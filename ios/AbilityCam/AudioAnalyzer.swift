@@ -26,6 +26,13 @@ final class AudioAnalyzer {
         try engine.start()
     }
 
+    /// 裏から戻ったとき、止まっていたら動かし直す
+    func resumeIfNeeded() {
+        guard !engine.isRunning else { return }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        try? engine.start()
+    }
+
     func stop() {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()

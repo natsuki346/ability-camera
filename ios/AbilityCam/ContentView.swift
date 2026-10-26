@@ -1,11 +1,13 @@
 import AVFoundation
 import Charts
 import SwiftUI
+import UIKit.UIGestureRecognizerSubclass
 
 struct ContentView: View {
     @StateObject private var model = AnalysisModel()
     @State private var cameraLarge = false
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
+    @Environment(\.scenePhase) private var scenePhase
 
     private let series = ["口角を上げる", "眉を寄せる", "目を細める", "口を開ける", "音量", "声の高さ"]
     private let colors: [Color] = [Metric.mouthSmile, .browDown, .eyeSquint, .jawOpen, .rmsDb, .f0Hz].map(\.color)
@@ -13,6 +15,8 @@ struct ContentView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
+                notRecordingBanner
+
                 ZStack(alignment: .topTrailing) {
                     faceSketch
                         .padding(.top, 140)   // 右上の小さな映像と重ならないように
@@ -58,6 +62,36 @@ struct ContentView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding()
+        }
+        .background(TouchActivityView { model.noteActivity() })   // 画面のどこかを触ったら、止めるまでの5分を数え直す
+        .task { await model.prepareCamera() }   // カメラの許可を得たら、すぐ映像を出す（記録はしない）
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background: model.enterBackground()
+            case .active: Task { await model.enterForeground() }
+            default: break
+            }
+        }
+    }
+
+    /// 「開始」前・「停止」後は、記録していないことをはっきり出す
+    @ViewBuilder private var notRecordingBanner: some View {
+        if !model.running {
+            Group {
+                if model.cameraPausedForIdle {
+                    Button { Task { await model.prepareCamera() } } label: {
+                        Label("カメラを止めています（タップで再開）", systemImage: "camera")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                } else {
+                    Label("まだ記録していません（映り方の確認中）", systemImage: "eye")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .font(.callout)
+            .foregroundStyle(.primary)
+            .padding(10)
+            .background(Color(red: 0xDC / 255, green: 0xE3 / 255, blue: 0xEA / 255).opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
         }
     }
 
@@ -117,13 +151,26 @@ struct ContentView: View {
             .containerRelativeFrame(.horizontal) { w, _ in cameraLarge ? w - 32 : w / 3 }   // 32 = 左右の余白
             .background(Color.black)
             .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                if model.cameraPausedForIdle {
+                    Text("タップで再開").font(.caption).foregroundStyle(.white)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.black.opacity(0.6))
+                }
+            }
             .contentShape(Rectangle())
-            .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { cameraLarge.toggle() } }
+            .onTapGesture {
+                if model.cameraPausedForIdle {
+                    Task { await model.prepareCamera() }
+                } else {
+                    withAnimation(.easeInOut(duration: 0.2)) { cameraLarge.toggle() }
+                }
+            }
     }
 
     /// 動きを写す顔の絵（映像と同じ見え方・同じ向き）。読めないときは灰色で中立
     private var faceSketch: some View {
-        let shape = model.running ? model.faceShape : nil
+        let shape = model.cameraActive ? model.faceShape : nil
         let sketch = FaceSketch(shape: shape, size: 220, tone: sketchTone)
         return VStack(spacing: 4) {
             sketch
@@ -132,7 +179,9 @@ struct ContentView: View {
                         ForEach(SketchTone.allCases) { Text($0.rawValue).tag($0) }
                     }
                 }
-            if !model.running {
+            if model.cameraPausedForIdle {
+                Text("カメラを止めています（タップで再開）").font(.callout).foregroundStyle(.secondary)
+            } else if !model.cameraActive {
                 Text(" ").font(.callout)
             } else if let shape {
                 Text(shape["yaw"] != nil ? "顔の向き：\(FaceSketch.directionText(shape))" : " ").font(.callout)
@@ -144,6 +193,8 @@ struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { if model.cameraPausedForIdle { Task { await model.prepareCamera() } } }
     }
 
     /// 家族の印。介助しながら片手で押せる大きさ
@@ -215,5 +266,43 @@ struct CameraPreview: UIViewRepresentable {
     final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+    }
+}
+
+/// 画面のどこかが触られたことを知らせる（タッチは横取りしない）
+struct TouchActivityView: UIViewRepresentable {
+    let onTouch: @MainActor () -> Void
+
+    func makeUIView(context: Context) -> HostView { HostView(onTouch: onTouch) }
+    func updateUIView(_ uiView: HostView, context: Context) { uiView.recognizer.onTouch = onTouch }
+
+    final class HostView: UIView {
+        let recognizer: Recognizer
+        init(onTouch: @escaping @MainActor () -> Void) {
+            recognizer = Recognizer(onTouch: onTouch)
+            super.init(frame: .zero)
+            isUserInteractionEnabled = false
+        }
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func willMove(toWindow newWindow: UIWindow?) {
+            recognizer.view?.removeGestureRecognizer(recognizer)
+            newWindow?.addGestureRecognizer(recognizer)
+        }
+    }
+
+    final class Recognizer: UIGestureRecognizer {
+        var onTouch: @MainActor () -> Void
+        init(onTouch: @escaping @MainActor () -> Void) {
+            self.onTouch = onTouch
+            super.init(target: nil, action: nil)
+            cancelsTouchesInView = false
+            delaysTouchesBegan = false
+            delaysTouchesEnded = false
+        }
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+            onTouch()
+            state = .failed   // 何も認識しない（ほかの操作の邪魔をしない）
+        }
     }
 }

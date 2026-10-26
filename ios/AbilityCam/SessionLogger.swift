@@ -72,6 +72,7 @@ final class SessionLogger {
     private var handle: FileHandle?
     private let encoder = JSONEncoder()
     private(set) var fileName: String?
+    private var startedMs = Int64.max   // queue の上でだけ触る
 
     func start() throws {
         let f = DateFormatter()
@@ -92,7 +93,11 @@ final class SessionLogger {
             "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果"
         ]
         let data = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
-        queue.async { self.handle?.write(data + Data("\n".utf8)) }
+        let ms = header["started_at_ms"] as! Int64
+        queue.async {
+            self.startedMs = ms
+            self.handle?.write(data + Data("\n".utf8))
+        }
     }
 
     func write<T: Encodable>(_ record: T) {
@@ -102,10 +107,20 @@ final class SessionLogger {
         }
     }
 
+    /// 記録を始める前に撮られたコマは書かない
+    func write<T: Encodable>(_ record: T, notBefore tMs: Int64) {
+        queue.async {
+            guard tMs >= self.startedMs else { return }
+            guard let h = self.handle, let d = try? self.encoder.encode(record) else { return }
+            h.write(d + Data("\n".utf8))
+        }
+    }
+
     func stop() {
         queue.sync {
             try? handle?.close()
             handle = nil
+            startedMs = .max
         }
     }
 }

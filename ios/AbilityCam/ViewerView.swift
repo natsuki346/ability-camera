@@ -83,6 +83,18 @@ struct ViewerView: View {
         case .requesting(let n): "\(n) の画面で、送るかどうかの確認を待っています"
         case .connecting(let n): "\(n) につないでいます"
         case .connected(let n): "\(n) とつながっています"
+        case .retrying(let n, let at):
+            "\(n) とつなぎ直し中（\(max(0, Int(at.timeIntervalSinceNow.rounded(.up))))秒後にもう一度）"
+        case .needsApproval(let n):
+            "\(n) で許可が取り消されています。見るには「見たいと申し込む」を押し、撮る側で確かめてもらってください"
+        }
+    }
+
+    /// 手で申し込むボタンを出すか（探している・取り消されたとき）
+    private var showRequestButtons: Bool {
+        switch link.status {
+        case .searching, .needsApproval: true
+        default: false
         }
     }
 
@@ -94,7 +106,7 @@ struct ViewerView: View {
                 .font(.title.bold())
                 .multilineTextAlignment(.center)
             Text(statusText).font(.callout)
-            if case .searching = link.status {
+            if showRequestButtons {
                 ForEach(link.found, id: \.self) { p in
                     Button("\(p.displayName) に見たいと申し込む") { link.request(p) }
                         .buttonStyle(.bordered)

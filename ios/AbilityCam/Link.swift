@@ -35,7 +35,7 @@ struct LiveEvent: Codable, Identifiable {
 
 /// 1通の中身（JSON）。映像だけは JSON にせず、先頭 1 バイト 0xFF の後ろに JPEG を付けて送る
 struct Wire: Codable {
-    var kind: String                  // state / event / viewer_event / ping / pong / grant / bye
+    var kind: String                  // state / event / viewer_event / ping / pong / grant / bye / revoked
     var state: LiveState?
     var event: LiveEvent?
     var t0: Int64?                    // ping を送った時刻（見る側の時計）
@@ -137,6 +137,7 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
     }
     private var targets: [MCSession] = []                   // 映像のスレッドから読む写し（lock）
     private var viewerIDs: [MCPeerID: String] = [:]         // main で触る
+    private var noticeSessions: [MCPeerID: MCSession] = [:] // 「取り消されています」を伝えるだけのつながり（見ている端末に数えない）
     private let sendQueue = DispatchQueue(label: "link.send", qos: .utility)
     private let lock = NSLock()
     private var sendingState = false, sendingVideo = false
@@ -159,7 +160,8 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
         for r in requests { r.reply(false, nil) }
         requests = []
         for s in sessions.values { s.disconnect() }
-        sessions = [:]; viewerIDs = [:]
+        for s in noticeSessions.values { s.disconnect() }
+        sessions = [:]; viewerIDs = [:]; noticeSessions = [:]
         viewers = []
     }
 
@@ -248,6 +250,15 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
                 self.accept(peerID, viewerID: info.id, reply: invitationHandler)
                 return
             }
+            // 合言葉を持っているのに合わない（取り消した・知らない）：確認は出さず、理由を伝えて断る。
+            // 申し込みの断り方には理由を付けられないので、伝えるだけのつながりを受けて「revoked」を送り、すぐ切る
+            if info?.token != nil, let me = self.me {
+                let s = MCSession(peer: me, securityIdentity: nil, encryptionPreference: .required)
+                s.delegate = self
+                self.noticeSessions[peerID] = s
+                invitationHandler(true, s)
+                return
+            }
             self.requests.removeAll { $0.peer == peerID }
             self.requests.append(Request(peer: peerID, info: info, reply: invitationHandler))
         }
@@ -257,6 +268,13 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
         DispatchQueue.main.async {
             switch state {
             case .connected:
+                if self.noticeSessions[peerID] === session {
+                    if let d = try? JSONEncoder().encode(Wire(kind: "revoked")) {
+                        try? session.send(d, toPeers: [peerID], with: .reliable)
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { session.disconnect() }
+                    return
+                }
                 guard self.sessions[peerID] === session else { return }
                 if !self.viewers.contains(peerID) { self.viewers.append(peerID) }
                 // 合言葉を渡す（暗号化されたつながりの上で）
@@ -265,6 +283,7 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
                     try? session.send(d, toPeers: [peerID], with: .reliable)
                 }
             case .notConnected:
+                if self.noticeSessions[peerID] === session { self.noticeSessions[peerID] = nil; return }
                 if self.sessions[peerID] === session { self.sessions[peerID] = nil; self.viewerIDs[peerID] = nil }
                 self.viewers.removeAll { $0 == peerID }
             default: break
@@ -303,6 +322,8 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         case requesting(String)       // 撮る側の画面で確かめてもらっている（初めての端末）
         case connecting(String)       // 許可済み：確認なしでつないでいる
         case connected(String)
+        case retrying(String, Date)   // つながらなかった（電波・時間切れ・見つからない・裏に回っている）。合言葉は持ったまま、この時刻につなぎ直す
+        case needsApproval(String)    // 撮る側で許可が取り消されている。手で申し込み、撮る側で確かめてもらう
     }
 
     struct Point: Identifiable {
@@ -334,6 +355,8 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     private var timer: Timer?
     private var tick = 0
     private var inviteStarted: Date?
+    private var retryCameraID: String?
+    private var retryDelay = 0.0                  // 2, 4, 8, 16, 30, 30… 秒
     private var clock: [(rtt: Int64, offset: Double)] = []   // 撮る側の時計 − こちらの時計
     private let decoder = JSONDecoder()
 
@@ -365,10 +388,22 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         video = nil
     }
 
-    /// 手で申し込む（前に「送らない」だった撮る側にも）
+    /// 手で申し込む（前に「送らない」だった撮る側・取り消された撮る側にも）
     func request(_ peer: MCPeerID) {
         if let id = cameraIDs[peer] { declined.remove(id) }
+        retryCameraID = nil; retryDelay = 0
         invite(peer)
+    }
+
+    /// 合言葉は持ったまま、間をあけてつなぎ直す
+    private func scheduleRetry(cameraID: String, name: String) {
+        retryCameraID = cameraID
+        retryDelay = retryDelay == 0 ? 2 : min(retryDelay * 2, 30)
+        status = .retrying(name, Date().addingTimeInterval(retryDelay))
+    }
+
+    private func peer(for cameraID: String) -> MCPeerID? {
+        found.last { cameraIDs[$0] == cameraID }
     }
 
     /// 見る側で押した印・場面を、撮る側に送って記録してもらう。時刻は押した瞬間を、撮る側の時計に直して送る
@@ -390,10 +425,25 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         // 申し込んだまま答えが無い（撮る側が裏に回った、など）
         if let s = inviteStarted, Date().timeIntervalSince(s) > 65 {
             inviteStarted = nil
+            let st = status
             session?.disconnect()
-            status = .searching
+            if case .connecting(let name) = st, let id = retryCameraID ?? currentCameraID {
+                scheduleRetry(cameraID: id, name: name)
+            } else {
+                status = .searching
+            }
         }
-        if case .searching = status { autoConnect() }
+        switch status {
+        case .searching: autoConnect()
+        case .retrying(let name, let at) where Date() >= at:
+            guard let id = retryCameraID else { status = .searching; return }
+            if let p = peer(for: id) {
+                invite(p)
+            } else {
+                scheduleRetry(cameraID: id, name: name)   // 見つからない：撮る側が戻ってきたら foundPeer ですぐつなぐ
+            }
+        default: break
+        }
     }
 
     /// 許可済みの撮る側を先に。初めての撮る側には、起動中に断られていなければ申し込む
@@ -403,8 +453,11 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         if let p = candidates.first(where: { t[cameraIDs[$0] ?? ""] != nil }) ?? candidates.first { invite(p) }
     }
 
+    private var currentCameraID: String?
+
     private func invite(_ peer: MCPeerID) {
         guard let me, let browser else { return }
+        currentCameraID = cameraIDs[peer]
         session?.disconnect()
         let s = MCSession(peer: me, securityIdentity: nil, encryptionPreference: .required)
         s.delegate = self
@@ -453,7 +506,12 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         DispatchQueue.main.async {
             self.cameraIDs[peerID] = info?["id"] ?? peerID.displayName
             if !self.found.contains(peerID) { self.found.append(peerID) }
-            if case .searching = self.status { self.autoConnect() }
+            switch self.status {
+            case .searching: self.autoConnect()
+            case .retrying where self.cameraIDs[peerID] == self.retryCameraID:
+                self.invite(peerID)   // 撮る側が前に戻った：待たずにつなぐ
+            default: break
+            }
         }
     }
 
@@ -469,24 +527,30 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
             switch state {
             case .connected:
                 self.inviteStarted = nil
+                self.retryDelay = 0; self.retryCameraID = nil
                 self.status = .connected(peerID.displayName)
                 self.clock = []
                 self.points = []; self.events = []
                 self.ping()
             case .notConnected:
                 self.inviteStarted = nil
+                self.video = nil
+                let id = self.cameraIDs[peerID] ?? self.currentCameraID
                 switch self.status {
                 case .requesting(let name):
                     self.notice = "\(name) で「送らない」が選ばれたか、時間内に答えがありませんでした"
-                    if let id = self.cameraIDs[peerID] { self.declined.insert(id) }
-                case .connecting(let name):
-                    // 許可が取り消されたかもしれない。次は確認ありで申し込む
-                    self.notice = "\(name) に確認なしではつながりませんでした"
-                    if let id = self.cameraIDs[peerID] { self.tokens[id] = nil }
-                default: break
+                    if let id { self.declined.insert(id) }
+                    self.status = .searching
+                case .connecting(let name), .connected(let name):
+                    // 電波・時間切れ・裏に回った など。合言葉は忘れずに、間をあけてつなぎ直す
+                    if let id, self.tokens[id] != nil {
+                        self.scheduleRetry(cameraID: id, name: name)
+                    } else {
+                        self.status = .searching
+                    }
+                case .needsApproval, .retrying: break
+                case .searching: break
                 }
-                self.status = .searching
-                self.video = nil
             default: break
             }
         }
@@ -520,6 +584,17 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
                 if self.clock.count > 15 { self.clock.removeFirst() }
             case "grant":
                 if let id = w.cameraID, let token = w.token { self.tokens[id] = token }
+            case "revoked":
+                // 撮る側がはっきり「取り消されています／知らない」と返したときだけ、合言葉を忘れる
+                let name = peerID.displayName
+                if let id = self.cameraIDs[peerID] ?? self.currentCameraID {
+                    self.tokens[id] = nil
+                    self.declined.insert(id)   // 自動では申し込まない（撮る側に確認を出さないため）
+                }
+                self.retryDelay = 0; self.retryCameraID = nil
+                self.status = .needsApproval(name)
+                self.notice = nil
+                session.disconnect()
             case "bye":
                 self.notice = "\(peerID.displayName) が送るのを止めました（「見たいと申し込む」でもう一度つなげます）"
                 if let id = self.cameraIDs[peerID] { self.declined.insert(id) }   // 自動ではつなぎ直さない

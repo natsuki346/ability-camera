@@ -4,6 +4,26 @@ import SwiftUI
 struct FaceSketch: View {
     /// ならした blendshape の値。nil のときは形を中立に戻して灰色で描く
     let shape: [String: Double]?
+    var size: CGFloat = 120
+
+    /// 左右がこれを超えると、表情の数値は当てにならない
+    static let sideLimit = 35.0
+
+    var yaw: Double { shape?["yaw"] ?? 0 }
+    var pitch: Double { shape?["pitch"] ?? 0 }
+    var roll: Double { shape?["roll"] ?? 0 }
+    var turnedAway: Bool { abs(yaw) > Self.sideLimit }
+
+    /// 「右 25°・下 10°」のような事実だけ。15°未満は出さず、どれも無ければ「正面」
+    static func directionText(_ shape: [String: Double]) -> String {
+        func part(_ v: Double?, _ plus: String, _ minus: String) -> String? {
+            guard let v, abs(v) >= 15 else { return nil }
+            return "\(v > 0 ? plus : minus) \(Int(abs(v).rounded()))°"
+        }
+        let parts = [part(shape["yaw"], "右", "左"), part(shape["pitch"], "上", "下"),
+                     part(shape["roll"], "右に傾き", "左に傾き")].compactMap { $0 }
+        return parts.isEmpty ? "正面" : parts.joined(separator: "・")
+    }
 
     static let keys = ["browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft", "browOuterUpRight",
                        "eyeBlinkLeft", "eyeBlinkRight", "eyeSquintLeft", "eyeSquintRight", "eyeWideLeft", "eyeWideRight",
@@ -26,12 +46,18 @@ struct FaceSketch: View {
 
             let r = min(size.width, size.height) * 0.45
             let c = CGPoint(x: size.width / 2, y: size.height / 2)
-            func p(_ x: Double, _ y: Double) -> CGPoint { CGPoint(x: c.x + x * r, y: c.y + y * r) }
+            // 向き：眉・目・口を、左右（yaw）・上下（pitch）の分だけずらし、横幅を cos(yaw) で縮める
+            let rad = Double.pi / 180
+            let sx = cos(yaw * rad), dx = sin(yaw * rad) * 0.4, dy = -sin(pitch * rad) * 0.4
+            func p(_ x: Double, _ y: Double) -> CGPoint { CGPoint(x: c.x + (x * sx + dx) * r, y: c.y + (y + dy) * r) }
             let color: Color = shape == nil ? .gray.opacity(0.5) : .primary
-            let style = StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)
+            let lineWidth = max(2, r / 27)   // 大きく描くときは線も太く
+            let style = StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
 
             // 顔の輪郭
             ctx.stroke(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)), with: .color(color), style: style)
+            // 横を向いているときは、表情の部分を薄くする（参考程度）
+            if turnedAway { ctx.opacity = 0.3 }
 
             for side in [-1.0, 1.0] {
                 // 眉：内側は寄せると下がって内へ、browInnerUp で上がる。外側は browOuterUp で上がる
@@ -43,7 +69,7 @@ struct FaceSketch: View {
 
                 // 目：まばたき・細めると縦に細く、見開くと縦に開く
                 let open = (1 - 0.85 * sided("eyeBlink", side)) * (1 - 0.5 * sided("eyeSquint", side)) * (1 + 0.6 * sided("eyeWide", side))
-                let w = 0.3 * r, h = max(0.02 * r, 0.16 * r * open)
+                let w = 0.3 * r * sx, h = max(0.02 * r, 0.16 * r * open)
                 let ec = p(side * 0.36, -0.14)
                 ctx.stroke(Path(ellipseIn: CGRect(x: ec.x - w / 2, y: ec.y - h / 2, width: w, height: h)), with: .color(color), style: style)
             }
@@ -58,11 +84,13 @@ struct FaceSketch: View {
             let midY = p(0, 0.45).y   // 口の中央は動かさず、口角だけを動かす
             var mouth = Path()
             mouth.move(to: left)
-            mouth.addQuadCurve(to: right, control: CGPoint(x: c.x, y: midY))
-            mouth.addQuadCurve(to: left, control: CGPoint(x: c.x, y: midY + 0.5 * r * v("jawOpen")))
+            let midX = p(0, 0.45).x
+            mouth.addQuadCurve(to: right, control: CGPoint(x: midX, y: midY))
+            mouth.addQuadCurve(to: left, control: CGPoint(x: midX, y: midY + 0.5 * r * v("jawOpen")))
             ctx.stroke(mouth, with: .color(color), style: style)
         }
-        .frame(width: 120, height: 120)
+        .frame(width: size, height: size)
+        .rotationEffect(.degrees(roll))   // 頭の上が映像の右へ傾く＝時計回り
         .accessibilityHidden(true)
     }
 }

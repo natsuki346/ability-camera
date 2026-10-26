@@ -29,12 +29,16 @@ enum MeshTopology {
 
 struct MeshOverlay: View {
     let mesh: FaceMesh
+    var fill = false    // プレビューが resizeAspectFill のとき
 
     var body: some View {
         Canvas { ctx, size in
             guard mesh.imageSize.width > 0 else { return }
-            // resizeAspect と同じ置き方（余白を除いた映像の領域）。背面カメラなので左右反転はしない
-            let r = AVMakeRect(aspectRatio: mesh.imageSize, insideRect: CGRect(origin: .zero, size: size))
+            // プレビューと同じ置き方（resizeAspect は余白を除いた領域、resizeAspectFill ははみ出す領域）。背面カメラなので左右反転はしない
+            let k = fill ? max(size.width / mesh.imageSize.width, size.height / mesh.imageSize.height)
+                         : min(size.width / mesh.imageSize.width, size.height / mesh.imageSize.height)
+            let w = mesh.imageSize.width * k, h = mesh.imageSize.height * k
+            let r = CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
             let pts = mesh.points.map { CGPoint(x: r.minX + $0.x * r.width, y: r.minY + $0.y * r.height) }
 
             func path(_ c: MeshTopology.Pairs) -> Path {

@@ -98,9 +98,12 @@ final class AnalysisModel: ObservableObject {
             // 撮影時刻（端末の起動からの時計）を、epoch ms に直す
             let ageSec = CACurrentMediaTime() - Double(r.captureMs) / 1000
             let tMs = Int64((Date().timeIntervalSince1970 - ageSec) * 1000)
+            let round1 = { (x: Double) in (x * 10).rounded() / 10 }
             logger.write(FrameRecord(tMs: tMs, face: r.face,
                                      bs: r.face ? r.blendshapes : nil, pts: r.face ? r.keyPoints : nil,
-                                     rmsDb: a.rmsDb, f0Hz: a.f0Hz, procMs: r.procMs, latMs: r.latMs))
+                                     rmsDb: a.rmsDb, f0Hz: a.f0Hz, procMs: r.procMs, latMs: r.latMs,
+                                     yawDeg: r.pose.map { round1($0.yaw) }, pitchDeg: r.pose.map { round1($0.pitch) },
+                                     rollDeg: r.pose.map { round1($0.roll) }))
             Task { @MainActor in self?.update(r, audio: a) }
         }
         camera.onFrame = { [weak face] sb in face?.process(sb) }
@@ -196,6 +199,11 @@ final class AnalysisModel: ObservableObject {
             for k in FaceSketch.keys {
                 let x = Double(r.blendshapes[k] ?? 0)
                 shapeSmooth[k] = (shapeSmooth[k] ?? x) + a * (x - (shapeSmooth[k] ?? x))
+            }
+            if let p = r.pose {
+                for (k, x) in [("yaw", p.yaw), ("pitch", p.pitch), ("roll", p.roll)] {
+                    shapeSmooth[k] = (shapeSmooth[k] ?? x) + a * (x - (shapeSmooth[k] ?? x))
+                }
             }
             lastShapeT = captureT
         }

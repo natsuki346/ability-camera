@@ -4,6 +4,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = AnalysisModel()
+    @State private var cameraLarge = false
 
     private let series = ["口角を上げる", "眉を寄せる", "目を細める", "口を開ける", "音量", "声の高さ"]
     private let colors: [Color] = [.green, .orange, .yellow, .blue, .purple, .pink]
@@ -11,24 +12,12 @@ struct ContentView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                CameraPreview(session: model.camera.session)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 280)
-                    .background(Color.black)
-                    .overlay {
-                        // 網目は解析の遅れの分だけ映像より遅れて見える（即時性そのものなので、隠さない）
-                        if model.meshEnabled, let mesh = model.mesh { MeshOverlay(mesh: mesh) }
-                    }
-                    .overlay(alignment: .topTrailing) {
-                        Button { model.meshEnabled.toggle() } label: {
-                            Label("網目", systemImage: model.meshEnabled ? "circle.grid.cross.fill" : "circle.grid.cross")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(model.meshEnabled ? .white : .gray)
-                        .padding(6)
-                    }
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                ZStack(alignment: .topTrailing) {
+                    faceSketch
+                        .padding(.top, 140)   // 右上の小さな映像と重ならないように
+                        .opacity(cameraLarge ? 0 : 1)
+                    camera
+                }
 
                 Button {
                     Task { await model.toggle() }
@@ -40,7 +29,6 @@ struct ContentView: View {
                 .tint(model.running ? .red : .accentColor)
 
                 differencesCard
-                faceSketch
                 marks
                 scenes
 
@@ -106,12 +94,48 @@ struct ContentView: View {
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
     }
 
-    /// 動きを写す顔の絵（映像と同じ向き）。読めないときは灰色で中立
+    /// カメラ映像（網目つき）。普段は右上に小さく（幅の1/3）、タップで大きく、もう一度タップで戻る
+    private var camera: some View {
+        CameraPreview(session: model.camera.session, fill: !cameraLarge)
+            .overlay {
+                // 網目は解析の遅れの分だけ映像より遅れて見える（即時性そのものなので、隠さない）
+                if model.meshEnabled, let mesh = model.mesh { MeshOverlay(mesh: mesh, fill: !cameraLarge) }
+            }
+            .overlay(alignment: .topTrailing) {
+                if cameraLarge {
+                    Button { model.meshEnabled.toggle() } label: {
+                        Label("網目", systemImage: model.meshEnabled ? "circle.grid.cross.fill" : "circle.grid.cross")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(model.meshEnabled ? .white : .gray)
+                    .padding(6)
+                }
+            }
+            .aspectRatio(cameraLarge ? 9.0 / 16.0 : 3.0 / 4.0, contentMode: .fit)
+            .containerRelativeFrame(.horizontal) { w, _ in cameraLarge ? w - 32 : w / 3 }   // 32 = 左右の余白
+            .background(Color.black)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
+            .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { cameraLarge.toggle() } }
+    }
+
+    /// 動きを写す顔の絵（映像と同じ見え方・同じ向き）。読めないときは灰色で中立
     private var faceSketch: some View {
-        VStack(spacing: 4) {
-            FaceSketch(shape: model.running ? model.faceShape : nil)
-            Text(model.running && model.faceShape == nil ? "読めません" : " ")
-                .font(.caption).foregroundStyle(.secondary)
+        let shape = model.running ? model.faceShape : nil
+        let sketch = FaceSketch(shape: shape, size: 220)
+        return VStack(spacing: 4) {
+            sketch
+            if !model.running {
+                Text(" ").font(.callout)
+            } else if let shape {
+                Text(shape["yaw"] != nil ? "顔の向き：\(FaceSketch.directionText(shape))" : " ").font(.callout)
+                if sketch.turnedAway {
+                    Text("横を向いているため表情は参考程度").font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Text("読めません").font(.callout).foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity)
     }
@@ -169,15 +193,18 @@ struct ContentView: View {
 
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
+    var fill = false   // true: 枠いっぱいに（はみ出す分は切る）
 
     func makeUIView(context: Context) -> PreviewView {
         let v = PreviewView()
         v.previewLayer.session = session
-        v.previewLayer.videoGravity = .resizeAspect
+        v.previewLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
         return v
     }
 
-    func updateUIView(_ uiView: PreviewView, context: Context) {}
+    func updateUIView(_ uiView: PreviewView, context: Context) {
+        uiView.previewLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
+    }
 
     final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }

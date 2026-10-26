@@ -12,9 +12,13 @@ struct FrameRecord: Encodable {
     let f0Hz: Float?
     let procMs: Double
     let latMs: Double
+    var yawDeg: Double?         // 顔の向き（度）。映像で見て右・上・右へ傾く が +
+    var pitchDeg: Double?
+    var rollDeg: Double?
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", face, bs, pts, rmsDb = "rms_db", f0Hz = "f0_hz", procMs = "proc_ms", latMs = "lat_ms"
+        case yawDeg = "yaw_deg", pitchDeg = "pitch_deg", rollDeg = "roll_deg"
     }
 }
 
@@ -85,7 +89,7 @@ final class SessionLogger {
             "started_at_ms": Int64(Date().timeIntervalSince1970 * 1000),
             "device": UIDevice.current.model,
             "ios": UIDevice.current.systemVersion,
-            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果"
+            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果"
         ]
         let data = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
         queue.async { self.handle?.write(data + Data("\n".utf8)) }

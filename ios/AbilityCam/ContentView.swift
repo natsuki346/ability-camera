@@ -5,6 +5,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var model = AnalysisModel()
     @State private var cameraLarge = false
+    @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
 
     private let series = ["口角を上げる", "眉を寄せる", "目を細める", "口を開ける", "音量", "声の高さ"]
     private let colors: [Color] = [.green, .orange, .yellow, .blue, .purple, .pink]
@@ -123,9 +124,14 @@ struct ContentView: View {
     /// 動きを写す顔の絵（映像と同じ見え方・同じ向き）。読めないときは灰色で中立
     private var faceSketch: some View {
         let shape = model.running ? model.faceShape : nil
-        let sketch = FaceSketch(shape: shape, size: 220)
+        let sketch = FaceSketch(shape: shape, size: 220, tone: sketchTone)
         return VStack(spacing: 4) {
             sketch
+                .contextMenu {   // 長押しで絵の色を選ぶ
+                    Picker("絵の色", selection: $sketchTone) {
+                        ForEach(SketchTone.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                }
             if !model.running {
                 Text(" ").font(.callout)
             } else if let shape {

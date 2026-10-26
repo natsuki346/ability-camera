@@ -15,6 +15,19 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
                     .frame(height: 280)
                     .background(Color.black)
+                    .overlay {
+                        // 網目は解析の遅れの分だけ映像より遅れて見える（即時性そのものなので、隠さない）
+                        if model.meshEnabled, let mesh = model.mesh { MeshOverlay(mesh: mesh) }
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        Button { model.meshEnabled.toggle() } label: {
+                            Label("網目", systemImage: model.meshEnabled ? "circle.grid.cross.fill" : "circle.grid.cross")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(model.meshEnabled ? .white : .gray)
+                        .padding(6)
+                    }
                     .clipShape(RoundedRectangle(cornerRadius: 8))
 
                 Button {
@@ -35,6 +48,7 @@ struct ContentView: View {
                     stat("解析コマ/秒", model.fps.map { String(format: "%.1f", $0) })
                     stat("解析時間 ms", model.procMs.map { String(format: "%.0f", $0) })
                     stat("撮影→結果 ms", model.latMs.map { String(format: "%.0f", $0) })
+                    stat("撮影→網目 ms", model.meshLagMs.map { String(format: "%.0f", $0) })
                     stat("音量 dB", model.rmsDb.map { String(format: "%.0f", $0) })
                     stat("声の高さ Hz", model.f0Hz.map { String(format: "%.0f", $0) })
                 }

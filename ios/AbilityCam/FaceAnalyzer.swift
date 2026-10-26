@@ -14,6 +14,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         let face: Bool
         let blendshapes: [String: Float]
         let keyPoints: [[Float]]    // 鍵となる顔の点 [x, y, z]
+        let mesh: [CGPoint]         // 全478点の (x, y)、0〜1。画面の網目だけに使い、記録には入れない
+        let imageSize: CGSize       // 解析した画像の大きさ（縦向き）
         let procMs: Double          // 解析に渡してから結果が返るまで
         let latMs: Double           // 撮影されてから結果が返るまで
     }
@@ -24,6 +26,7 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
     private var landmarker: FaceLandmarker?
     private var sentAt: [Int: CFTimeInterval] = [:]
     private var lastTs = -1
+    private var imageSize = CGSize.zero
     private let lock = NSLock()
 
     /// MediaPipe のスレッドから呼ばれる
@@ -53,6 +56,9 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         lock.lock()
         guard ms > lastTs else { lock.unlock(); return }   // 時刻は必ず増えていく必要がある
         lastTs = ms
+        if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            imageSize = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
+        }
         sentAt[ms] = CACurrentMediaTime()
         sentAt = sentAt.filter { $0.key > ms - 3000 }      // 返ってこなかったコマの分を掃除
         lock.unlock()
@@ -70,10 +76,11 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
                         timestampInMilliseconds: Int,
                         error: Error?) {
         let now = CACurrentMediaTime()
-        lock.lock(); let sent = sentAt.removeValue(forKey: timestampInMilliseconds); lock.unlock()
+        lock.lock(); let sent = sentAt.removeValue(forKey: timestampInMilliseconds); let size = imageSize; lock.unlock()
 
         var bs: [String: Float] = [:]
         var pts: [[Float]] = []
+        var mesh: [CGPoint] = []
         let lms = result?.faceLandmarks.first
         if let lms, !lms.isEmpty {
             for c in result?.faceBlendshapes.first?.categories ?? [] {
@@ -84,12 +91,15 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
                 let p = lms[i]
                 return [p.x, p.y, p.z].map { ($0 * 10000).rounded() / 10000 }
             }
+            mesh = lms.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
         }
         onResult?(Result(
             captureMs: timestampInMilliseconds,
             face: !(lms?.isEmpty ?? true),
             blendshapes: bs,
             keyPoints: pts,
+            mesh: mesh,
+            imageSize: size,
             procMs: sent.map { (now - $0) * 1000 } ?? -1,
             latMs: now * 1000 - Double(timestampInMilliseconds)
         ))

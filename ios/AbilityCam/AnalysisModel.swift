@@ -38,6 +38,9 @@ final class AnalysisModel: ObservableObject {
     @Published var faceReadable = true
     @Published var scene: CareScene?
     @Published var markMessage: String?
+    @Published var meshEnabled = true
+    @Published var mesh: FaceMesh?           // 顔が読めないときは nil（古い網目を残さない）
+    @Published var meshLagMs: Double?        // 撮影→網目を出すまで（解析の遅れ＋画面の間引き）
 
     let camera = CameraManager()
     private let face = FaceAnalyzer()
@@ -46,6 +49,7 @@ final class AnalysisModel: ObservableObject {
 
     private var frames = 0, faceFrames = 0, procSum = 0.0, procN = 0, latSum = 0.0
     private var startHost: CFTimeInterval = 0
+    private var meshLagSum = 0.0, meshN = 0
 
     // 普段といつもとの違い
     private var baselineStartHost: CFTimeInterval = 0
@@ -77,7 +81,8 @@ final class AnalysisModel: ObservableObject {
             return
         }
 
-        frames = 0; faceFrames = 0; procSum = 0; procN = 0; latSum = 0
+        frames = 0; faceFrames = 0; procSum = 0; procN = 0; latSum = 0; meshLagSum = 0; meshN = 0
+        mesh = nil; meshLagMs = nil
         points = []
         startHost = CACurrentMediaTime()
         smooth = [:]; lastAudioAt = 0; recentFace = []
@@ -112,7 +117,7 @@ final class AnalysisModel: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
         running = false
         baselineSec = nil; baselineReady = false; differences = []; insufficient = []
-        scene = nil; markMessage = nil
+        scene = nil; markMessage = nil; mesh = nil
         status = "保存しました: \(logger.fileName ?? "-")（\(frames)コマ）"
     }
 
@@ -225,6 +230,14 @@ final class AnalysisModel: ObservableObject {
         let faceCount = recentFace.filter(\.face).count
         let readable = faceCount * 2 >= recentFace.count
         if faceReadable != readable { faceReadable = readable }
+
+        if meshEnabled, readable, r.face, !r.mesh.isEmpty {
+            mesh = FaceMesh(points: r.mesh, imageSize: r.imageSize, values: faceValues)
+            meshLagSum += (now - captureT) * 1000; meshN += 1
+            meshLagMs = meshLagSum / Double(meshN)
+        } else if mesh != nil {
+            mesh = nil
+        }
 
         if recording {
             let sec = Int(now - baselineStartHost)

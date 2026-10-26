@@ -327,7 +327,11 @@ def scene_intervals(rec: Recording, t_end: float) -> list[tuple[float, float, st
 
 
 def marks(rec: Recording) -> list[tuple[float, str]]:
-    return [(e["t_ms"] / 1000, str(e.get("value"))) for e in rec.events if e.get("kind") == "mark"]
+    """見る側で押した印は、押した端末の名前を付ける（v0.5〜：source="viewer", by）"""
+    def label(e):
+        v = str(e.get("value"))
+        return f"{v}（{e.get('by') or '見る側'}で）" if e.get("source") == "viewer" else v
+    return [(e["t_ms"] / 1000, label(e)) for e in rec.events if e.get("kind") == "mark"]
 
 
 def frame_dt(t: np.ndarray, cap=1.0) -> np.ndarray:

@@ -40,9 +40,13 @@ struct EventRecord: Encodable {
     let kind: String            // scene / mark / change / baseline_restart
     let value: Value?
     var faceReadable: Bool?     // change のときだけ
+    var source: String?         // 見る側で押したときは "viewer"（撮る側で押したときは書かない）
+    var by: String?             // 見る側の端末の名前
+    var clockCorrected: Bool?   // 見る側：押した瞬間の時刻を、2台の時計のずれを直して記録したか
 
     enum CodingKeys: String, CodingKey {
-        case type, tMs = "t_ms", kind, value, faceReadable = "face_readable"
+        case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
+        case clockCorrected = "clock_corrected"
     }
 }
 

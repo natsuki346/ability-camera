@@ -52,7 +52,13 @@ final class AnalysisModel: ObservableObject {
     private let audio = AudioAnalyzer()
     private let logger = SessionLogger()
     let link = CameraLink()                  // 見る側（iPad / Mac）へ状態を送る
+    private let video = VideoSender()        // 見る側へ映像（設定でオンのときだけ）
     private var lastLiveSent: CFTimeInterval = 0
+    private var videoSending = false
+    private var frameTimes: [CFTimeInterval] = []   // 直近2秒の解析コマ（映像を送る間隔を決める）
+    private var fpsWithoutVideo: Double?
+    private var videoInterval = VideoSender.fastest
+    private var lastVideoAdjust: CFTimeInterval = 0
 
     private var frames = 0, faceFrames = 0, procSum = 0.0, procN = 0, latSum = 0.0
     private var startHost: CFTimeInterval = 0
@@ -106,7 +112,9 @@ final class AnalysisModel: ObservableObject {
 
     /// アプリが裏に回った：カメラとマイクを止め、5秒たっても戻らなければファイルを閉じて要約する
     func appEnteredBackground() {
-        link.stop()   // 裏に回るとつながりは切れる。戻ったら、見る側からもう一度申し込む
+        link.stop()   // 裏に回るとつながりは切れる。戻ったら、見る側が自動でつなぎ直す
+        video.configure(enabled: false, interval: VideoSender.fastest)
+        videoSending = false
         stopCamera()
         guard running else { return }
         if micOn { audio.stop() }
@@ -233,7 +241,15 @@ final class AnalysisModel: ObservableObject {
                          notBefore: tMs)
             Task { @MainActor in self?.update(r, audio: a) }
         }
-        camera.onFrame = { [weak face] sb in face?.process(sb) }
+        let video = self.video, link = self.link
+        video.onJPEG = { [weak link] d in link?.sendVideo(d) }
+        camera.onFrame = { [weak face, weak video] sb in
+            face?.process(sb)
+            video?.offer(sb)
+        }
+        if link.onViewerEvent == nil {
+            link.onViewerEvent = { [weak self] e, name, corrected in self?.applyViewerEvent(e, by: name, clockCorrected: corrected) }
+        }
 
         resetLive()
         camera.start()
@@ -276,6 +292,41 @@ final class AnalysisModel: ObservableObject {
         link.send(LiveEvent(tMs: t, kind: "scene", value: v))
     }
 
+    /// 見る側で押された印・場面。撮る側で押したのと同じく記録し、だれが押したかも書く
+    private func applyViewerEvent(_ e: LiveEvent, by name: String, clockCorrected: Bool) {
+        guard running else { return }
+        var r: EventRecord
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        let time = f.string(from: Date(timeIntervalSince1970: Double(e.tMs) / 1000))
+        switch e.kind {
+        case "mark":
+            guard let m = Mark(rawValue: e.value) else { return }
+            r = EventRecord(tMs: e.tMs, kind: "mark", value: .text(m.rawValue))
+            showMessage("\(name)が家族の印を付けました：\(m.rawValue)（\(time)）")
+        case "scene":
+            let s = CareScene(rawValue: e.value)
+            guard s != nil || e.value == "なし" else { return }
+            scene = s
+            r = EventRecord(tMs: e.tMs, kind: "scene", value: .text(s?.rawValue ?? "なし"))
+            showMessage("\(name)が場面を選びました：\(s?.rawValue ?? "なし")（\(time)）")
+        default: return
+        }
+        r.source = "viewer"; r.by = name; r.clockCorrected = clockCorrected
+        logger.write(r)
+        var out = e
+        out.by = name
+        link.send(out)
+    }
+
+    private func showMessage(_ msg: String) {
+        markMessage = msg
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            if markMessage == msg { markMessage = nil }
+        }
+    }
+
     func tapMark(_ m: Mark) {
         guard running else { return }
         let now = Date()
@@ -283,12 +334,7 @@ final class AnalysisModel: ObservableObject {
         link.send(LiveEvent(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: m.rawValue))
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
-        let msg = "家族の印を記録しました：\(m.rawValue)（\(f.string(from: now))）"
-        markMessage = msg
-        Task {
-            try? await Task.sleep(for: .seconds(3))
-            if markMessage == msg { markMessage = nil }
-        }
+        showMessage("家族の印を記録しました：\(m.rawValue)（\(f.string(from: now))）")
     }
 
     private static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
@@ -330,6 +376,9 @@ final class AnalysisModel: ObservableObject {
         latSum += r.latMs
 
         let captureT = Double(r.captureMs) / 1000
+        let hostNow = CACurrentMediaTime()
+        frameTimes.append(hostNow)
+        if let i = frameTimes.firstIndex(where: { $0 >= hostNow - 2 }), i > 0 { frameTimes.removeFirst(i) }
         recentFace.append((captureT, r.face))
         recentFace.removeAll { $0.t < captureT - 1 }
 
@@ -425,7 +474,8 @@ final class AnalysisModel: ObservableObject {
             }
         }
         if running && baselineReady { updateDifferences(now: now, faceReadable: readable) }
-        sendLive(r, now: now, readable: readable)
+        sendLive(r, now: now, readable: readable, values: faceValues, audio: a)
+        adjustVideo(now: now)
 
         // グラフ
         var new: [ChartPoint] = []
@@ -446,7 +496,28 @@ final class AnalysisModel: ObservableObject {
     }
 
     /// 見る側へ（1秒に10回まで）。映像・音声・顔の点は送らない
-    private func sendLive(_ r: FaceAnalyzer.Result, now: CFTimeInterval, readable: Bool) {
+    /// 映像を送るかと、その間隔。送っていないときの解析コマ/秒を覚えておき、送っていて1割より落ちたら間隔を広げる
+    private func adjustVideo(now: CFTimeInterval) {
+        let on = UserDefaults.standard.bool(forKey: "sendVideo") && !link.viewers.isEmpty
+        if videoSending != on { videoSending = on }
+        guard now - lastVideoAdjust >= 1 else { return }
+        lastVideoAdjust = now
+        let recent = Double(frameTimes.count) / 2
+        if !on {
+            if now - startHost > 3 { fpsWithoutVideo = recent }
+            videoInterval = VideoSender.fastest
+        } else if let ref = fpsWithoutVideo {
+            if recent < ref * 0.9 {
+                videoInterval = min(videoInterval * 1.5, VideoSender.slowest)
+            } else if recent >= ref * 0.97 {
+                videoInterval = max(videoInterval / 1.2, VideoSender.fastest)
+            }
+        }
+        video.configure(enabled: on, interval: videoInterval)
+    }
+
+    private func sendLive(_ r: FaceAnalyzer.Result, now: CFTimeInterval, readable: Bool,
+                          values: [Metric: Double], audio a: AudioAnalyzer.Snapshot) {
         guard !link.viewers.isEmpty, now - lastLiveSent >= 0.09 else { return }
         lastLiveSent = now
         let captureMs = Int64((Date().timeIntervalSince1970 - (now - Double(r.captureMs) / 1000)) * 1000)
@@ -455,10 +526,14 @@ final class AnalysisModel: ObservableObject {
         link.send(LiveState(
             captureMs: captureMs, sentMs: Self.nowMs(), faceReadable: readable,
             yaw: r.pose.map { r1($0.yaw) }, pitch: r.pose.map { r1($0.pitch) }, roll: r.pose.map { r1($0.roll) },
-            shape: shape, differences: differences,
+            shape: shape,
+            values: r.face ? Dictionary(uniqueKeysWithValues: values.map { ($0.key.rawValue, ($0.value * 1000).rounded() / 1000) }) : nil,
+            rmsDb: a.rmsDb.map(Double.init), f0Hz: a.f0Hz.map(Double.init),
+            differences: differences,
             baselineSec: baselineSec, baselineTotal: Int(Self.baselineSeconds), baselineReady: baselineReady,
             baselineWait: baselineWait, insufficient: insufficient.map(\.label),
             recording: running, sessionStartedMs: sessionStartedAt.map { Int64($0.timeIntervalSince1970 * 1000) },
+            scene: scene?.rawValue,
             faceRatio: faceRatio, fps: fps))
     }
 

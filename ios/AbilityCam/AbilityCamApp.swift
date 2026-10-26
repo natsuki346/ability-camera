@@ -59,8 +59,11 @@ struct RoleSelectView: View {
 
 /// 設定：役割と、相手の画面に出るこの端末の名前
 struct SettingsView: View {
+    var link: CameraLink? = nil   // 撮る側のときだけ
     @AppStorage("role") private var role = ""
     @AppStorage("deviceName") private var deviceName = ""
+    @AppStorage("sendVideo") private var sendVideo = false
+    @State private var allowed = AllowedViewers.all()
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -79,9 +82,45 @@ struct SettingsView: View {
                 } header: { Text("この端末の名前") } footer: {
                     Text("つないだ相手の画面に「〇〇が見ています」「〇〇に状態を送りますか？」のように出ます。次につなぐときから使われます")
                 }
+                if link != nil {
+                    Section {
+                        Toggle("見る側に映像も送る", isOn: $sendVideo)
+                    } footer: {
+                        Text("初めはオフ。オンのあいだは、見ている端末に小さな映像（長い辺 480px、毎秒5コマまで）を送り、上の帯に「映像を送っています」と出ます。見る側は表示するだけで保存しません。解析のコマ/秒が落ちるときは、送るコマを減らします")
+                    }
+                    Section {
+                        if allowed.isEmpty {
+                            Text("ありません").foregroundStyle(.secondary)
+                        }
+                        ForEach(allowed) { v in
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(v.name)
+                                    Text("許可した日 \(Self.date(v.addedMs))").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("取り消す") {
+                                    AllowedViewers.remove(v.id)
+                                    link?.disconnect(viewerID: v.id)
+                                    allowed = AllowedViewers.all()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                    } header: { Text("許可した端末") } footer: {
+                        Text("ここにある端末は、確認なしでつながります（つながると上の帯に「〇〇が見ています」と出ます）。取り消すと、つながっていれば切り、次は確認してからつなぎます")
+                    }
+                }
             }
             .navigationTitle("設定")
+            .onAppear { allowed = AllowedViewers.all() }
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { dismiss() } } }
         }
+    }
+
+    private static func date(_ ms: Int64) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy/M/d HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
     }
 }

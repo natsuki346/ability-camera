@@ -36,6 +36,7 @@ final class AnalysisModel: ObservableObject {
 
     @Published var baselineSec: Int?          // 普段を記録中の経過秒（記録中でなければ nil）
     @Published var baselineReady = false
+    @Published var baselineWait: String?      // 普段を数えていない理由（数えている間は nil）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
     @Published var differences: [String] = []
     @Published var faceReadable = true
@@ -64,6 +65,10 @@ final class AnalysisModel: ObservableObject {
     // 普段といつもとの違い
     private var baselineStartHost: CFTimeInterval = 0
     private var baselineStartMs: Int64 = 0
+    private var baselineValidS = 0.0          // 普段に数えた時間の合計
+    private var baselineLastT: Double?        // 前に見たコマの撮影時刻（数えた時間の幅を出す）
+    private var lastValidHost: CFTimeInterval = -.infinity
+    private var sessionStartHost: CFTimeInterval = 0
     private var stats: [Metric: Welford] = [:]
     private var smooth: [Metric: Smoother] = [:]
     private var lastAudioAt: CFTimeInterval = 0
@@ -72,7 +77,9 @@ final class AnalysisModel: ObservableObject {
     private var diffSince: [String: CFTimeInterval] = [:]     // 違いが出ている間の開始時刻（続いている秒数を出す）
 
     static let chartWindow = 20.0
-    static let baselineSeconds = 60.0
+    static let baselineSeconds = 60.0     // 数えた時間（時計の時間ではない）
+    static let baselineYawLimit = 35.0
+    static let baselineWarmup = 5.0       // 開いてから最初の5秒は数えない（ポケットに入れる間）
     static let minSamples = 30
     static let resumeGraceSeconds = 5.0   // 裏に回ってからこの秒数以内に戻れば、同じセッションを続ける
 
@@ -130,6 +137,7 @@ final class AnalysisModel: ObservableObject {
         }
         resetLive()
         scene = nil; markMessage = nil
+        sessionStartHost = CACurrentMediaTime()
         resetBaseline()   // 普段の60秒も自動で始める
         running = true
         sessionStartedAt = Date()
@@ -273,7 +281,8 @@ final class AnalysisModel: ObservableObject {
         baselineStartHost = CACurrentMediaTime()
         baselineStartMs = Self.nowMs()
         stats = [:]
-        baselineSec = 0; baselineReady = false; insufficient = []; differences = []
+        baselineValidS = 0; baselineLastT = nil; lastValidHost = -.infinity
+        baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []
         lastChange = nil
         diffSince = [:]
     }
@@ -288,10 +297,12 @@ final class AnalysisModel: ObservableObject {
                                                   insufficient: w.n < Self.minSamples)
         }
         logger.write(BaselineRecord(tMs: Self.nowMs(), startedMs: baselineStartMs,
-                                    durationS: ((now - baselineStartHost) * 10).rounded() / 10,
+                                    wallS: ((now - baselineStartHost) * 10).rounded() / 10,
+                                    validS: (baselineValidS * 10).rounded() / 10,
+                                    yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                     minN: Self.minSamples, metrics: out))
         insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
-        baselineSec = nil
+        baselineSec = nil; baselineWait = nil
         baselineReady = true
     }
 
@@ -351,18 +362,29 @@ final class AnalysisModel: ObservableObject {
             if let f0 = a.f0Hz { voiceValues[.f0Hz] = Double(f0) }
         }
 
-        let collecting = running && !baselineReady   // 普段を記録するのはセッションの記録中だけ
+        let faceCount = recentFace.filter(\.face).count
+        let readable = faceCount * 2 >= recentFace.count
+
+        // 普段に数えるのは、ちゃんと映っていたコマだけ（顔が読めていて |yaw| < 35°、開いてから5秒より後）。
+        // 声も同じ間のものだけ数える（ポケットに入れる音などを入れないため）
+        let collecting = running && !baselineReady
+        let warmingUp = now - sessionStartHost < Self.baselineWarmup
+        let facing = r.pose.map { abs($0.yaw) < Self.baselineYawLimit } ?? false
+        let valid = collecting && !warmingUp && readable && r.face && facing
+        if collecting {
+            // 前に見たコマからの幅を、今のコマの状態として数える（0.5秒より空いた分は数えない）
+            if valid, let last = baselineLastT, captureT > last { baselineValidS += min(captureT - last, 0.5) }
+            baselineLastT = captureT
+            if valid { lastValidHost = now }
+        }
         for (m, x) in faceValues {
             smooth[m, default: Smoother()].add(x, at: captureT)
-            if collecting { stats[m, default: Welford()].add(x) }
+            if valid { stats[m, default: Welford()].add(x) }
         }
         for (m, x) in voiceValues {
             smooth[m, default: Smoother()].add(x, at: a.at)
-            if collecting { stats[m, default: Welford()].add(x) }
+            if valid { stats[m, default: Welford()].add(x) }
         }
-
-        let faceCount = recentFace.filter(\.face).count
-        let readable = faceCount * 2 >= recentFace.count
         if faceReadable != readable { faceReadable = readable }
         faceShape = readable && !shapeSmooth.isEmpty ? shapeSmooth : nil
 
@@ -375,11 +397,15 @@ final class AnalysisModel: ObservableObject {
         }
 
         if collecting {
-            let sec = Int(now - baselineStartHost)
-            if now - baselineStartHost >= Self.baselineSeconds {
+            let sec = Int(baselineValidS)
+            if baselineValidS >= Self.baselineSeconds {
                 finishBaseline(now: now)
-            } else if baselineSec != sec {
-                baselineSec = sec
+            } else {
+                if baselineSec != sec { baselineSec = sec }
+                // ちらつかないよう、0.5秒数えられなかったら「待っています」にする
+                let wait: String? = warmingUp ? "開いてから\(Int(Self.baselineWarmup))秒は数えません"
+                    : now - lastValidHost > 0.5 ? "顔が映るのを待っています" : nil
+                if baselineWait != wait { baselineWait = wait }
             }
         }
         if running && baselineReady { updateDifferences(now: now, faceReadable: readable) }

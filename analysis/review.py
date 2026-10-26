@@ -666,6 +666,19 @@ def fmt_s(s: float) -> str:
     return f"{s // 3600}時間{s // 60 % 60}分{s % 60}秒" if s >= 3600 else f"{s // 60}分{s % 60}秒"
 
 
+def baseline_time_row(b: dict) -> list:
+    """普段を集めた時間。古い記録（v0.3 まで）は duration_s だけで、時計の時間で数えていた"""
+    started = jst(b["started_ms"] / 1000) if b.get("started_ms") else "–"
+    wall = b.get("wall_s", b.get("duration_s"))
+    valid = b.get("valid_s")
+    if valid is None:
+        cond = "時計の時間で数えた（v0.3 までの記録）"
+    else:
+        cond = f"顔が読めていて |yaw| < {b.get('yaw_limit_deg', 35):g}°、開いてから {b.get('warmup_s', 5):g}秒より後"
+    return [started, jst(b["t_ms"] / 1000), "–" if wall is None else f"{wall:g}秒",
+            "–" if valid is None else f"{valid:g}秒", cond]
+
+
 def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str) -> None:
     rec, c, e = a.rec, a.criteria, html.escape
     parts = []
@@ -708,7 +721,13 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                 f = lambda v: "" if v is None else f"{v:g}"
                 brows.append([jst(b["t_ms"] / 1000), m, LABEL[m], st.get("n", ""), f(st.get("mean")), f(st.get("std")),
                               "データ不足（計算しない）" if st.get("insufficient") else ""])
-        parts.append("<h2>普段（baseline）</h2>" + table(["記録し終えた時刻", "指標", "", "n", "mean", "std", ""], brows))
+        parts.append("<h2>普段（baseline）</h2>"
+                     "<p class=note>v0.4 からは、顔が読めていて横を向きすぎていない（|yaw| が yaw_limit_deg 未満）コマだけを、"
+                     "開いてから warmup_s 秒より後に数えています（声も同じ間だけ）。"
+                     "「数えた時間」が60秒になるまでにかかった実際の時間が「かかった時間」です。</p>"
+                     + table(["記録し始めた時刻", "記録し終えた時刻", "かかった時間", "数えた時間", "数えた条件"],
+                             [baseline_time_row(b) for b in rec.baselines])
+                     + table(["記録し終えた時刻", "指標", "", "n", "mean", "std", ""], brows))
     else:
         parts.append("<h2>普段（baseline）</h2><p>普段の記録（type:\"baseline\"）が無いため、区間は判定できません。</p>")
 

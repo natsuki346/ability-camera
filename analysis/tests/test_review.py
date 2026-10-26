@@ -140,6 +140,29 @@ class FixtureTest(unittest.TestCase):
             self.assertIn("仮の値", csv_text)
 
 
+    def test_baseline_times(self):
+        """v0.4 の baseline 行（wall_s / valid_s）と、古い行（duration_s だけ）の両方を出す"""
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            lines = FIXTURE.read_text(encoding="utf-8").splitlines()
+            out, first = [], True
+            for line in lines:
+                o = json.loads(line)
+                if o.get("type") == "baseline" and first:
+                    first = False
+                    o.pop("duration_s", None)
+                    o.update({"wall_s": 23.4, "valid_s": 10.0, "yaw_limit_deg": 35, "warmup_s": 5})
+                out.append(json.dumps(o, ensure_ascii=False))
+            p = Path(d) / "new.jsonl"
+            p.write_text("\n".join(out) + "\n", encoding="utf-8")
+            review.main([str(p), "--out-dir", d])
+            doc = (Path(d) / "new.html").read_text(encoding="utf-8")
+            self.assertIn("23.4秒", doc)
+            self.assertIn("10秒", doc)
+            self.assertIn("開いてから 5秒より後", doc)
+            self.assertIn("時計の時間で数えた（v0.3 までの記録）", doc)   # 2つ目の baseline は古い形のまま
+
+
 class CandidateTest(unittest.TestCase):
     """作った区間を与えて、通知候補の条件 A・B・C と場面の振り分けを見る（fixture の時刻を使う）"""
 

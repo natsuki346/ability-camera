@@ -58,12 +58,16 @@ struct BaselineRecord: Encodable {
     let type = "baseline"
     let tMs: Int64              // 記録し終えた時刻
     let startedMs: Int64        // 記録し始めた時刻
-    let durationS: Double
+    let wallS: Double           // 普段を集めるのにかかった実際の時間
+    let validS: Double          // そのうち数えた時間（顔が読めていて |yaw| < 35°、開いてから5秒より後）
+    let yawLimitDeg: Double
+    let warmupS: Double         // 開いてからこの秒数は数えない（ポケットに入れる間）
     let minN: Int
     let metrics: [String: Stat]
 
     enum CodingKeys: String, CodingKey {
-        case type, tMs = "t_ms", startedMs = "started_ms", durationS = "duration_s", minN = "min_n", metrics
+        case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
+        case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", metrics
     }
 }
 

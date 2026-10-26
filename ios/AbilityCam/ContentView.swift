@@ -136,6 +136,11 @@ struct ContentView: View {
                 if let sec = model.baselineSec {
                     Text("普段を記録中 \(sec)/\(Int(AnalysisModel.baselineSeconds))秒（落ち着いているときに）")
                     ProgressView(value: Double(sec), total: AnalysisModel.baselineSeconds)
+                    if let wait = model.baselineWait {
+                        Text(wait).foregroundStyle(.secondary)
+                    } else {
+                        Text("顔が映っていて、横を向きすぎていない間だけ数えます").font(.caption).foregroundStyle(.secondary)
+                    }
                 } else if model.baselineReady {
                     if model.differences.isEmpty {
                         Text(model.faceReadable ? "いつもと大きな違いはありません" : "声は、いつもと大きな違いはありません")

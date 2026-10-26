@@ -10,6 +10,7 @@
 data/
 # 振り返りレポートの出力（記録から作るので入れない）
 ability-cam-*.html
+framing-checks*.html
 *_segments.csv
 
 # 生成物

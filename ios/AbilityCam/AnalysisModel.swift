@@ -25,6 +25,10 @@ final class AnalysisModel: ObservableObject {
     @Published var cameraActive = false      // カメラが動いている（記録していなくても映り方の確認に使う）
     @Published var cameraPausedForIdle = false   // 操作がなくて止めた（タップで再開）
     @Published var status = "カメラの準備中…"
+    @Published var framingSince: Date?               // 映り方チェック中なら始めた時刻（記録はしない）
+    private var framing: FramingCheck?               // 数えている途中（画面には出さない。毎コマ更新するため）
+    @Published var framingResult: FramingSummary?     // 終えたあとの要約
+    @Published var framingNoteSaved: String?
     @Published var faceRatio: Double?
     @Published var fps: Double?
     @Published var procMs: Double?
@@ -133,7 +137,10 @@ final class AnalysisModel: ObservableObject {
     }
 
     /// アプリが裏に回った
-    func enterBackground() { pauseCamera(idle: false) }
+    func enterBackground() {
+        if framing != nil { finishFramingCheck(endedBy: "background") }   // カメラが止まるので、そこで終える
+        pauseCamera(idle: false)
+    }
 
     /// アプリが前に戻った
     func enterForeground() async {
@@ -150,7 +157,7 @@ final class AnalysisModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(10))
                 guard let self, !Task.isCancelled else { return }
-                if self.cameraActive, !self.running, CACurrentMediaTime() - self.lastActivity >= Self.idleSeconds {
+                if self.cameraActive, !self.running, self.framing == nil, CACurrentMediaTime() - self.lastActivity >= Self.idleSeconds {
                     self.pauseCamera(idle: true)
                     return
                 }
@@ -172,6 +179,7 @@ final class AnalysisModel: ObservableObject {
 
     /// 記録を始める。マイクはここで初めて使う
     func start() async {
+        guard framing == nil else { return }
         await prepareCamera()
         guard cameraActive else { return }
         guard await AVAudioApplication.requestRecordPermission() else { status = "マイクの許可がありません（設定アプリから許可してください）"; return }
@@ -204,6 +212,49 @@ final class AnalysisModel: ObservableObject {
         status = "保存しました: \(logger.fileName ?? "-")（\(recordedFrames)コマ）"
         noteActivity()
         if !cameraActive { UIApplication.shared.isIdleTimerDisabled = false }
+    }
+
+    // MARK: 映り方チェック（表情の記録・普段・マイクは使わない。要約だけを framing-checks.jsonl に残す）
+
+    func toggleFramingCheck() async {
+        if framing != nil { finishFramingCheck(endedBy: "button") } else { await startFramingCheck() }
+    }
+
+    func startFramingCheck() async {
+        guard !running, framing == nil else { return }
+        await prepareCamera()
+        guard cameraActive else { return }
+        framing = FramingCheck(startHost: CACurrentMediaTime())
+        framingSince = Date()
+        framingResult = nil; framingNoteSaved = nil
+        status = "映り方チェック中…（表情・音声は記録していません）"
+    }
+
+    func finishFramingCheck(endedBy: String) {
+        guard var f = framing else { return }
+        f.finish(atHost: CACurrentMediaTime())
+        framing = nil; framingSince = nil
+        let sum = f.summary(endedBy: endedBy)
+        framingResult = sum
+        do {
+            try FramingLog.append(sum)
+            status = "映り方チェックの要約を保存しました: \(FramingLog.fileName)"
+                + (endedBy == "background" ? "（アプリが裏に回ったので、そこで終えました）" : "")
+        } catch {
+            status = "要約を保存できませんでした: \(error.localizedDescription)"
+        }
+        noteActivity()
+    }
+
+    func saveFramingNote(_ text: String) {
+        let note = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let r = framingResult, !note.isEmpty else { return }
+        do {
+            try FramingLog.append(FramingNote(id: r.id, tMs: Self.nowMs(), note: note))
+            framingNoteSaved = note
+        } catch {
+            status = "メモを保存できませんでした: \(error.localizedDescription)"
+        }
     }
 
     /// 普段を取り直す
@@ -271,6 +322,7 @@ final class AnalysisModel: ObservableObject {
         latSum += r.latMs
 
         let captureT = Double(r.captureMs) / 1000
+        framing?.add(captureT: captureT, face: r.face, yaw: r.pose?.yaw)
         recentFace.append((captureT, r.face))
         recentFace.removeAll { $0.t < captureT - 1 }
 
@@ -337,6 +389,7 @@ final class AnalysisModel: ObservableObject {
         if meshEnabled, readable, r.face, !r.mesh.isEmpty {
             mesh = FaceMesh(points: r.mesh, imageSize: r.imageSize, values: faceValues)
             meshLagSum += (now - captureT) * 1000; meshN += 1
+            framing?.addMeshLag((now - captureT) * 1000)
             meshLagMs = meshLagSum / Double(meshN)
         } else if mesh != nil {
             mesh = nil

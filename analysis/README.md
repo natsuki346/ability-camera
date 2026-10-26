@@ -22,6 +22,16 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回だ
 ```
 変えられる項目：`smooth_s`（ならし）、`start_z`、`start_min_s`、`end_z`、`end_min_s`。
 
+## 映り方チェック（`framing.py`）
+アプリの「映り方チェック」が残した `framing-checks.jsonl`（要約だけ）から、チェックごとの一覧と、顔が映っていた割合の比較の表を出す。numpy などは使わない。
+```sh
+.venv/bin/python framing.py framing-checks.jsonl                    # → framing-checks.html
+.venv/bin/python framing.py 端末A/framing-checks.jsonl 端末B/framing-checks.jsonl --out 比較.html
+```
+- **映っていた割合の比較（メモごと）**：同じメモのチェックをまとめ、時間で重み付けした「顔が映っていた」「横を向きすぎていなかった（左右35°未満）」の割合
+- **比較（チェックごと）**：割合の高い順。10秒ごとの、顔が映っていた割合を小さな棒で並べる
+- **チェックの一覧**：時刻順。計測した時間、顔が映っていた時間、映らなかった時間の一番長い続き、解析コマ/秒、撮影→網目の遅れ、終え方、メモ
+
 ## 基準（`criteria.json`）
 基準は `criteria.json` に置く。**変えたら `version` を更新し、`changelog` に日付と理由を1件足す。**
 レポートの先頭と CSV のヘッダには、その回に使った基準（引数で変えた値も）が必ず出る。
@@ -55,4 +65,5 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回だ
 .venv/bin/python tests/make_fixture.py               # 作り物のテスト用記録を作り直す
 .venv/bin/python -m unittest discover -s tests
 ```
+`test_framing.py` は映り方チェックの読み込み（メモは一番新しいもの・同じ要約は1つ）、メモごとのまとめ、HTML を確かめる。
 `tests/fixture_basic.jsonl` は人の記録ではなく、区間・短い動き・ヒステリシス・判定対象外・取り直しを確かめるための作り物。

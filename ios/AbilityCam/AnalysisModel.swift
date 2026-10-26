@@ -51,6 +51,8 @@ final class AnalysisModel: ObservableObject {
     private let face = FaceAnalyzer()
     private let audio = AudioAnalyzer()
     private let logger = SessionLogger()
+    let link = CameraLink()                  // 見る側（iPad / Mac）へ状態を送る
+    private var lastLiveSent: CFTimeInterval = 0
 
     private var frames = 0, faceFrames = 0, procSum = 0.0, procN = 0, latSum = 0.0
     private var startHost: CFTimeInterval = 0
@@ -95,6 +97,7 @@ final class AnalysisModel: ObservableObject {
             endBackgroundTask()
         }
         if running { await resumeSession() } else { await startSession() }
+        link.start()
         if !recoveryDone {
             recoveryDone = true
             recoverMissing()
@@ -103,6 +106,7 @@ final class AnalysisModel: ObservableObject {
 
     /// アプリが裏に回った：カメラとマイクを止め、5秒たっても戻らなければファイルを閉じて要約する
     func appEnteredBackground() {
+        link.stop()   // 裏に回るとつながりは切れる。戻ったら、見る側からもう一度申し込む
         stopCamera()
         guard running else { return }
         if micOn { audio.stop() }
@@ -118,6 +122,15 @@ final class AnalysisModel: ObservableObject {
             guard !Task.isCancelled else { return }
             self?.finalizeSession()
         }
+    }
+
+    /// 役割を「見る側」に変えたとき：すぐ止めて、記録を閉じて要約する
+    func shutdown() {
+        link.stop()
+        stopCamera()
+        if running, micOn { audio.stop() }
+        finalizeSession()
+        UIApplication.shared.isIdleTimerDisabled = false
     }
 
     private func startSession() async {
@@ -258,13 +271,16 @@ final class AnalysisModel: ObservableObject {
     func tapScene(_ s: CareScene) {
         guard running else { return }
         scene = scene == s ? nil : s
-        logger.write(EventRecord(tMs: Self.nowMs(), kind: "scene", value: .text(scene?.rawValue ?? "なし")))
+        let t = Self.nowMs(), v = scene?.rawValue ?? "なし"
+        logger.write(EventRecord(tMs: t, kind: "scene", value: .text(v)))
+        link.send(LiveEvent(tMs: t, kind: "scene", value: v))
     }
 
     func tapMark(_ m: Mark) {
         guard running else { return }
         let now = Date()
         logger.write(EventRecord(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: .text(m.rawValue)))
+        link.send(LiveEvent(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: m.rawValue))
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
         let msg = "家族の印を記録しました：\(m.rawValue)（\(f.string(from: now))）"
@@ -409,6 +425,7 @@ final class AnalysisModel: ObservableObject {
             }
         }
         if running && baselineReady { updateDifferences(now: now, faceReadable: readable) }
+        sendLive(r, now: now, readable: readable)
 
         // グラフ
         var new: [ChartPoint] = []
@@ -426,6 +443,23 @@ final class AnalysisModel: ObservableObject {
         }
         points.append(contentsOf: new)
         points.removeAll { $0.t < t - Self.chartWindow }
+    }
+
+    /// 見る側へ（1秒に10回まで）。映像・音声・顔の点は送らない
+    private func sendLive(_ r: FaceAnalyzer.Result, now: CFTimeInterval, readable: Bool) {
+        guard !link.viewers.isEmpty, now - lastLiveSent >= 0.09 else { return }
+        lastLiveSent = now
+        let captureMs = Int64((Date().timeIntervalSince1970 - (now - Double(r.captureMs) / 1000)) * 1000)
+        let r1 = { (x: Double) in (x * 10).rounded() / 10 }
+        let shape = faceShape?.mapValues { ($0 * 1000).rounded() / 1000 }
+        link.send(LiveState(
+            captureMs: captureMs, sentMs: Self.nowMs(), faceReadable: readable,
+            yaw: r.pose.map { r1($0.yaw) }, pitch: r.pose.map { r1($0.pitch) }, roll: r.pose.map { r1($0.roll) },
+            shape: shape, differences: differences,
+            baselineSec: baselineSec, baselineTotal: Int(Self.baselineSeconds), baselineReady: baselineReady,
+            baselineWait: baselineWait, insufficient: insufficient.map(\.label),
+            recording: running, sessionStartedMs: sessionStartedAt.map { Int64($0.timeIntervalSince1970 * 1000) },
+            faceRatio: faceRatio, fps: fps))
     }
 
     /// z =（ならした今の値 − 普段の平均）÷ max(普段の標準偏差, 下限)

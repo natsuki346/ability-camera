@@ -19,7 +19,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.ability.cam
         DEVELOPMENT_TEAM: ${TEAM_ID}
         CODE_SIGN_STYLE: Automatic
-        TARGETED_DEVICE_FAMILY: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"   # iPhone（撮る側）と iPad（見る側）。Apple シリコンの Mac では iPad 用アプリとして動く
         SWIFT_VERSION: "5.0"
         ENABLE_USER_SCRIPT_SANDBOXING: NO   # CocoaPods のスクリプトを動かすため
     info:
@@ -28,7 +28,10 @@ targets:
         CFBundleDisplayName: Ability Cam
         NSCameraUsageDescription: 介助中のやり取りで、表情の変化をその場で解析するために使います。映像は保存せず、外にも送りません。
         NSMicrophoneUsageDescription: 声の大きさと高さを、その場で解析するために使います。音声は保存せず、外にも送りません。
+        NSLocalNetworkUsageDescription: 家の中の iPad や Mac に、顔の絵といつもとの違いを端末どうし直接送るために使います。映像・音声は送らず、インターネットは使いません。
+        NSBonjourServices: [_abilitycam._tcp, _abilitycam._udp]
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]

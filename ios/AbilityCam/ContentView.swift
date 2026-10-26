@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var cameraLarge = false
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
     @Environment(\.scenePhase) private var scenePhase
+    @State private var showSettings = false
 
     private let series = ["口角を上げる", "眉を寄せる", "目を細める", "口を開ける", "音量", "声の高さ"]
     private let colors: [Color] = [Metric.mouthSmile, .browDown, .eyeSquint, .jawOpen, .rmsDb, .f0Hz].map(\.color)
@@ -14,7 +15,12 @@ struct ContentView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                recordingBanner
+                HStack(alignment: .top) {
+                    recordingBanner
+                    Button { showSettings = true } label: { Image(systemName: "gearshape").padding(10) }
+                        .accessibilityLabel("設定")
+                }
+                ViewersBar(link: model.link)
 
                 ZStack(alignment: .topTrailing) {
                     faceSketch
@@ -55,6 +61,8 @@ struct ContentView: View {
             }
             .padding()
         }
+        .sheet(isPresented: $showSettings) { SettingsView() }
+        .onDisappear { model.shutdown() }   // 役割を「見る側」に変えた
         .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {
             case .active: Task { await model.appBecameActive() }   // 開いたら記録（新しいセッション、5秒以内なら同じセッション）
@@ -261,6 +269,38 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
+    }
+}
+
+/// 見ている端末（だれが見ているか）と、見たいという申し込みの確認
+struct ViewersBar: View {
+    @ObservedObject var link: CameraLink
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(link.viewers, id: \.self) { p in
+                HStack {
+                    Label("\(p.displayName)が見ています", systemImage: "ipad.and.iphone")
+                    Spacer()
+                    Button("切る") { link.disconnect(p) }
+                        .buttonStyle(.bordered)
+                        .tint(Color(red: 0x6B / 255, green: 0x7A / 255, blue: 0x8C / 255))   // 青灰（赤は使わない）
+                }
+                .font(.callout)
+                .foregroundStyle(ContentView.navy)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(Color(red: 0xDC / 255, green: 0xE3 / 255, blue: 0xEA / 255), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .alert(link.requests.first.map { "\($0.peer.displayName)に状態を送りますか？" } ?? "",
+               isPresented: Binding(get: { !link.requests.isEmpty }, set: { _ in })) {
+            if let r = link.requests.first {
+                Button("送る") { link.answer(r, send: true) }
+                Button("送らない", role: .cancel) { link.answer(r, send: false) }
+            }
+        } message: {
+            Text("顔の絵を動かす数値・顔の向き・いつもとの違い・記録の状態・家族の印と場面を、その場で送ります。映像・音声・記録のファイルは送りません。")
+        }
     }
 }
 

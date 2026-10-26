@@ -1,0 +1,56 @@
+# 振り返りレポート（PC 用）
+
+Ability Cam の記録（JSONL、`ability-cam.ios.v0.2` 以降）から、**普段（type:"baseline"）から外れた区間**を数値の事実として出す。
+状態の名前（快・不快・痛み など）は付けない。外部には何も送らない（すべて手元の PC で計算する）。
+
+## 使い方
+```sh
+cd analysis
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回だけ
+.venv/bin/python review.py 記録.jsonl            # ふつうの記録
+.venv/bin/python review.py 記録.jsonl --calm     # 「何もしていない記録」→ 誤報の目安を出す
+```
+出力は記録と同じ場所に：
+- `記録.html` … レポート（グラフの画像は埋め込み、1ファイル）
+- `記録_segments.csv` … 区間の一覧。先頭の `#` 行に、使った基準を書き出している
+
+基準を変えて試す：
+```sh
+.venv/bin/python review.py 記録.jsonl --set brow_down.start_min_s=0.8 --set all.end_z=1.2
+.venv/bin/python review.py 記録.jsonl --start-z 2.5          # すべての指標の start_z を変える
+.venv/bin/python review.py 記録.jsonl --criteria 別の基準.json --out-dir 出力先
+```
+変えられる項目：`smooth_s`（ならし）、`start_z`、`start_min_s`、`end_z`、`end_min_s`。
+
+## 基準（`criteria.json`）
+基準は `criteria.json` に置く。**変えたら `version` を更新し、`changelog` に日付と理由を1件足す。**
+レポートの先頭と CSV のヘッダには、その回に使った基準（引数で変えた値も）が必ず出る。
+
+| 指標 | 初期値 | 根拠 |
+|---|---|---|
+| 表情（mouth_smile, brow_down, eye_squint, jaw_open） | ならし 0.3秒、\|z\|≥2 が 0.5秒以上で開始 | ふつうの表情は 0.5〜4秒。0.5秒未満は微表情として「短い動き」に別に数える |
+| 声（rms_db, f0_hz） | ならし 0.3秒、\|z\|≥2 が 0.5秒以上で開始 | 決まった根拠がない。`--calm` の記録の誤報の割合を見て後から決める |
+| 終了（すべて） | \|z\|<1.5 が 0.5秒続いたら | ヒステリシス（2 と 1.5 の間ではちらつかない） |
+
+- std の下限はアプリと同じ（表情 0.03、2dB、10Hz）。普段で `insufficient` の指標は計算しない
+- 表情は、直近1秒で顔が映っているコマが半分以上、かつ |yaw| < 35°（v0.3 以降の記録）のときだけ判定する。それ以外は「判定対象外」
+- 「普段を取り直す」から次の baseline 行までは、アプリと同じく判定しない
+- 判定できない時間の直後に |z|≥2 のまま始まったものは、始まりが見えていないので「短い動き」に数えない（区間になったら備考に書く）
+- `eda_response_window_s`（出来事の1〜4秒後）は、将来の手首の記録（皮膚電気活動）用。今は使っていない
+
+## レポートの中身
+- **使った基準**と変更の履歴
+- **記録の質**：長さ、顔が映っていた割合、表情の判定対象外だった時間の割合、yaw の分布、解析コマ/秒、撮影→結果の遅れ（中央値・95%）
+- **普段**：baseline 行ごとの n / mean / std
+- **区間の数**：指標ごとの区間と短い動き。`--calm` のときは 1分あたり・10分あたりを出し、目安（10分に1回以下）と比べる
+- **印との対応**：家族の印ごとに、一番近い区間までの時間差
+- **z の時系列**：指標ごと。±開始の z の線、区間（橙＝普段より上、青＝下）、場面（上の帯）、印（縦線）、判定対象外（灰色）。横軸は日本時間
+  - 手首の記録（ability-lab.raw.v1）は、`review.py` の `Track` を足せば同じ時間軸に並ぶ作り（今は未実装）
+- **区間の一覧**：開始・終了（日本時間）、長さ、指標、向き（上／下）、ピークの z、普段の平均 → ピークの値、場面、前後10秒の印、顔が映っていた割合、yaw の平均
+
+## テスト
+```sh
+.venv/bin/python tests/make_fixture.py               # 作り物のテスト用記録を作り直す
+.venv/bin/python -m unittest discover -s tests
+```
+`tests/fixture_basic.jsonl` は人の記録ではなく、区間・短い動き・ヒステリシス・判定対象外・取り直しを確かめるための作り物。

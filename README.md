@@ -16,6 +16,7 @@
 ## 構成
 - `ios/` … iOS アプリ（SwiftUI + MediaPipe Face Landmarker + AVAudioEngine）
 - `web/` … ブラウザ版（録画ファイルの解析にも使える）
+- `analysis/` … PC 用の振り返りレポート（記録から、普段から外れた区間を出す）。使い方は `analysis/README.md`
 
 ## iOS のビルド（Mac）
 ```sh

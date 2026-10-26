@@ -5,7 +5,12 @@
 *.m4a
 *.wav
 *.jsonl
+# テスト用の作り物の記録だけは入れる
+!analysis/tests/*.jsonl
 data/
+# 振り返りレポートの出力（記録から作るので入れない）
+ability-cam-*.html
+*_segments.csv
 
 # 生成物
 ios/Pods/
@@ -21,4 +26,5 @@ build/
 # その他
 web/*.pem
 __pycache__/
+analysis/.venv/
 .DS_Store

@@ -1,0 +1,34 @@
+name: AbilityCam
+options:
+  bundleIdPrefix: com.ability
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  AbilityCam:
+    type: application
+    platform: iOS
+    sources:
+      - path: AbilityCam
+        excludes:
+          - "Resources/**"
+      - path: AbilityCam/Resources
+        buildPhase: resources
+        optional: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ability.cam
+        DEVELOPMENT_TEAM: ${TEAM_ID}
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO   # CocoaPods のスクリプトを動かすため
+    info:
+      path: AbilityCam/Info.plist
+      properties:
+        CFBundleDisplayName: Ability Cam
+        NSCameraUsageDescription: 介助中のやり取りで、表情の変化をその場で解析するために使います。映像は保存せず、外にも送りません。
+        NSMicrophoneUsageDescription: 声の大きさと高さを、その場で解析するために使います。音声は保存せず、外にも送りません。
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]

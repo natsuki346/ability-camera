@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ability Cam</title>
+<style>
+  :root{--bg:#f6f5f2;--fg:#1d1d1b;--mut:#6b6a66;--line:#d9d6cf;--acc:#2f6f5e;--warn:#a5482a;}
+  @media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecebe7;--mut:#9a9893;--line:#33322f;--acc:#6fbfa6;--warn:#e08a6a;}}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Hiragino Sans",sans-serif}
+  header{padding:12px 16px;font-weight:600;border-bottom:1px solid var(--line)}
+  header small{font-weight:400;color:var(--mut);margin-left:8px}
+  .wrap{padding:12px 16px;max-width:960px;margin:0 auto}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+  button,.file{padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--fg);font:inherit;cursor:pointer}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+  button:disabled{opacity:.4;cursor:default}
+  .file input{display:none}
+  .stage{position:relative;width:100%;background:#000;border-radius:8px;overflow:hidden}
+  video,#overlay{display:block;width:100%;height:auto}
+  #overlay{position:absolute;inset:0;height:100%}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:12px 0}
+  .stat{border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .stat b{display:block;font-size:20px} .stat span{color:var(--mut);font-size:12px}
+  #chart{width:100%;height:220px;border:1px solid var(--line);border-radius:8px}
+  .legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--mut);margin-top:6px}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+  #status{color:var(--mut);font-size:13px;margin-top:8px} #status.err{color:var(--warn)}
+  .note{font-size:12px;color:var(--mut);margin-top:12px}
+</style>
+</head>
+<body>
+<header>Ability Cam <small>v0.1 表情・声の解析（端末内のみ）</small></header>
+<div class="wrap">
+  <div class="controls">
+    <button id="btnLive" class="primary">カメラ開始</button>
+    <label class="file">録画を解析<input type="file" id="fileIn" accept="video/*"></label>
+    <button id="btnStop" disabled>停止</button>
+    <label><input type="checkbox" id="chkRec" checked> 動画も端末に保存</label>
+    <button id="btnDl" disabled>記録を保存(JSONL)</button>
+  </div>
+  <div class="stage"><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div>
+  <div class="stats">
+    <div class="stat"><b id="sFace">–</b><span>顔が映っている割合</span></div>
+    <div class="stat"><b id="sFps">–</b><span>解析フレーム/秒</span></div>
+    <div class="stat"><b id="sInfer">–</b><span>解析時間 ms（平均）</span></div>
+    <div class="stat"><b id="sLat">–</b><span>撮影→結果 ms（平均）</span></div>
+    <div class="stat"><b id="sVol">–</b><span>音量 dB</span></div>
+    <div class="stat"><b id="sF0">–</b><span>声の高さ Hz</span></div>
+  </div>
+  <canvas id="chart"></canvas>
+  <div class="legend" id="legend"></div>
+  <div id="status">準備中…</div>
+  <p class="note">映像と音声はこの端末の中だけで処理します。外に送るのは、最初に解析モデルとプログラムを読み込む通信だけです。</p>
+</div>
+
+<script type="module">
+import {FaceLandmarker, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const video=$("video"), overlay=$("overlay"), chart=$("chart");
+const octx=overlay.getContext("2d"), cctx=chart.getContext("2d");
+const status=(m,err)=>{$("status").textContent=m;$("status").className=err?"err":"";};
+
+// ---- 表示する系列（0〜1に正規化して重ね描き）----
+const SERIES=[
+  {k:"face",  name:"顔あり",       color:"#9a9893"},
+  {k:"smile", name:"口角を上げる", color:"#2f9e6e"},
+  {k:"brow",  name:"眉を寄せる",   color:"#c4572e"},
+  {k:"squint",name:"目を細める",   color:"#b08a1e"},
+  {k:"jaw",   name:"口を開ける",   color:"#4a6fc0"},
+  {k:"vol",   name:"音量",         color:"#8a4ab0"},
+  {k:"f0",    name:"声の高さ",     color:"#d14a8b"},
+];
+$("legend").innerHTML=SERIES.map(s=>`<span><i style="background:${s.color}"></i>${s.name}</span>`).join("");
+
+// ---- 状態 ----
+let landmarker=null, running=false, mode=null, stream=null, recorder=null, recChunks=[];
+let audioCtx=null, analyser=null, audioBuf=null, fileSrcNode=null;
+let log=[], hist=[], agg;
+const KEYPTS=[1,10,152,33,263,61,291]; // 鼻先・額・あご・両目尻・両口角（追跡の安定性を後で確かめる用）
+function resetAgg(){agg={frames:0,face:0,infer:0,lat:0,latN:0,t0:performance.now()};}
+
+// ---- モデル読み込み ----
+async function init(){
+  try{
+    const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts=d=>({baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",delegate:d},
+      runningMode:"VIDEO",numFaces:1,outputFaceBlendshapes:true});
+    try{landmarker=await FaceLandmarker.createFromOptions(fs,opts("GPU"));}
+    catch(e){landmarker=await FaceLandmarker.createFromOptions(fs,opts("CPU"));}
+    status("準備できました。");
+  }catch(e){status("モデルを読み込めませんでした: "+e.message,true);}
+}
+init();
+
+// ---- 音声 ----
+function setupAudio(source){
+  audioCtx=audioCtx||new AudioContext();
+  analyser=audioCtx.createAnalyser(); analyser.fftSize=2048;
+  audioBuf=new Float32Array(analyser.fftSize);
+  source.connect(analyser); // 出力にはつながない（スピーカーから鳴らさない）
+}
+function audioFeatures(){
+  if(!analyser) return {rms_db:null,f0_hz:null};
+  analyser.getFloatTimeDomainData(audioBuf);
+  const b=audioBuf,n=b.length; let s=0; for(let i=0;i<n;i++) s+=b[i]*b[i];
+  const rms=Math.sqrt(s/n), db=rms>0?20*Math.log10(rms):-100;
+  return {rms_db:+db.toFixed(1), f0_hz:pitch(b,audioCtx.sampleRate,rms)};
+}
+function pitch(b,sr,rms){ // 自己相関。70〜1000Hz、声らしい周期性があるときだけ返す
+  if(rms<0.01) return null;
+  const n=b.length, maxLag=Math.min(Math.floor(sr/70),n-1), minLag=Math.floor(sr/1000);
+  const c=new Float32Array(maxLag+1);
+  for(let l=0;l<=maxLag;l++){let t=0;for(let i=0;i<n-l;i++) t+=b[i]*b[i+l]; c[l]=t;}
+  let d=1; while(d<maxLag && c[d]>c[d+1]) d++;
+  let best=-Infinity,bl=-1; for(let l=Math.max(d,minLag);l<=maxLag;l++) if(c[l]>best){best=c[l];bl=l;}
+  if(bl<1 || best/c[0]<0.5) return null;
+  return +(sr/bl).toFixed(1);
+}
+
+// ---- 開始・停止 ----
+$("btnLive").onclick=async()=>{
+  if(!landmarker) return status("まだ準備中です。",true);
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:"environment"},width:{ideal:1280},height:{ideal:720}},
+      audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  }catch(e){return status("カメラ・マイクを使えません: "+e.message+"（スマホではHTTPSで開く必要があります）",true);}
+  video.srcObject=stream; video.muted=true; await video.play();
+  setupAudio((audioCtx=audioCtx||new AudioContext()).createMediaStreamSource(stream));
+  await audioCtx.resume();
+  if($("chkRec").checked) startRecording();
+  begin("live");
+};
+$("fileIn").onchange=async e=>{
+  const f=e.target.files[0]; if(!f) return;
+  if(!landmarker) return status("まだ準備中です。",true);
+  video.srcObject=null; video.src=URL.createObjectURL(f); video.muted=false;
+  audioCtx=audioCtx||new AudioContext();
+  if(!fileSrcNode) fileSrcNode=audioCtx.createMediaElementSource(video); // 1要素につき1回だけ作れる
+  setupAudio(fileSrcNode); await audioCtx.resume();
+  video.onended=stop;
+  await video.play();
+  begin("file",f.name);
+  e.target.value="";
+};
+$("btnStop").onclick=stop;
+
+function begin(m,fileName){
+  mode=m; running=true; log=[]; hist=[]; resetAgg();
+  log.push({schema:"ability-cam.v0",mode:m,file:fileName||null,started_at_ms:Date.now(),
+    started_at:new Date().toISOString(),ua:navigator.userAgent,
+    note:"t_ms=端末の時刻(epoch ms, liveのみ) / media_s=動画内の秒 / bs=表情の数値52種(0-1) / pts=鍵となる顔の点[x,y,z]"});
+  $("btnStop").disabled=false; $("btnLive").disabled=true; $("btnDl").disabled=true;
+  status(m==="live"?"解析中（カメラ）":"解析中（録画）: "+fileName);
+  schedule();
+}
+function stop(){
+  if(!running) return; running=false;
+  if(recorder && recorder.state!=="inactive") recorder.stop();
+  if(stream){stream.getTracks().forEach(t=>t.stop()); stream=null;}
+  if(mode==="file") video.pause();
+  $("btnStop").disabled=true; $("btnLive").disabled=false; $("btnDl").disabled=log.length<2;
+  status(`停止しました。${log.length-1}フレームを記録。`);
+}
+
+// ---- 動画の保存（端末内） ----
+function startRecording(){
+  const type=["video/mp4","video/webm;codecs=vp9,opus","video/webm"].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t));
+  if(!type) return;
+  recChunks=[]; recorder=new MediaRecorder(stream,{mimeType:type});
+  recorder.ondataavailable=e=>e.data.size&&recChunks.push(e.data);
+  recorder.onstart=()=>{ if(log[0]) log[0].rec_started_at_ms=Date.now(); };
+  recorder.onstop=()=>download(new Blob(recChunks,{type}),`ability-cam-${stamp()}.${type.includes("mp4")?"mp4":"webm"}`);
+  recorder.start(1000);
+}
+$("btnDl").onclick=()=>download(new Blob([log.map(o=>JSON.stringify(o)).join("\n")+"\n"],{type:"application/x-ndjson"}),`ability-cam-${stamp()}.jsonl`);
+function download(blob,name){const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000);}
+function stamp(){return new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);}
+
+// ---- フレームごとの解析 ----
+function schedule(){
+  if(!running) return;
+  if(video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+  else requestAnimationFrame(now=>onFrame(now,null));
+}
+function onFrame(now,meta){
+  if(!running) return;
+  if(video.readyState<2) return schedule();
+  const t0=performance.now();
+  let res; try{res=landmarker.detectForVideo(video,t0);}catch(e){status("解析エラー: "+e.message,true);return schedule();}
+  const t1=performance.now(), infer=t1-t0;
+  const capT=meta&&(meta.captureTime||meta.presentationTime); // 撮影された時刻（取れる端末のみ）
+  const lat=(mode==="live"&&capT)?t1-capT:null;
+
+  const face=res.faceLandmarks&&res.faceLandmarks.length>0;
+  const bs={}; if(face&&res.faceBlendshapes[0]) for(const c of res.faceBlendshapes[0].categories) bs[c.categoryName]=+c.score.toFixed(3);
+  const pts=face?KEYPTS.map(i=>{const p=res.faceLandmarks[0][i];return [+p.x.toFixed(4),+p.y.toFixed(4),+p.z.toFixed(4)];}):null;
+  const au=audioFeatures();
+
+  const row={t_ms:mode==="live"?Math.round(performance.timeOrigin+t1):null,
+    media_s:+video.currentTime.toFixed(3),face,bs:face?bs:null,pts,
+    rms_db:au.rms_db,f0_hz:au.f0_hz,infer_ms:+infer.toFixed(1),lat_ms:lat!=null?+lat.toFixed(1):null};
+  log.push(row);
+
+  agg.frames++; if(face) agg.face++; agg.infer+=infer; if(lat!=null){agg.lat+=lat;agg.latN++;}
+  const avg=(a,b)=>((a||0)+(b||0))/2;
+  hist.push({x:video.currentTime,face:face?1:0,
+    smile:face?avg(bs.mouthSmileLeft,bs.mouthSmileRight):null,
+    brow:face?avg(bs.browDownLeft,bs.browDownRight):null,
+    squint:face?avg(bs.eyeSquintLeft,bs.eyeSquintRight):null,
+    jaw:face?(bs.jawOpen||0):null,
+    vol:au.rms_db==null?null:Math.min(1,Math.max(0,(au.rms_db+60)/60)),
+    f0:au.f0_hz==null?null:Math.min(1,Math.max(0,Math.log(au.f0_hz/70)/Math.log(1000/70)))});
+  if(agg.frames%3===0) updateStats(au);
+  drawOverlay(face?res.faceLandmarks[0]:null); drawChart();
+  schedule();
+}
+
+function updateStats(au){
+  const el=(performance.now()-agg.t0)/1000;
+  $("sFace").textContent=Math.round(100*agg.face/agg.frames)+"%";
+  $("sFps").textContent=(agg.frames/el).toFixed(1);
+  $("sInfer").textContent=(agg.infer/agg.frames).toFixed(0);
+  $("sLat").textContent=agg.latN?(agg.lat/agg.latN).toFixed(0):"–";
+  $("sVol").textContent=au.rms_db==null?"–":au.rms_db.toFixed(0);
+  $("sF0").textContent=au.f0_hz==null?"–":Math.round(au.f0_hz);
+}
+
+function drawOverlay(lm){
+  const r=video.getBoundingClientRect(), dpr=devicePixelRatio||1;
+  overlay.width=r.width*dpr; overlay.height=r.height*dpr;
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  if(!lm) return;
+  octx.fillStyle="rgba(111,191,166,.85)";
+  for(let i=0;i<lm.length;i+=4){octx.fillRect(lm[i].x*overlay.width,lm[i].y*overlay.height,2*dpr,2*dpr);}
+}
+
+function drawChart(){
+  const dpr=devicePixelRatio||1, W=chart.clientWidth*dpr, H=chart.clientHeight*dpr;
+  if(chart.width!==W||chart.height!==H){chart.width=W;chart.height=H;}
+  cctx.clearRect(0,0,W,H);
+  if(hist.length<2) return;
+  const xEnd=hist[hist.length-1].x, span=20, xStart=xEnd-span;
+  while(hist.length>2&&hist[0].x<xStart-1) hist.shift();
+  const X=x=>(x-xStart)/span*W, Y=v=>H-6*dpr-v*(H-12*dpr);
+  cctx.lineWidth=1.5*dpr;
+  for(const s of SERIES){
+    cctx.strokeStyle=s.color; cctx.beginPath(); let pen=false;
+    for(const h of hist){const v=h[s.k]; if(v==null){pen=false;continue;}
+      if(!pen){cctx.moveTo(X(h.x),Y(v));pen=true;} else cctx.lineTo(X(h.x),Y(v));}
+    cctx.stroke();
+  }
+}
+</script>
+</body>
+</html>

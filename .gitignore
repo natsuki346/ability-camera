@@ -1,0 +1,24 @@
+# 撮影データは絶対に入れない
+*.mp4
+*.mov
+*.webm
+*.m4a
+*.wav
+*.jsonl
+data/
+
+# 生成物
+ios/Pods/
+ios/*.xcodeproj/
+ios/*.xcworkspace/
+ios/Podfile.lock
+ios/AbilityCam/Info.plist
+ios/AbilityCam/Resources/*.task
+xcuserdata/
+DerivedData/
+build/
+
+# その他
+web/*.pem
+__pycache__/
+.DS_Store

@@ -1,9 +1,10 @@
 import AVFoundation
 import Accelerate
+import QuartzCore
 
 /// マイクから音量と声の高さをその場で計算する。音声そのものは保存しない。
 final class AudioAnalyzer {
-    struct Snapshot { var rmsDb: Float?; var f0Hz: Float? }
+    struct Snapshot { var rmsDb: Float?; var f0Hz: Float?; var at: CFTimeInterval = 0 }   // at = 計算した時刻（CACurrentMediaTime）
 
     private let engine = AVAudioEngine()
     private let lock = NSLock()
@@ -44,7 +45,7 @@ final class AudioAnalyzer {
         let f0 = rms < 0.01 ? nil : Self.pitch(x, n: n, sampleRate: sr)
 
         lock.lock()
-        latest = Snapshot(rmsDb: (db * 10).rounded() / 10, f0Hz: f0.map { ($0 * 10).rounded() / 10 })
+        latest = Snapshot(rmsDb: (db * 10).rounded() / 10, f0Hz: f0.map { ($0 * 10).rounded() / 10 }, at: CACurrentMediaTime())
         lock.unlock()
     }
 

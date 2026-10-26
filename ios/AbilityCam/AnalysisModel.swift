@@ -9,6 +9,16 @@ struct ChartPoint: Identifiable {
     let value: Double    // 0〜1 に正規化
 }
 
+enum CareScene: String, CaseIterable, Identifiable {
+    case meal = "食事", posture = "姿勢を変える", bath = "入浴・着替え", visitor = "人が来た", other = "その他"
+    var id: String { rawValue }
+}
+
+enum Mark: String, CaseIterable, Identifiable {
+    case pleasant = "快", unpleasant = "不快", unknown = "分からない"
+    var id: String { rawValue }
+}
+
 @MainActor
 final class AnalysisModel: ObservableObject {
     @Published var running = false
@@ -21,6 +31,14 @@ final class AnalysisModel: ObservableObject {
     @Published var f0Hz: Float?
     @Published var points: [ChartPoint] = []
 
+    @Published var baselineSec: Int?          // 普段を記録中の経過秒（記録中でなければ nil）
+    @Published var baselineReady = false
+    @Published var insufficient: [Metric] = []  // データ不足で比べない指標
+    @Published var differences: [String] = []
+    @Published var faceReadable = true
+    @Published var scene: CareScene?
+    @Published var markMessage: String?
+
     let camera = CameraManager()
     private let face = FaceAnalyzer()
     private let audio = AudioAnalyzer()
@@ -29,7 +47,18 @@ final class AnalysisModel: ObservableObject {
     private var frames = 0, faceFrames = 0, procSum = 0.0, procN = 0, latSum = 0.0
     private var startHost: CFTimeInterval = 0
 
+    // 普段といつもとの違い
+    private var baselineStartHost: CFTimeInterval = 0
+    private var baselineStartMs: Int64 = 0
+    private var stats: [Metric: Welford] = [:]
+    private var smooth: [Metric: Smoother] = [:]
+    private var lastAudioAt: CFTimeInterval = 0
+    private var recentFace: [(t: Double, face: Bool)] = []   // 直近1秒のコマ
+    private var lastChange: (diffs: [String], faceReadable: Bool)?
+
     static let chartWindow = 20.0
+    static let baselineSeconds = 60.0
+    static let minSamples = 30
 
     func toggle() async {
         running ? stop() : await start()
@@ -51,6 +80,9 @@ final class AnalysisModel: ObservableObject {
         frames = 0; faceFrames = 0; procSum = 0; procN = 0; latSum = 0
         points = []
         startHost = CACurrentMediaTime()
+        smooth = [:]; lastAudioAt = 0; recentFace = []
+        faceReadable = true; scene = nil; markMessage = nil
+        resetBaseline()
 
         let face = self.face, audio = self.audio, logger = self.logger
         face.onResult = { [weak self] r in
@@ -79,7 +111,64 @@ final class AnalysisModel: ObservableObject {
         logger.stop()
         UIApplication.shared.isIdleTimerDisabled = false
         running = false
+        baselineSec = nil; baselineReady = false; differences = []; insufficient = []
+        scene = nil; markMessage = nil
         status = "保存しました: \(logger.fileName ?? "-")（\(frames)コマ）"
+    }
+
+    /// 普段を取り直す
+    func restartBaseline() {
+        guard running else { return }
+        logger.write(EventRecord(tMs: Self.nowMs(), kind: "baseline_restart", value: nil))
+        resetBaseline()
+    }
+
+    /// 同じ場面をもう一度押すと「場面なし」
+    func tapScene(_ s: CareScene) {
+        guard running else { return }
+        scene = scene == s ? nil : s
+        logger.write(EventRecord(tMs: Self.nowMs(), kind: "scene", value: .text(scene?.rawValue ?? "なし")))
+    }
+
+    func tapMark(_ m: Mark) {
+        guard running else { return }
+        let now = Date()
+        logger.write(EventRecord(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: .text(m.rawValue)))
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        let msg = "記録しました：\(m.rawValue)（\(f.string(from: now))）"
+        markMessage = msg
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            if markMessage == msg { markMessage = nil }
+        }
+    }
+
+    private static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+
+    private func resetBaseline() {
+        baselineStartHost = CACurrentMediaTime()
+        baselineStartMs = Self.nowMs()
+        stats = [:]
+        baselineSec = 0; baselineReady = false; insufficient = []; differences = []
+        lastChange = nil
+    }
+
+    private func finishBaseline(now: CFTimeInterval) {
+        var out: [String: BaselineRecord.Stat] = [:]
+        for m in Metric.allCases {
+            let w = stats[m] ?? Welford()
+            out[m.rawValue] = BaselineRecord.Stat(n: w.n,
+                                                  mean: w.n > 0 ? (w.mean * 10000).rounded() / 10000 : nil,
+                                                  std: w.n > 0 ? (w.std * 10000).rounded() / 10000 : nil,
+                                                  insufficient: w.n < Self.minSamples)
+        }
+        logger.write(BaselineRecord(tMs: Self.nowMs(), startedMs: baselineStartMs,
+                                    durationS: ((now - baselineStartHost) * 10).rounded() / 10,
+                                    minN: Self.minSamples, metrics: out))
+        insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
+        baselineSec = nil
+        baselineReady = true
     }
 
     private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot) {
@@ -89,10 +178,15 @@ final class AnalysisModel: ObservableObject {
         if r.procMs >= 0 { procSum += r.procMs; procN += 1 }
         latSum += r.latMs
 
-        let t = Double(r.captureMs) / 1000 - startHost
+        let captureT = Double(r.captureMs) / 1000
+        recentFace.append((captureT, r.face))
+        recentFace.removeAll { $0.t < captureT - 1 }
+
+        let t = captureT - startHost
         guard frames % 3 == 0 else { return }   // 画面の更新は 1/3 に間引く（記録は全コマ）
 
-        let elapsed = CACurrentMediaTime() - startHost
+        let now = CACurrentMediaTime()
+        let elapsed = now - startHost
         faceRatio = Double(faceFrames) / Double(frames)
         fps = Double(frames) / max(elapsed, 0.001)
         procMs = procN > 0 ? procSum / Double(procN) : nil
@@ -100,15 +194,55 @@ final class AnalysisModel: ObservableObject {
         rmsDb = a.rmsDb
         f0Hz = a.f0Hz
 
+        // 今の値
         func avg(_ a: String, _ b: String) -> Double {
             Double(((r.blendshapes[a] ?? 0) + (r.blendshapes[b] ?? 0)) / 2)
         }
+        var faceValues: [Metric: Double] = [:]
+        if r.face {
+            faceValues[.mouthSmile] = avg("mouthSmileLeft", "mouthSmileRight")
+            faceValues[.browDown] = avg("browDownLeft", "browDownRight")
+            faceValues[.eyeSquint] = avg("eyeSquintLeft", "eyeSquintRight")
+            faceValues[.jawOpen] = Double(r.blendshapes["jawOpen"] ?? 0)
+        }
+        var voiceValues: [Metric: Double] = [:]
+        if a.at > lastAudioAt {   // 同じ音の結果を二度数えない
+            lastAudioAt = a.at
+            if let db = a.rmsDb { voiceValues[.rmsDb] = Double(db) }
+            if let f0 = a.f0Hz { voiceValues[.f0Hz] = Double(f0) }
+        }
+
+        let recording = !baselineReady
+        for (m, x) in faceValues {
+            smooth[m, default: Smoother()].add(x, at: captureT)
+            if recording { stats[m, default: Welford()].add(x) }
+        }
+        for (m, x) in voiceValues {
+            smooth[m, default: Smoother()].add(x, at: a.at)
+            if recording { stats[m, default: Welford()].add(x) }
+        }
+
+        let faceCount = recentFace.filter(\.face).count
+        let readable = faceCount * 2 >= recentFace.count
+        if faceReadable != readable { faceReadable = readable }
+
+        if recording {
+            let sec = Int(now - baselineStartHost)
+            if now - baselineStartHost >= Self.baselineSeconds {
+                finishBaseline(now: now)
+            } else if baselineSec != sec {
+                baselineSec = sec
+            }
+        }
+        if baselineReady { updateDifferences(now: now, faceReadable: readable) }
+
+        // グラフ
         var new: [ChartPoint] = []
         if r.face {
-            new.append(ChartPoint(t: t, series: "口角を上げる", value: avg("mouthSmileLeft", "mouthSmileRight")))
-            new.append(ChartPoint(t: t, series: "眉を寄せる", value: avg("browDownLeft", "browDownRight")))
-            new.append(ChartPoint(t: t, series: "目を細める", value: avg("eyeSquintLeft", "eyeSquintRight")))
-            new.append(ChartPoint(t: t, series: "口を開ける", value: Double(r.blendshapes["jawOpen"] ?? 0)))
+            new.append(ChartPoint(t: t, series: "口角を上げる", value: faceValues[.mouthSmile]!))
+            new.append(ChartPoint(t: t, series: "眉を寄せる", value: faceValues[.browDown]!))
+            new.append(ChartPoint(t: t, series: "目を細める", value: faceValues[.eyeSquint]!))
+            new.append(ChartPoint(t: t, series: "口を開ける", value: faceValues[.jawOpen]!))
         }
         if let db = a.rmsDb {
             new.append(ChartPoint(t: t, series: "音量", value: min(1, max(0, Double(db + 60) / 60))))
@@ -118,5 +252,27 @@ final class AnalysisModel: ObservableObject {
         }
         points.append(contentsOf: new)
         points.removeAll { $0.t < t - Self.chartWindow }
+    }
+
+    /// z =（ならした今の値 − 普段の平均）÷ max(普段の標準偏差, 下限)
+    private func updateDifferences(now: CFTimeInterval, faceReadable: Bool) {
+        var messages: [String] = [], keys: [String] = []
+        for m in Metric.allCases {
+            if m.isFace && !faceReadable { continue }
+            guard let w = stats[m], w.n >= Self.minSamples,
+                  let s = smooth[m], s.fresh(now: now), let v = s.value else { continue }
+            let z = (v - w.mean) / max(w.std, m.stdFloor)
+            if let msg = m.message(z: z), let key = m.diffKey(z: z) {
+                messages.append(msg); keys.append(key)
+            }
+        }
+        if differences != messages { differences = messages }
+
+        if lastChange == nil || lastChange!.diffs != keys || lastChange!.faceReadable != faceReadable {
+            lastChange = (keys, faceReadable)
+            var e = EventRecord(tMs: Self.nowMs(), kind: "change", value: .list(keys))
+            e.faceReadable = faceReadable
+            logger.write(e)
+        }
     }
 }

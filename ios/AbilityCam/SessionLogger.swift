@@ -52,7 +52,7 @@ struct EventRecord: Encodable {
 
 /// 普段（最初の60秒）の各指標の n / mean / std
 struct BaselineRecord: Encodable {
-    struct Stat: Encodable {
+    struct Stat: Codable {
         let n: Int
         let mean: Double?
         let std: Double?

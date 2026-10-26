@@ -22,6 +22,25 @@ struct LiveState: Codable {
     var scene: String?
     var faceRatio: Double?
     var fps: Double?
+    // v0.7〜（古い撮る側からは届かないので省略できる）
+    var z: [String: Double]?          // 指標ごとの今の z（約1秒でならした値から）。比べられない指標は入らない
+    var diffs: [LiveDiff]?            // いつもとの違い（指標・向き・続いている秒数）。differences と同じもの
+    var diffCount: Int?               // このセッションで違いが出た回数（sessions.jsonl の segments と同じ数え方）
+}
+
+/// いつもとの違い1つ
+struct LiveDiff: Codable, Hashable {
+    let metric: String                // mouth_smile など
+    let above: Bool                   // いつもより上（強い・大きい・高い）か
+    let seconds: Int                  // 続いている秒数
+}
+
+/// 普段の記録が終わったとき（取り直したときも）に1回送る。見る側はこれで「いつもの範囲」を描く。
+/// つながったときにも、今の普段を1回送る（記録中・まだ無いときは nil）
+struct LiveBaseline: Codable {
+    let startedMs: Int64
+    let tMs: Int64
+    let metrics: [String: BaselineRecord.Stat]   // 指標ごとの n / mean / std / insufficient（std は下限をかける前）
 }
 
 /// 家族の印・場面（t_ms は撮る側の時計）
@@ -35,8 +54,9 @@ struct LiveEvent: Codable, Identifiable {
 
 /// 1通の中身（JSON）。映像だけは JSON にせず、先頭 1 バイト 0xFF の後ろに JPEG を付けて送る
 struct Wire: Codable {
-    var kind: String                  // state / event / viewer_event / ping / pong / grant / bye / revoked
+    var kind: String                  // state / event / baseline / viewer_event / ping / pong / grant / bye / revoked
     var state: LiveState?
+    var baseline: LiveBaseline?       // baseline：nil なら「普段はまだ無い（記録中）」
     var event: LiveEvent?
     var t0: Int64?                    // ping を送った時刻（見る側の時計）
     var tc: Int64?                    // pong を返した時刻（撮る側の時計）
@@ -125,6 +145,11 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
 
     @Published private(set) var viewers: [MCPeerID] = []
     @Published private(set) var requests: [Request] = []
+
+    /// 今の普段（main で触る）。変わったら、見ている端末みんなに1回送る。つながったときにも送る
+    var baseline: LiveBaseline? {
+        didSet { sendBaseline(to: Array(sessions.values)) }
+    }
 
     /// 見る側で付けた印・場面（main で呼ぶ）。名前は撮る側から見えている、その端末の名前
     var onViewerEvent: ((LiveEvent, String, Bool) -> Void)?
@@ -218,6 +243,13 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
         }
     }
 
+    private func sendBaseline(to targets: [MCSession]) {
+        guard !targets.isEmpty, let d = try? JSONEncoder().encode(Wire(kind: "baseline", baseline: baseline)) else { return }
+        sendQueue.async {
+            for s in targets where !s.connectedPeers.isEmpty { try? s.send(d, toPeers: s.connectedPeers, with: .reliable) }
+        }
+    }
+
     /// 映像（JPEG）。どのスレッドから呼んでもよい
     func sendVideo(_ jpeg: Data) {
         lock.lock(); let targets = self.targets; lock.unlock()
@@ -282,6 +314,7 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
                    let d = try? JSONEncoder().encode(Wire(kind: "grant", token: v.token, cameraID: self.cameraID)) {
                     try? session.send(d, toPeers: [peerID], with: .reliable)
                 }
+                self.sendBaseline(to: [session])
             case .notConnected:
                 if self.noticeSessions[peerID] === session { self.noticeSessions[peerID] = nil; return }
                 if self.sessions[peerID] === session { self.sessions[peerID] = nil; self.viewerIDs[peerID] = nil }
@@ -326,22 +359,32 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         case needsApproval(String)    // 撮る側で許可が取り消されている。手で申し込み、撮る側で確かめてもらう
     }
 
-    struct Point: Identifiable {
-        let id = UUID()
-        let t: Double                 // 撮る側の時計（秒）
-        let series: String
-        let value: Double             // 0〜1
+    /// 時間の流れの帯の1区間（撮る側の時計、秒）
+    struct Run<V: Equatable>: Equatable {
+        var start: Double
+        var end: Double
+        var value: V
     }
 
-    static let chartWindow = 60.0
+    /// 指標ごとの帯の塗り
+    enum Band: Equatable {
+        case above, below      // いつもより上／下（「いつもとの違い」に出ていた）
+        case usual             // いつもの範囲
+        case notCompared       // 比べていない（記録していない・普段を記録中・顔が読めない・データ不足・値が無い）
+    }
+
+    static let historyWindow = 15 * 60.0   // 時間の流れは最長15分（この端末のメモリにだけ置く）
+    static let runGap = 1.0                // これより間が空いたら（つながっていなかったなど）、帯を途切れさせる
 
     @Published private(set) var found: [MCPeerID] = []
     @Published private(set) var status = Status.searching
     @Published private(set) var state: LiveState?
     @Published private(set) var lastReceived: Date?
     @Published private(set) var latencyMs: Double?
-    @Published private(set) var events: [LiveEvent] = []   // 直近60秒（画面に出すだけ）
-    @Published private(set) var points: [Point] = []       // 直近60秒のグラフ（メモリだけ）
+    @Published private(set) var events: [LiveEvent] = []   // 直近15分の家族の印・場面（画面に出すだけ）
+    @Published private(set) var bands: [Metric: [Run<Band>]] = [:]   // 直近15分の時間の流れ（メモリだけ）
+    @Published private(set) var scenes: [Run<String>] = []
+    @Published private(set) var baseline: LiveBaseline?    // 撮る側の普段（いつもの範囲を描く）
     @Published private(set) var video: UIImage?
     @Published private(set) var videoAt: Date?
     @Published var notice: String?
@@ -358,6 +401,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     private var retryCameraID: String?
     private var retryDelay = 0.0                  // 2, 4, 8, 16, 30, 30… 秒
     private var clock: [(rtt: Int64, offset: Double)] = []   // 撮る側の時計 − こちらの時計
+    private var historyCameraID: String?          // 時間の流れを貯めている撮る側（別の撮る側につないだら消す）
     private let decoder = JSONDecoder()
 
     private var tokens: [String: String] {   // 撮る側の ID → 合言葉
@@ -481,22 +525,37 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
 
     private func trim() {
         guard let last = state?.captureMs else { return }
-        let from = Double(last) / 1000 - Self.chartWindow
-        if let i = points.firstIndex(where: { $0.t >= from }), i > 0 { points.removeFirst(i) }
+        let from = Double(last) / 1000 - Self.historyWindow
+        for (m, runs) in bands {
+            if let i = runs.firstIndex(where: { $0.end >= from }), i > 0 { bands[m]!.removeFirst(i) }
+        }
+        if let i = scenes.firstIndex(where: { $0.end >= from }), i > 0 { scenes.removeFirst(i) }
         events.removeAll { Double($0.tMs) / 1000 < from }
     }
 
-    private func addPoints(_ s: LiveState) {
+    /// そのとき、この指標がどう見えていたか（撮る側の「いつもとの違い」と同じ決まり）
+    static func band(_ m: Metric, in s: LiveState) -> Band {
+        guard s.recording, s.baselineReady, !s.insufficient.contains(m.label),
+              !(m.isFace && !s.faceReadable) else { return .notCompared }
+        if let d = s.diffs?.first(where: { $0.metric == m.rawValue }) { return d.above ? .above : .below }
+        return s.z?[m.rawValue] != nil ? .usual : .notCompared
+    }
+
+    private static func extend<V: Equatable>(_ runs: inout [Run<V>], at t: Double, _ v: V) {
+        if let last = runs.last, t - last.end <= runGap {
+            guard t >= last.end else { return }   // 順番が入れ替わって届いたもの
+            if last.value == v { runs[runs.count - 1].end = t } else { runs.append(Run(start: last.end, end: t, value: v)) }
+        } else {
+            runs.append(Run(start: t, end: t, value: v))
+        }
+    }
+
+    private func addHistory(_ s: LiveState) {
         let t = Double(s.captureMs) / 1000
-        var new: [Point] = []
-        for m in Metric.allCases where m.isFace {
-            if let v = s.values?[m.rawValue] { new.append(Point(t: t, series: m.label, value: v)) }
-        }
-        if let db = s.rmsDb { new.append(Point(t: t, series: Metric.rmsDb.label, value: min(1, max(0, (db + 60) / 60)))) }
-        if let f0 = s.f0Hz, f0 > 0 {
-            new.append(Point(t: t, series: Metric.f0Hz.label, value: min(1, max(0, log(f0 / 70) / log(1000.0 / 70)))))
-        }
-        points.append(contentsOf: new)
+        var b = bands
+        for m in Metric.allCases { Self.extend(&b[m, default: []], at: t, Self.band(m, in: s)) }
+        bands = b
+        if let name = s.scene { Self.extend(&scenes, at: t, name) }
     }
 
     // MARK: delegate
@@ -530,7 +589,12 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
                 self.retryDelay = 0; self.retryCameraID = nil
                 self.status = .connected(peerID.displayName)
                 self.clock = []
-                self.points = []; self.events = []
+                // 同じ撮る側につなぎ直したときは、時間の流れを続ける（別の撮る側なら消す）
+                let id = self.cameraIDs[peerID] ?? self.currentCameraID
+                if id != self.historyCameraID {
+                    self.historyCameraID = id
+                    self.bands = [:]; self.scenes = []; self.events = []   // 普段は、撮る側がつながったときに必ず送ってくる
+                }
                 self.ping()
             case .notConnected:
                 self.inviteStarted = nil
@@ -575,7 +639,9 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
                 self.state = s
                 self.lastReceived = Date()
                 if let off = self.offsetMs { self.latencyMs = Double(t1) + off - Double(s.captureMs) }
-                self.addPoints(s)
+                self.addHistory(s)
+            case "baseline":
+                self.baseline = w.baseline
             case "event":
                 if let e = w.event { self.events.append(e) }
             case "pong":

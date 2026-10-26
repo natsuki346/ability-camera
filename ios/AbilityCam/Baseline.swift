@@ -49,6 +49,33 @@ enum Metric: String, CaseIterable {
         }
     }
 
+    /// 向きだけの短い言い方（見る側のメーターの横に出す）
+    func directionText(above: Bool) -> String {
+        switch self {
+        case .rmsDb: above ? "いつもより大きい" : "いつもより小さい"
+        case .f0Hz: above ? "いつもより高い" : "いつもより低い"
+        default: above ? "いつもより強い" : "いつもより弱い"
+        }
+    }
+
+    /// 数値の書き方（表情は 0〜1、声は dB / Hz）。パーセントにはしない
+    func valueText(_ v: Double) -> String {
+        switch self {
+        case .rmsDb: String(format: "%.0f dB", v)
+        case .f0Hz: String(format: "%.0f Hz", v)
+        default: String(format: "%.2f", v)
+        }
+    }
+
+    /// 値として取りうる範囲（いつもの範囲を書くときに、この外は切る）
+    var valueBounds: ClosedRange<Double> {
+        switch self {
+        case .rmsDb: -120...0
+        case .f0Hz: 0...2000
+        default: 0...1
+        }
+    }
+
     /// 記録に書く、違いの向き（"brow_down:above" など）
     func diffKey(z: Double) -> String? {
         guard message(z: z) != nil else { return nil }

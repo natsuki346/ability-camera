@@ -83,6 +83,9 @@ final class AnalysisModel: ObservableObject {
     private var recentFace: [(t: Double, face: Bool)] = []   // 直近1秒のコマ
     private var lastChange: (diffs: [String], faceReadable: Bool)?
     private var diffSince: [String: CFTimeInterval] = [:]     // 違いが出ている間の開始時刻（続いている秒数を出す）
+    private var liveZ: [String: Double] = [:]                 // 見る側へ：指標ごとの今の z
+    private var liveDiffs: [LiveDiff] = []                    // 見る側へ：違いの一覧（指標・向き・秒数）
+    private var diffCount = 0                                 // このセッションで違いが出た回数（segments と同じ数え方）
 
     static let chartWindow = 20.0
     static let baselineSeconds = 60.0     // 数えた時間（時計の時間ではない）
@@ -158,6 +161,7 @@ final class AnalysisModel: ObservableObject {
         }
         resetLive()
         scene = nil; markMessage = nil
+        diffCount = 0
         sessionStartHost = CACurrentMediaTime()
         resetBaseline()   // 普段の60秒も自動で始める
         running = true
@@ -179,6 +183,7 @@ final class AnalysisModel: ObservableObject {
             running = false
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
+            liveZ = [:]; liveDiffs = []; link.baseline = nil
             scene = nil; markMessage = nil
             if let s = logger.finish() {
                 do {
@@ -347,6 +352,8 @@ final class AnalysisModel: ObservableObject {
         baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []
         lastChange = nil
         diffSince = [:]
+        liveZ = [:]; liveDiffs = []
+        link.baseline = nil   // 見る側の「いつもの範囲」も消す（記録し終えたら、また送る）
     }
 
     private func finishBaseline(now: CFTimeInterval) {
@@ -366,6 +373,7 @@ final class AnalysisModel: ObservableObject {
         insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
         baselineSec = nil; baselineWait = nil
         baselineReady = true
+        link.baseline = LiveBaseline(startedMs: baselineStartMs, tMs: Self.nowMs(), metrics: out)   // 見る側へ1回
     }
 
     private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot) {
@@ -534,27 +542,33 @@ final class AnalysisModel: ObservableObject {
             baselineWait: baselineWait, insufficient: insufficient.map(\.label),
             recording: running, sessionStartedMs: sessionStartedAt.map { Int64($0.timeIntervalSince1970 * 1000) },
             scene: scene?.rawValue,
-            faceRatio: faceRatio, fps: fps))
+            faceRatio: faceRatio, fps: fps,
+            z: baselineReady ? liveZ : nil, diffs: baselineReady ? liveDiffs : nil, diffCount: running ? diffCount : nil))
     }
 
     /// z =（ならした今の値 − 普段の平均）÷ max(普段の標準偏差, 下限)
     private func updateDifferences(now: CFTimeInterval, faceReadable: Bool) {
         var messages: [String] = [], keys: [String] = []
+        var zs: [String: Double] = [:], items: [LiveDiff] = []
         for m in Metric.allCases {
             if m.isFace && !faceReadable { continue }
             guard let w = stats[m], w.n >= Self.minSamples,
                   let s = smooth[m], s.fresh(now: now), let v = s.value else { continue }
             let z = (v - w.mean) / max(w.std, m.stdFloor)
+            zs[m.rawValue] = (z * 100).rounded() / 100
             if let msg = m.message(z: z), let key = m.diffKey(z: z) {
                 let since = diffSince[key] ?? now
                 diffSince[key] = since
                 messages.append("\(msg)（\(Int(now - since))秒）"); keys.append(key)
+                items.append(LiveDiff(metric: m.rawValue, above: z > 0, seconds: Int(now - since)))
             }
         }
         diffSince = diffSince.filter { keys.contains($0.key) }
         if differences != messages { differences = messages }
+        liveZ = zs; liveDiffs = items
 
         if lastChange == nil || lastChange!.diffs != keys || lastChange!.faceReadable != faceReadable {
+            diffCount += Set(keys).subtracting(lastChange?.diffs ?? []).count
             lastChange = (keys, faceReadable)
             var e = EventRecord(tMs: Self.nowMs(), kind: "change", value: .list(keys))
             e.faceReadable = faceReadable

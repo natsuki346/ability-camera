@@ -40,6 +40,7 @@ struct ContentView: View {
                 .tint(model.running ? .red : .accentColor)
 
                 differencesCard
+                faceSketch
                 marks
                 scenes
 
@@ -103,6 +104,16 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
+    }
+
+    /// 動きを写す顔の絵（映像と同じ向き）。読めないときは灰色で中立
+    private var faceSketch: some View {
+        VStack(spacing: 4) {
+            FaceSketch(shape: model.running ? model.faceShape : nil)
+            Text(model.running && model.faceShape == nil ? "読めません" : " ")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     /// 家族の印。介助しながら片手で押せる大きさ

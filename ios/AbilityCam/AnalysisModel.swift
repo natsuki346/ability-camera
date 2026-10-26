@@ -40,6 +40,7 @@ final class AnalysisModel: ObservableObject {
     @Published var markMessage: String?
     @Published var meshEnabled = true
     @Published var mesh: FaceMesh?           // 顔が読めないときは nil（古い網目を残さない）
+    @Published var faceShape: [String: Double]?   // 顔の絵用に約0.2秒でならした値。読めないときは nil
     @Published var meshLagMs: Double?        // 撮影→網目を出すまで（解析の遅れ＋画面の間引き）
 
     let camera = CameraManager()
@@ -50,6 +51,7 @@ final class AnalysisModel: ObservableObject {
     private var frames = 0, faceFrames = 0, procSum = 0.0, procN = 0, latSum = 0.0
     private var startHost: CFTimeInterval = 0
     private var meshLagSum = 0.0, meshN = 0
+    private var shapeSmooth: [String: Double] = [:], lastShapeT = -Double.infinity
 
     // 普段といつもとの違い
     private var baselineStartHost: CFTimeInterval = 0
@@ -83,6 +85,7 @@ final class AnalysisModel: ObservableObject {
 
         frames = 0; faceFrames = 0; procSum = 0; procN = 0; latSum = 0; meshLagSum = 0; meshN = 0
         mesh = nil; meshLagMs = nil
+        faceShape = nil; shapeSmooth = [:]; lastShapeT = -.infinity
         points = []
         startHost = CACurrentMediaTime()
         smooth = [:]; lastAudioAt = 0; recentFace = []
@@ -117,7 +120,7 @@ final class AnalysisModel: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
         running = false
         baselineSec = nil; baselineReady = false; differences = []; insufficient = []
-        scene = nil; markMessage = nil; mesh = nil
+        scene = nil; markMessage = nil; mesh = nil; faceShape = nil
         status = "保存しました: \(logger.fileName ?? "-")（\(frames)コマ）"
     }
 
@@ -187,6 +190,16 @@ final class AnalysisModel: ObservableObject {
         recentFace.append((captureT, r.face))
         recentFace.removeAll { $0.t < captureT - 1 }
 
+        // 顔の絵：毎コマ、約0.2秒の移動平均でならす（間が1秒以上空いたら今の値から）
+        if r.face {
+            let a = captureT - lastShapeT > 1 ? 1 : 1 - exp(-max(captureT - lastShapeT, 0) / 0.2)
+            for k in FaceSketch.keys {
+                let x = Double(r.blendshapes[k] ?? 0)
+                shapeSmooth[k] = (shapeSmooth[k] ?? x) + a * (x - (shapeSmooth[k] ?? x))
+            }
+            lastShapeT = captureT
+        }
+
         let t = captureT - startHost
         guard frames % 3 == 0 else { return }   // 画面の更新は 1/3 に間引く（記録は全コマ）
 
@@ -230,6 +243,7 @@ final class AnalysisModel: ObservableObject {
         let faceCount = recentFace.filter(\.face).count
         let readable = faceCount * 2 >= recentFace.count
         if faceReadable != readable { faceReadable = readable }
+        faceShape = readable && !shapeSmooth.isEmpty ? shapeSmooth : nil
 
         if meshEnabled, readable, r.face, !r.mesh.isEmpty {
             mesh = FaceMesh(points: r.mesh, imageSize: r.imageSize, values: faceValues)

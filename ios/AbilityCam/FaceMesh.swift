@@ -55,10 +55,10 @@ struct MeshOverlay: View {
 
             ctx.stroke(path(MeshTopology.tesselation), with: .color(.white.opacity(0.18)), lineWidth: 0.5)
             ctx.stroke(path(MeshTopology.faceOval), with: .color(.white.opacity(0.55)), lineWidth: 1)
-            stroke(MeshTopology.eyebrows, .orange, .browDown)
-            stroke(MeshTopology.eyes, .yellow, .eyeSquint)
-            stroke(MeshTopology.lipsOuter, .green, .mouthSmile)
-            stroke(MeshTopology.lipsInner, .blue, .jawOpen)
+            stroke(MeshTopology.eyebrows, Metric.browDown.color, .browDown)
+            stroke(MeshTopology.eyes, Metric.eyeSquint.color, .eyeSquint)
+            stroke(MeshTopology.lipsOuter, Metric.mouthSmile.color, .mouthSmile)
+            stroke(MeshTopology.lipsInner, Metric.jawOpen.color, .jawOpen)
         }
         .allowsHitTesting(false)
     }

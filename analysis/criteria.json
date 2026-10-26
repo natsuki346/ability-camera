@@ -3,30 +3,90 @@
   "changelog": [
     {
       "date": "2026-10-26",
-      "reason": "初版。表情：ふつうの表情は0.5〜4秒続くため、|z|≥2 が0.5秒以上で区間とし、0.5秒未満は「短い動き」として別に数える。声：決まった根拠がないため表情と同じ値から始め、--calm の記録の誤報の割合を見て後から決める。終了は |z|<1.5 が0.5秒（ヒステリシス）。"
+      "reason": "初版。表情：ふつうの表情は0.5〜4秒続くため、|z|≥2 が0.5秒以上で区間とし、0.5秒未満は「短い動き」として別に数える。声：決まった根拠がないため表情と同じ値から始め、--calm の記録で区間が多すぎないかを見て後から決める。終了は |z|<1.5 が0.5秒（ヒステリシス）。"
+    },
+    {
+      "date": "2026-10-26",
+      "reason": "通知候補（実際には通知しない）の基準を追加。A：表情と声が同時に区間に入って15秒以上、B：同じ指標の区間が60秒以上、C：30分以内に同じ指標の区間が3回以上。いずれも仮の値で、記録を見ながら決める。場面が 食事・姿勢を変える・入浴・着替え の間の候補は別に数える。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor はアプリと同じ値。",
-
   "std_floor": {
-    "mouth_smile": 0.03, "brow_down": 0.03, "eye_squint": 0.03, "jaw_open": 0.03,
-    "rms_db": 2.0, "f0_hz": 10.0
+    "mouth_smile": 0.03,
+    "brow_down": 0.03,
+    "eye_squint": 0.03,
+    "jaw_open": 0.03,
+    "rms_db": 2.0,
+    "f0_hz": 10.0
   },
-
   "metrics": {
-    "mouth_smile": {"smooth_s": 0.3, "start_z": 2.0, "start_min_s": 0.5, "end_z": 1.5, "end_min_s": 0.5},
-    "brow_down":   {"smooth_s": 0.3, "start_z": 2.0, "start_min_s": 0.5, "end_z": 1.5, "end_min_s": 0.5},
-    "eye_squint":  {"smooth_s": 0.3, "start_z": 2.0, "start_min_s": 0.5, "end_z": 1.5, "end_min_s": 0.5},
-    "jaw_open":    {"smooth_s": 0.3, "start_z": 2.0, "start_min_s": 0.5, "end_z": 1.5, "end_min_s": 0.5},
-    "rms_db":      {"smooth_s": 0.3, "start_z": 2.0, "start_min_s": 0.5, "end_z": 1.5, "end_min_s": 0.5},
-    "f0_hz":       {"smooth_s": 0.3, "start_z": 2.0, "start_min_s": 0.5, "end_z": 1.5, "end_min_s": 0.5}
+    "mouth_smile": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5
+    },
+    "brow_down": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5
+    },
+    "eye_squint": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5
+    },
+    "jaw_open": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5
+    },
+    "rms_db": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5
+    },
+    "f0_hz": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5
+    }
   },
-
-  "face_valid": {"window_s": 1.0, "min_face_ratio": 0.5, "max_abs_yaw_deg": 35.0},
+  "face_valid": {
+    "window_s": 1.0,
+    "min_face_ratio": 0.5,
+    "max_abs_yaw_deg": 35.0
+  },
   "stale_s": 1.0,
   "mark_window_s": 10.0,
   "calm_target_per_10min": 1.0,
-
-  "eda_response_window_s": [1.0, 4.0],
+  "notify": {
+    "_note": "通知候補の基準。すべて仮の値。実際には通知しない（docs/wording-guide.md）",
+    "provisional": true,
+    "cross_modal_s": 15.0,
+    "long_s": 60.0,
+    "repeat_count": 3,
+    "repeat_window_min": 30.0,
+    "scene_separate": [
+      "食事",
+      "姿勢を変える",
+      "入浴・着替え"
+    ]
+  },
+  "eda_response_window_s": [
+    1.0,
+    4.0
+  ],
   "_eda_note": "将来の手首の記録（ability-lab.raw.v1、皮膚電気活動）用：出来事の1〜4秒後に反応を探す窓。今は使っていない。"
 }

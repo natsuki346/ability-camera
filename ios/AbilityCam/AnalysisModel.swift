@@ -61,6 +61,7 @@ final class AnalysisModel: ObservableObject {
     private var lastAudioAt: CFTimeInterval = 0
     private var recentFace: [(t: Double, face: Bool)] = []   // 直近1秒のコマ
     private var lastChange: (diffs: [String], faceReadable: Bool)?
+    private var diffSince: [String: CFTimeInterval] = [:]     // 違いが出ている間の開始時刻（続いている秒数を出す）
 
     static let chartWindow = 20.0
     static let baselineSeconds = 60.0
@@ -147,7 +148,7 @@ final class AnalysisModel: ObservableObject {
         logger.write(EventRecord(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: .text(m.rawValue)))
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
-        let msg = "記録しました：\(m.rawValue)（\(f.string(from: now))）"
+        let msg = "家族の印を記録しました：\(m.rawValue)（\(f.string(from: now))）"
         markMessage = msg
         Task {
             try? await Task.sleep(for: .seconds(3))
@@ -163,6 +164,7 @@ final class AnalysisModel: ObservableObject {
         stats = [:]
         baselineSec = 0; baselineReady = false; insufficient = []; differences = []
         lastChange = nil
+        diffSince = [:]
     }
 
     private func finishBaseline(now: CFTimeInterval) {
@@ -298,9 +300,12 @@ final class AnalysisModel: ObservableObject {
                   let s = smooth[m], s.fresh(now: now), let v = s.value else { continue }
             let z = (v - w.mean) / max(w.std, m.stdFloor)
             if let msg = m.message(z: z), let key = m.diffKey(z: z) {
-                messages.append(msg); keys.append(key)
+                let since = diffSince[key] ?? now
+                diffSince[key] = since
+                messages.append("\(msg)（\(Int(now - since))秒）"); keys.append(key)
             }
         }
+        diffSince = diffSince.filter { keys.contains($0.key) }
         if differences != messages { differences = messages }
 
         if lastChange == nil || lastChange!.diffs != keys || lastChange!.faceReadable != faceReadable {

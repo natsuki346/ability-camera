@@ -31,6 +31,13 @@ FACE_METRICS = {"mouth_smile", "brow_down", "eye_squint", "jaw_open"}
 LABEL = {"mouth_smile": "口角を上げる", "brow_down": "眉を寄せる", "eye_squint": "目を細める",
          "jaw_open": "口を開ける", "rms_db": "声の大きさ", "f0_hz": "声の高さ"}
 UNIT = {"rms_db": " dB", "f0_hz": " Hz"}
+# 向きの言い方（docs/wording-guide.md）
+DIRECTION = {"rms_db": ("いつもより大きい", "いつもより小さい"), "f0_hz": ("いつもより高い", "いつもより低い")}
+
+
+def direction(m: str, sign: int) -> str:
+    up, down = DIRECTION.get(m, ("いつもより強い", "いつもより弱い"))
+    return up if sign > 0 else down
 CRITERIA_KEYS = ["smooth_s", "start_z", "start_min_s", "end_z", "end_min_s"]
 
 
@@ -346,11 +353,11 @@ def segment_rows(a: Analysis) -> list[dict]:
         yaw = rec.yaw[sl]
         rows.append({
             "開始": jst(t0, ms=True), "終了": jst(t1, ms=True), "長さ_秒": round(t1 - t0, 2),
-            "指標": s.metric, "指標名": LABEL[s.metric], "向き": "上" if s.sign > 0 else "下",
+            "指標": s.metric, "指標名": LABEL[s.metric], "向き": direction(s.metric, s.sign),
             "ピークのz": round(s.peak_z, 2),
             "普段の平均": round(b["mean"], 4), "ピークの値": round(float(a.sm[s.metric][s.peak_i]), 4),
             "場面": "→".join(dict.fromkeys(sc)) or "なし",
-            "前後の印": "、".join(near) or "なし",
+            "前後の家族の印": "、".join(near) or "なし",
             "顔が映っていた割合": round(float(rec.face[sl].mean()), 2),
             "yawの平均": round(float(np.nanmean(yaw)), 1) if np.isfinite(yaw).any() else "",
             "備考": s.truncated,
@@ -369,6 +376,11 @@ def criteria_lines(c: dict) -> list[str]:
     fv = c["face_valid"]
     out.append(f"表情の判定条件: 直近{fv['window_s']}秒で顔が映るコマ≥{fv['min_face_ratio']:.0%}、|yaw|<{fv['max_abs_yaw_deg']}°")
     out.append(f"{a_short(c)}秒未満で |z|≥開始値 になったものは「短い動き」として区間とは別に数える")
+    n = c["notify"]
+    out.append(f"通知候補（{'仮の値' if n.get('provisional') else ''}・実際には通知しない）: "
+               f"A 表情と声が同時に区間に入って {n['cross_modal_s']:g}秒以上 / B 同じ指標の区間が {n['long_s']:g}秒以上 / "
+               f"C {n['repeat_window_min']:g}分以内に同じ指標の区間が {n['repeat_count']}回以上 / "
+               f"場面「{'・'.join(n['scene_separate'])}」の間は別に数える")
     return out
 
 
@@ -379,13 +391,62 @@ def a_short(c: dict) -> str:
 
 def write_csv(path: Path, rows: list[dict], c: dict) -> None:
     cols = ["開始", "終了", "長さ_秒", "指標", "指標名", "向き", "ピークのz", "普段の平均", "ピークの値",
-            "場面", "前後の印", "顔が映っていた割合", "yawの平均", "備考"]
+            "場面", "前後の家族の印", "顔が映っていた割合", "yawの平均", "備考"]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         for line in criteria_lines(c):
             f.write(f"# {line}\n")
         wr = csv.DictWriter(f, fieldnames=cols)
         wr.writeheader()
         wr.writerows(rows)
+
+
+# ---------------------------------------------------------------- 通知候補（実際には通知しない）
+
+@dataclass
+class Candidate:
+    t: float            # 条件を満たした時刻
+    rule: str           # A / B / C
+    detail: str
+    scene: str
+    in_scene: bool      # 場面（食事・姿勢を変える・入浴・着替え）の最中
+
+
+def candidates(a: Analysis) -> list[Candidate]:
+    """A：表情と声が同時に区間に入って cross_modal_s 秒以上（同時の間をひとまとまりで1件）
+    B：同じ指標の区間が long_s 秒以上（区間ごとに1件）
+    C：repeat_window_min 分以内に同じ指標の区間が repeat_count 回（満たしたら数え直す）"""
+    n, t = a.criteria["notify"], a.rec.t
+    scenes = scene_intervals(a.rec, t[-1])
+
+    def make(ts, rule, detail):
+        sc = next((name for (s0, s1, name) in scenes if s0 <= ts < s1), None)
+        return Candidate(ts, rule, detail, sc or "なし", sc in n["scene_separate"])
+
+    out = []
+    face_on, voice_on = np.zeros(len(t), bool), np.zeros(len(t), bool)
+    for s in a.segments:
+        (face_on if s.metric in FACE_METRICS else voice_on)[s.i0:s.i1 + 1] = True
+    for t0, t1 in spans(face_on & voice_on, t):
+        if t1 - t0 >= n["cross_modal_s"]:
+            which = [f"{LABEL[s.metric]}が{direction(s.metric, s.sign)}" for s in a.segments
+                     if t[s.i0] <= t1 and t[s.i1] >= t0]
+            out.append(make(t0 + n["cross_modal_s"], "A",
+                            f"表情と声の変化が同時に {t1 - t0:.0f}秒（{'、'.join(dict.fromkeys(which))}）"))
+    for s in a.segments:
+        dur = t[s.i1] - t[s.i0]
+        if dur >= n["long_s"]:
+            out.append(make(t[s.i0] + n["long_s"], "B",
+                            f"{LABEL[s.metric]}が{direction(s.metric, s.sign)}区間が {dur:.0f}秒"))
+    win = n["repeat_window_min"] * 60
+    for m in METRICS:
+        recent: list[float] = []
+        for ts in sorted(t[s.i0] for s in a.segments if s.metric == m):
+            recent = [x for x in recent if ts - x <= win] + [ts]
+            if len(recent) >= n["repeat_count"]:
+                out.append(make(ts, "C", f"{LABEL[m]}の区間が {(ts - recent[0]) / 60:.0f}分の間に {len(recent)}回"))
+                recent = []
+    out.sort(key=lambda x: x.t)
+    return out
 
 
 # ---------------------------------------------------------------- 記録の質
@@ -413,7 +474,7 @@ def quality(a: Analysis, calm: bool) -> dict:
                     "lt15": float((ay < 15).mean()), "15to35": float(((ay >= 15) & (ay < 35)).mean()),
                     "ge35": float((ay >= 35).mean())}
 
-    # 誤報の目安：普段の記録が終わった後（普段がある時間）の区間数
+    # 何もしていない記録での区間の数（多すぎないかの目安）：普段がある時間の区間数
     minutes = q["judged_s"] / 60
     per = {}
     for m in METRICS:
@@ -437,6 +498,13 @@ def quality(a: Analysis, calm: bool) -> dict:
                 best = (d, s)
         rows.append((m_t, v, best))
     q["mark_rows"] = rows
+
+    cands = candidates(a)
+    hours = q["judged_s"] / 3600
+    q["candidates"] = cands
+    q["cand_rate"] = {k: (len(v), len(v) / hours if hours > 0 else None) for k, v in
+                      {"all": cands, "other": [x for x in cands if not x.in_scene],
+                       "scene": [x for x in cands if x.in_scene]}.items()}
     return q
 
 
@@ -482,8 +550,11 @@ def spans(mask: np.ndarray, t: np.ndarray) -> list[tuple[float, float]]:
 
 
 # 場面の帯は、区間の色（橙・青）と紛れない落ち着いた色
-SCENE_COLORS = ["#c2a5cf", "#e6d36e", "#a6a6a6", "#d9a5c4", "#9fb87a", "#c9b48f"]
-UP, DOWN = "#e66101", "#2b83ba"
+# 色は docs/wording-guide.md に従う：赤と赤・黄・緑の組み合わせは使わない。
+# いつもの範囲＝薄い青灰の帯、今の値＝濃紺の線、区間＝いつもより上はアンバー・下は青灰
+SCENE_COLORS = ["#c2a5cf", "#b0bfd4", "#d6c2a3", "#c9c9c9", "#a7a3c9", "#d4b8c9"]
+UP, DOWN = "#E69F00", "#5B7FA6"
+RANGE, LINE = "#DCE3EA", "#1F3A5F"
 
 
 @dataclass
@@ -510,13 +581,12 @@ def metric_track(a: Analysis, m: str, scene_color: dict) -> Track:
                 ax.axvspan(to_num(t[s.i0]), to_num(t[s.i1]), color=UP if s.sign > 0 else DOWN, alpha=0.3, lw=0)
         for t0, t1, name in scene_intervals(rec, t[-1]):
             ax.axvspan(to_num(t0), to_num(t1), ymin=0.93, ymax=1.0, color=scene_color[name], lw=0)
+        mc = c["metrics"][m]
+        ax.axhspan(-mc["start_z"], mc["start_z"], color=RANGE, lw=0, zorder=0)   # いつもの範囲
+        ax.axhline(0, lw=0.5, color="#b8c2cc")
         z = np.where(a.judge[m], a.z[m], np.nan)
         step = max(1, len(t) // 20000)   # 長い記録は点を間引いて描く
-        ax.plot(x[::step], z[::step], lw=0.8, color="#333333")
-        mc = c["metrics"][m]
-        for y in (mc["start_z"], -mc["start_z"]):
-            ax.axhline(y, ls="--", lw=0.7, color="#777777")
-        ax.axhline(0, lw=0.5, color="#bbbbbb")
+        ax.plot(x[::step], z[::step], lw=0.9, color=LINE)
         for m_t, v in marks(rec):
             ax.axvline(to_num(m_t), color="#7570b3", lw=1)
         ax.set_ylabel("z")
@@ -547,13 +617,14 @@ def figure_tracks(a: Analysis, tracks: list[Track]) -> str:
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=JST))
     axes[-1].set_xlim(to_num(t[0]), to_num(t[-1]))
     axes[-1].set_xlabel("日本時間")
-    handles = [Patch(color=UP, alpha=0.3, label="区間（普段より上）"),
-               Patch(color=DOWN, alpha=0.3, label="区間（普段より下）"),
+    handles = [Patch(color=RANGE, label="いつもの範囲（|z|<開始値）"),
+               Patch(color=UP, alpha=0.3, label="区間（いつもより上）"),
+               Patch(color=DOWN, alpha=0.3, label="区間（いつもより下）"),
                Patch(color="#9e9e9e", alpha=0.45, label="判定対象外（表情）"),
                Patch(color="#e6e6e6", label="普段が無い時間"),
                Line2D([], [], color="#7570b3", label="家族の印"),
-               Line2D([], [], color="#777777", ls="--", label="±開始のz")]
-    fig.legend(handles=handles, loc="lower center", ncol=6, fontsize=8, frameon=False)
+               Line2D([], [], color=LINE, label="z（ならした今の値）")]
+    fig.legend(handles=handles, loc="lower center", ncol=7, fontsize=8, frameon=False)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     return fig_to_data(fig, plt)
 
@@ -600,8 +671,8 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     parts = []
     parts.append(f"<h1>振り返りレポート</h1><p class=sub>{e(rec.path.name)}（{e(rec.header.get('schema', '?'))}）"
                  f" / {jst(rec.t[0])} 〜 {jst(rec.t[-1])}（日本時間）</p>")
-    parts.append("<p class=note>出しているのは、普段（記録の最初の60秒など）から数値がどれだけ外れたかという事実だけです。"
-                 "意味の解釈はしていません。</p>")
+    parts.append("<p class=note>記録から、観測された変化（いつもの範囲から数値が外れた区間）を確認するための手がかりです。"
+                 "本人の気持ちや状態は判断していません。文言と色は docs/wording-guide.md に従っています。</p>")
 
     parts.append("<h2>使った基準</h2><ul>" + "".join(f"<li>{e(x)}</li>" for x in criteria_lines(c)) + "</ul>")
     if c.get("changelog"):
@@ -641,11 +712,11 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     else:
         parts.append("<h2>普段（baseline）</h2><p>普段の記録（type:\"baseline\"）が無いため、区間は判定できません。</p>")
 
-    # 誤報の目安
+    # 区間の数（--calm では、何もしていない記録で区間が多すぎないかの目安）
     r = q["rates"]
     rrows = [[m, LABEL[m], r["per_metric"][m][0], r["per_metric"][m][1]] for m in METRICS]
     rrows.append(["合計", "", r["total"], sum(v[1] for v in r["per_metric"].values())])
-    head = "<h2>区間の数" + ("（誤報の目安：--calm「何もしていない記録」）" if r["calm"] else "") + "</h2>"
+    head = "<h2>区間の数" + ("（何もしていない記録：多すぎないかの目安）" if r["calm"] else "") + "</h2>"
     rate = ("–" if r["per_min"] is None else
             f"判定した {r['minutes']:.1f}分 で {r['total']}件 = 1分あたり {r['per_min']:.2f}件 / 10分あたり {r['per_10min']:.1f}件")
     if r["calm"] and r["per_10min"] is not None:
@@ -662,8 +733,26 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
             else:
                 d, s = best
                 where = "区間の中" if d == 0 else (f"区間の終わりの {d:.1f}秒後" if d > 0 else f"区間の始まりの {-d:.1f}秒前")
-                mrows.append([jst(m_t), v, f"{LABEL[s.metric]}・{'上' if s.sign > 0 else '下'}（{jst(rec.t[s.i0])}）", where])
-        parts.append("<h2>印との対応（一番近い区間）</h2>" + table(["時刻", "印", "区間", "時間差"], mrows))
+                mrows.append([jst(m_t), v, f"{LABEL[s.metric]}が{direction(s.metric, s.sign)}（{jst(rec.t[s.i0])}〜）", where])
+        parts.append("<h2>家族の印と区間（一番近い区間）</h2>" + table(["時刻", "家族の印", "区間", "時間差"], mrows))
+
+    # 通知候補
+    n = c["notify"]
+    cr = q["cand_rate"]
+    per_h = lambda k: "–" if cr[k][1] is None else f"{cr[k][0]}件（1時間あたり {cr[k][1]:.1f}件）"
+    parts.append("<h2>通知候補（実際には通知しません）</h2>"
+                 f"<p class=note>{'基準はすべて仮の値です（criteria.json で変えられます）。' if n.get('provisional') else ''}"
+                 "通知の条件を決める前に、候補がどれくらい出るか（多すぎないか）を見るためのものです。</p>"
+                 f"<ul><li>A：表情と声の変化が同時に区間に入って {n['cross_modal_s']:g}秒以上続いた</li>"
+                 f"<li>B：同じ指標の区間が {n['long_s']:g}秒以上続いた</li>"
+                 f"<li>C：{n['repeat_window_min']:g}分以内に同じ指標の区間が {n['repeat_count']}回以上</li></ul>"
+                 + table(["", "件数"], [["すべて", per_h("all")], ["場面の外", per_h("other")],
+                                        [f"場面の最中（{'・'.join(n['scene_separate'])}）", per_h("scene")]]))
+    for title, group in [("場面の外", [x for x in q["candidates"] if not x.in_scene]),
+                         (f"場面の最中（{'・'.join(n['scene_separate'])}）", [x for x in q["candidates"] if x.in_scene])]:
+        parts.append(f"<h3>{e(title)}（{len(group)}件）</h3>"
+                     + (table(["時刻", "条件", "内容", "場面"], [[jst(x.t), x.rule, x.detail, x.scene] for x in group])
+                        if group else "<p>ありません。</p>"))
 
     # グラフ
     scene_names = list(dict.fromkeys(n for _, _, n in scene_intervals(rec, rec.t[-1])))
@@ -676,7 +765,7 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                  + f"<img src='{img}' alt='指標ごとの z の時系列'>")
 
     # 区間の表
-    cols = ["開始", "終了", "長さ_秒", "指標名", "向き", "ピークのz", "普段の平均", "ピークの値", "場面", "前後の印",
+    cols = ["開始", "終了", "長さ_秒", "指標名", "向き", "ピークのz", "普段の平均", "ピークの値", "場面", "前後の家族の印",
             "顔が映っていた割合", "yawの平均", "備考"]
     body = [[rw[k] if k != "普段の平均" else f"{rw['普段の平均']:g}{UNIT.get(rw['指標'], '')} → {rw['ピークの値']:g}{UNIT.get(rw['指標'], '')}"
              for k in cols if k != "ピークの値"] for rw in rows]
@@ -689,7 +778,7 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     @media (prefers-color-scheme: dark){:root{--fg:#eee;--sub:#aaa;--bg:#161616;--line:#333} img{background:#fff}}
     body{font-family:-apple-system,"Hiragino Sans","Yu Gothic",sans-serif;color:var(--fg);background:var(--bg);
          max-width:1200px;margin:24px auto;padding:0 16px;line-height:1.6}
-    h1{font-size:1.5em;margin-bottom:0} h2{font-size:1.15em;margin-top:2em;border-bottom:1px solid var(--line)}
+    h1{font-size:1.5em;margin-bottom:0} h3{font-size:1em;margin-top:1.2em} h2{font-size:1.15em;margin-top:2em;border-bottom:1px solid var(--line)}
     .sub{color:var(--sub);font-size:.9em;margin-top:4px} .note{color:var(--sub)}
     table{border-collapse:collapse;font-size:.85em;margin:8px 0;display:block;overflow-x:auto}
     th,td{border:1px solid var(--line);padding:4px 8px;text-align:left;white-space:nowrap}
@@ -707,7 +796,7 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Ability Cam の記録の振り返りレポート（普段から外れた区間）")
     p.add_argument("jsonl", type=Path)
-    p.add_argument("--calm", action="store_true", help="「何もしていない記録」として、誤報の目安を出す")
+    p.add_argument("--calm", action="store_true", help="「何もしていない記録」として、区間が多すぎないかの目安を出す")
     p.add_argument("--criteria", type=Path, default=HERE / "criteria.json")
     p.add_argument("--set", action="append", default=[], metavar="指標.項目=値",
                    help="基準を変える（例 brow_down.start_min_s=0.8、all.smooth_s=0.5）。項目：" + ", ".join(CRITERIA_KEYS))

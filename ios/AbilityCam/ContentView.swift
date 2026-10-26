@@ -8,7 +8,7 @@ struct ContentView: View {
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
 
     private let series = ["口角を上げる", "眉を寄せる", "目を細める", "口を開ける", "音量", "声の高さ"]
-    private let colors: [Color] = [.green, .orange, .yellow, .blue, .purple, .pink]
+    private let colors: [Color] = [Metric.mouthSmile, .browDown, .eyeSquint, .jawOpen, .rmsDb, .f0Hz].map(\.color)
 
     var body: some View {
         ScrollView {
@@ -27,7 +27,7 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(model.running ? .red : .accentColor)
+                .tint(model.running ? Color(red: 0x6B / 255, green: 0x7A / 255, blue: 0x8C / 255) : .accentColor)   // 赤は使わない
 
                 differencesCard
                 marks

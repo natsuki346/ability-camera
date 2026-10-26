@@ -113,7 +113,8 @@ class FixtureTest(unittest.TestCase):
         first = rows[0]
         self.assertEqual(first["指標"], "brow_down")
         self.assertEqual(first["場面"], "食事")
-        self.assertIn("不快", first["前後の印"])
+        self.assertIn("不快", first["前後の家族の印"])
+        self.assertEqual(first["向き"], "いつもより強い")
         self.assertEqual(first["普段の平均"], 0.05)
         q = review.quality(self.a, calm=True)
         # 判定対象外：yaw 50° の 2秒と、顔が映らない約1.5秒
@@ -131,8 +132,46 @@ class FixtureTest(unittest.TestCase):
             html_text = (Path(d) / "fixture_basic.html").read_text(encoding="utf-8")
             self.assertIn("data:image/png;base64,", html_text)
             self.assertIn("10分あたり", html_text)
-            for word in ["笑顔", "痛み", "怒り"]:
+            # docs/wording-guide.md の使わない語（「不快」は家族の印の名前としてだけ出る）
+            for word in ["笑顔", "痛み", "怒り", "苦痛", "異常", "検知", "緊急", "危険", "助けを求めて", "要求している",
+                         "安心してください", "監視", "見守り", "患者", "誤報", "%増", "%減"]:
                 self.assertNotIn(word, html_text)
+            self.assertIn("通知候補", html_text)
+            self.assertIn("仮の値", csv_text)
+
+
+class CandidateTest(unittest.TestCase):
+    """作った区間を与えて、通知候補の条件 A・B・C と場面の振り分けを見る（fixture の時刻を使う）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = review.load_criteria(review.HERE / "criteria.json", [])
+        cls.rec = review.load(FIXTURE)
+
+    def run_segs(self, segs):
+        a = review.analyze(self.rec, self.c)
+        idx = lambda sec: int(np.searchsorted(self.rec.t, T0 + sec))
+        a.segments = [review.Segment(m, sign, idx(s0), idx(s1), idx(s0), 3.0) for m, sign, s0, s1 in segs]
+        return review.candidates(a)
+
+    def test_cross_modal(self):
+        got = self.run_segs([("brow_down", 1, 26, 50), ("rms_db", 1, 30, 50)])   # 同時は 30–50 の 20秒
+        self.assertEqual([x.rule for x in got], ["A"])
+        self.assertAlmostEqual(got[0].t - T0, 45, delta=0.1)
+        self.assertEqual(self.run_segs([("brow_down", 1, 26, 50), ("rms_db", 1, 40, 50)]), [])   # 10秒だけ
+
+    def test_long(self):
+        got = self.run_segs([("jaw_open", 1, 26, 100)])
+        self.assertEqual([x.rule for x in got], ["B"])
+        self.assertAlmostEqual(got[0].t - T0, 86, delta=0.1)
+
+    def test_repeat_and_scene(self):
+        got = self.run_segs([("eye_squint", 1, 1, 2), ("eye_squint", 1, 5, 6), ("eye_squint", 1, 18, 19),
+                             ("mouth_smile", 1, 30, 31), ("mouth_smile", 1, 40, 41), ("mouth_smile", 1, 50, 51)])
+        self.assertEqual([(x.rule, round(x.t - T0)) for x in got], [("C", 18), ("C", 50)])
+        self.assertTrue(got[0].in_scene)          # 15–25 は「食事」
+        self.assertEqual(got[0].scene, "食事")
+        self.assertFalse(got[1].in_scene)
 
 
 if __name__ == "__main__":

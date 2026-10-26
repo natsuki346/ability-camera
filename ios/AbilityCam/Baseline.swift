@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// 「いつもとの違い」を見る指標。状態の名前は付けない（意味の解釈は家族がする）
 enum Metric: String, CaseIterable {
@@ -15,6 +16,18 @@ enum Metric: String, CaseIterable {
         case .jawOpen: "口を開ける"
         case .rmsDb: "声の大きさ"
         case .f0Hz: "声の高さ"
+        }
+    }
+
+    /// グラフと網目で使う色（docs/wording-guide.md：赤と赤・黄・緑の組み合わせを使わない）
+    var color: Color {
+        switch self {
+        case .mouthSmile: Color(red: 0x56 / 255, green: 0xB4 / 255, blue: 0xE9 / 255)   // 空色
+        case .browDown: Color(red: 0xE6 / 255, green: 0x9F / 255, blue: 0x00 / 255)     // アンバー
+        case .eyeSquint: Color(red: 0xA4 / 255, green: 0x8C / 255, blue: 0xD1 / 255)    // 薄紫
+        case .jawOpen: Color(red: 0x3B / 255, green: 0x78 / 255, blue: 0xC2 / 255)      // 青
+        case .rmsDb: Color(red: 0x9C / 255, green: 0x85 / 255, blue: 0x72 / 255)        // 灰茶
+        case .f0Hz: Color(red: 0xCC / 255, green: 0x79 / 255, blue: 0xA7 / 255)         // 赤紫
         }
     }
 

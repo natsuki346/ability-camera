@@ -805,6 +805,12 @@ def main(argv=None) -> int:
     p.add_argument("--out-dir", type=Path, help="出力先（省略時は記録と同じ場所）")
     args = p.parse_args(argv)
 
+    with open(args.jsonl, encoding="utf-8") as f:
+        if '"session_summary"' in f.readline():
+            print("これは要約の一覧（sessions.jsonl）です。一覧は sessions.py で、1回分のレポートは ability-cam-*.jsonl を渡してください",
+                  file=sys.stderr)
+            return 2
+
     overrides = list(args.set) + [f"all.{k}={getattr(args, k)}" for k in CRITERIA_KEYS if getattr(args, k) is not None]
     c = load_criteria(args.criteria, overrides)
     rec = load(args.jsonl)

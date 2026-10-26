@@ -73,6 +73,7 @@ final class SessionLogger {
     private let encoder = JSONEncoder()
     private(set) var fileName: String?
     private var startedMs = Int64.max   // queue の上でだけ触る
+    private var stats = SessionStats()  // queue の上でだけ触る。書いた行から要約を数える
 
     func start() throws {
         let f = DateFormatter()
@@ -96,6 +97,7 @@ final class SessionLogger {
         let ms = header["started_at_ms"] as! Int64
         queue.async {
             self.startedMs = ms
+            self.stats = SessionStats()
             self.handle?.write(data + Data("\n".utf8))
         }
     }
@@ -104,6 +106,37 @@ final class SessionLogger {
         queue.async {
             guard let h = self.handle, let d = try? self.encoder.encode(record) else { return }
             h.write(d + Data("\n".utf8))
+            self.count(record)
+        }
+    }
+
+    private func count<T>(_ record: T) {
+        if let f = record as? FrameRecord {
+            stats.addFrame(tMs: f.tMs, face: f.face, yawDeg: f.yawDeg)
+        } else if let e = record as? EventRecord {
+            let v: [String]?
+            switch e.value {
+            case .text(let s): v = [s]
+            case .list(let a): v = a
+            case nil: v = nil
+            }
+            stats.addEvent(tMs: e.tMs, kind: e.kind, value: v)
+        }
+    }
+
+    /// 書いた分を端末に書き出す（このあと終了されても、次に開いたときに読み直せるように）
+    func flush() { queue.async { try? self.handle?.synchronize() } }
+
+    /// ファイルを閉じて、このセッションの要約を返す
+    func finish() -> SessionSummary? {
+        queue.sync {
+            guard let h = handle, let name = fileName else { return nil }
+            try? h.close()
+            handle = nil
+            let s = stats.summary(file: name, startedMs: startedMs == .max ? nil : startedMs, recovered: false)
+            startedMs = .max
+            stats = SessionStats()
+            return s
         }
     }
 
@@ -113,14 +146,8 @@ final class SessionLogger {
             guard tMs >= self.startedMs else { return }
             guard let h = self.handle, let d = try? self.encoder.encode(record) else { return }
             h.write(d + Data("\n".utf8))
+            self.count(record)
         }
     }
 
-    func stop() {
-        queue.sync {
-            try? handle?.close()
-            handle = nil
-            startedMs = .max
-        }
-    }
 }

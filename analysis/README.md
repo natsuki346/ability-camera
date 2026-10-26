@@ -22,8 +22,22 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回だ
 ```
 変えられる項目：`smooth_s`（ならし）、`start_z`、`start_min_s`、`end_z`、`end_min_s`。
 
-## 映り方チェック（`framing.py`）
-アプリの「映り方チェック」が残した `framing-checks.jsonl`（要約だけ）から、チェックごとの一覧と、顔が映っていた割合の比較の表を出す。numpy などは使わない。
+## これまでの記録（`sessions.py`）
+アプリは、開いてから閉じるまでを1回の記録（セッション）として `ability-cam-日時.jsonl` に記録し、閉じたときに要約を `sessions.jsonl` に1行足す。
+「ファイル」アプリの Ability Cam フォルダを丸ごと PC に写して、フォルダを渡す。
+```sh
+.venv/bin/python sessions.py Ability\ Cam/              # → Ability Cam/sessions.html（セッションの一覧、新しい順）
+.venv/bin/python sessions.py Ability\ Cam/ --review     # 各記録の振り返りレポート（review.py）も作って、一覧からリンクする
+.venv/bin/python review.py Ability\ Cam/ability-cam-20261026-140312.jsonl   # 1回分だけ
+```
+- 一覧：開始、長さ、顔が映っていた割合、横を向きすぎていなかった時間、変化の区間の数（アプリの画面に「いつもとの違い」が出始めた回数）、家族の印・場面の数、記録のファイル、備考（次に開いたときに整理したもの）
+- **要約のない記録**：フォルダにあるのに `sessions.jsonl` に要約が無いファイル（アプリで次に開く前に写した、など）は、アプリと同じ数え方でここで要約して別の欄に出す
+- `review.py` に `sessions.jsonl` を渡すと、`sessions.py` を使うよう案内して終わる
+
+## 映り方チェック（`framing.py`、過去のファイル用）
+アプリの「映り方チェック」は v0.4 でなくした（開いている間はいつも記録するため）。過去に残った `framing-checks.jsonl` はこれで読める。
+
+`framing-checks.jsonl`（要約だけ）から、チェックごとの一覧と、顔が映っていた割合の比較の表を出す。numpy などは使わない。
 ```sh
 .venv/bin/python framing.py framing-checks.jsonl                    # → framing-checks.html
 .venv/bin/python framing.py 端末A/framing-checks.jsonl 端末B/framing-checks.jsonl --out 比較.html
@@ -65,5 +79,6 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回だ
 .venv/bin/python tests/make_fixture.py               # 作り物のテスト用記録を作り直す
 .venv/bin/python -m unittest discover -s tests
 ```
+`test_sessions.py` は、記録のファイルからの要約（空きの切り方・横向き・区間・印・場面・壊れた最後の行）と、一覧の HTML を確かめる。
 `test_framing.py` は映り方チェックの読み込み（メモは一番新しいもの・同じ要約は1つ）、メモごとのまとめ、HTML を確かめる。
 `tests/fixture_basic.jsonl` は人の記録ではなく、区間・短い動き・ヒステリシス・判定対象外・取り直しを確かめるための作り物。

@@ -21,14 +21,11 @@ enum Mark: String, CaseIterable, Identifiable {
 
 @MainActor
 final class AnalysisModel: ObservableObject {
-    @Published var running = false           // 記録中（JSONL・普段・マイク）
-    @Published var cameraActive = false      // カメラが動いている（記録していなくても映り方の確認に使う）
-    @Published var cameraPausedForIdle = false   // 操作がなくて止めた（タップで再開）
-    @Published var status = "カメラの準備中…"
-    @Published var framingSince: Date?               // 映り方チェック中なら始めた時刻（記録はしない）
-    private var framing: FramingCheck?               // 数えている途中（画面には出さない。毎コマ更新するため）
-    @Published var framingResult: FramingSummary?     // 終えたあとの要約
-    @Published var framingNoteSaved: String?
+    @Published var running = false           // セッションの記録中（ファイルが開いている。裏に回って5秒以内も含む）
+    @Published var cameraActive = false
+    @Published var sessionStartedAt: Date?   // 画面の上の経過時間
+    @Published var sessions: [SessionSummary] = []   // これまでの記録（新しい順）
+    @Published var status = "記録の準備中…"
     @Published var faceRatio: Double?
     @Published var fps: Double?
     @Published var procMs: Double?
@@ -56,10 +53,11 @@ final class AnalysisModel: ObservableObject {
 
     private var frames = 0, faceFrames = 0, procSum = 0.0, procN = 0, latSum = 0.0
     private var startHost: CFTimeInterval = 0
-    private var recordedFrames = 0
-    private var preparing = false
-    private var lastActivity: CFTimeInterval = 0
-    private var idleTask: Task<Void, Never>?
+    private var activating = false
+    private var micOn = false
+    private var finalizeTask: Task<Void, Never>?
+    private var bgTask: UIBackgroundTaskIdentifier = .invalid
+    private var recoveryDone = false
     private var meshLagSum = 0.0, meshN = 0
     private var shapeSmooth: [String: Double] = [:], lastShapeT = -Double.infinity
 
@@ -76,24 +74,126 @@ final class AnalysisModel: ObservableObject {
     static let chartWindow = 20.0
     static let baselineSeconds = 60.0
     static let minSamples = 30
-    static let idleSeconds = 300.0   // 記録していない間、操作がないままこれだけたったらカメラを止める
+    static let resumeGraceSeconds = 5.0   // 裏に回ってからこの秒数以内に戻れば、同じセッションを続ける
 
-    func toggle() async {
-        running ? stop() : await start()
+    // MARK: セッション（開いている間は記録し、裏に回ったら閉じて要約する）
+
+    /// アプリが前に出た
+    func appBecameActive() async {
+        guard !activating else { return }
+        activating = true
+        defer { activating = false }
+        if let t = finalizeTask {   // 5秒以内に戻った（通知を見た、など）→ 同じセッションを続ける
+            t.cancel(); finalizeTask = nil
+            endBackgroundTask()
+        }
+        if running { await resumeSession() } else { await startSession() }
+        if !recoveryDone {
+            recoveryDone = true
+            recoverMissing()
+        }
     }
 
-    /// カメラを動かす（記録はしない）。網目・顔の絵・顔の向き・顔が映っている割合はこれだけで動く
-    func prepareCamera() async {
-        guard !cameraActive, !preparing else { return }
-        preparing = true
-        defer { preparing = false }
-        guard await AVCaptureDevice.requestAccess(for: .video) else { status = "カメラの許可がありません（設定アプリから許可してください）"; return }
+    /// アプリが裏に回った：カメラとマイクを止め、5秒たっても戻らなければファイルを閉じて要約する
+    func appEnteredBackground() {
+        stopCamera()
+        guard running else { return }
+        if micOn { audio.stop() }
+        rmsDb = nil; f0Hz = nil
+        logger.flush()
+        UIApplication.shared.isIdleTimerDisabled = false
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "finish-session") { [weak self] in
+            // 裏で動ける時間が尽きそうなら、待たずに閉じる（main スレッドで呼ばれる）
+            MainActor.assumeIsolated { self?.finalizeSession() }
+        }
+        finalizeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.resumeGraceSeconds))
+            guard !Task.isCancelled else { return }
+            self?.finalizeSession()
+        }
+    }
+
+    private func startSession() async {
+        guard await startCamera() else { return }
+        do {
+            try logger.start()
+        } catch {
+            status = "記録を始められませんでした: \(error.localizedDescription)"
+            return
+        }
+        var note = ""
+        micOn = await AVAudioApplication.requestRecordPermission()
+        if micOn {
+            do { try audio.start() } catch { micOn = false; note = "（マイクを使えませんでした。声は記録していません）" }
+        } else {
+            note = "（マイクの許可がないため、声は記録していません）"
+        }
+        resetLive()
+        scene = nil; markMessage = nil
+        resetBaseline()   // 普段の60秒も自動で始める
+        running = true
+        sessionStartedAt = Date()
+        status = "記録しています: \(logger.fileName ?? "-")" + note
+        UIApplication.shared.isIdleTimerDisabled = true
+    }
+
+    private func resumeSession() async {
+        guard !cameraActive, await startCamera() else { return }
+        if micOn { try? audio.start() }
+        UIApplication.shared.isIdleTimerDisabled = true
+    }
+
+    /// ファイルを閉じて、要約を sessions.jsonl に足す
+    private func finalizeSession() {
+        finalizeTask?.cancel(); finalizeTask = nil
+        if running {
+            running = false
+            sessionStartedAt = nil
+            baselineSec = nil; baselineReady = false; differences = []; insufficient = []
+            scene = nil; markMessage = nil
+            if let s = logger.finish() {
+                do {
+                    try SessionStore.append(s)
+                    status = "記録を整理しました: \(s.file)"
+                } catch {
+                    status = "記録の要約を保存できませんでした: \(error.localizedDescription)"
+                }
+            }
+            sessions = SessionStore.load()
+        }
+        endBackgroundTask()
+    }
+
+    private func endBackgroundTask() {
+        guard bgTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(bgTask)
+        bgTask = .invalid
+    }
+
+    /// 前回、要約を作る前に終了されたファイルを整理する（重いので裏のスレッドで）
+    private func recoverMissing() {
+        sessions = SessionStore.load()
+        let current = logger.fileName
+        Task { [weak self] in
+            let list = await Task.detached(priority: .utility) {
+                SessionStore.recoverMissing(except: current) > 0 ? SessionStore.load() : nil
+            }.value
+            if let list { self?.sessions = list }
+        }
+    }
+
+    private func startCamera() async -> Bool {
+        if cameraActive { return true }
+        guard await AVCaptureDevice.requestAccess(for: .video) else {
+            status = "カメラの許可がありません（設定アプリから許可してください）"
+            return false
+        }
         do {
             try face.load()
             try camera.configureIfNeeded()
         } catch {
             status = "カメラを使えませんでした: \(error.localizedDescription)"
-            return
+            return false
         }
 
         let face = self.face, audio = self.audio, logger = self.logger
@@ -103,7 +203,7 @@ final class AnalysisModel: ObservableObject {
             let ageSec = CACurrentMediaTime() - Double(r.captureMs) / 1000
             let tMs = Int64((Date().timeIntervalSince1970 - ageSec) * 1000)
             let round1 = { (x: Double) in (x * 10).rounded() / 10 }
-            // 記録していない間は書かれない（ファイルが開いていない・記録の開始より前のコマ）
+            // ファイルが開いていないとき・記録の開始より前のコマは書かれない
             logger.write(FrameRecord(tMs: tMs, face: r.face,
                                      bs: r.face ? r.blendshapes : nil, pts: r.face ? r.keyPoints : nil,
                                      rmsDb: a.rmsDb, f0Hz: a.f0Hz, procMs: r.procMs, latMs: r.latMs,
@@ -117,52 +217,14 @@ final class AnalysisModel: ObservableObject {
         resetLive()
         camera.start()
         cameraActive = true
-        cameraPausedForIdle = false
-        UIApplication.shared.isIdleTimerDisabled = true
-        if !running { status = "「開始」を押すと記録を始めます" }
-        noteActivity()
-        watchIdle()
+        return true
     }
 
-    /// カメラを止める（電池と熱のため）。記録中なら記録は続く（ファイルは閉じない）
-    func pauseCamera(idle: Bool) {
-        idleTask?.cancel(); idleTask = nil
+    private func stopCamera() {
         guard cameraActive else { return }
         camera.stop()
         cameraActive = false
-        cameraPausedForIdle = idle
         mesh = nil; faceShape = nil; faceReadable = true
-        if !running { UIApplication.shared.isIdleTimerDisabled = false }
-        if idle { status = "操作がなかったので、カメラを止めました（タップで再開）" }
-    }
-
-    /// アプリが裏に回った
-    func enterBackground() {
-        if framing != nil { finishFramingCheck(endedBy: "background") }   // カメラが止まるので、そこで終える
-        pauseCamera(idle: false)
-    }
-
-    /// アプリが前に戻った
-    func enterForeground() async {
-        if running { audio.resumeIfNeeded() }
-        await prepareCamera()
-    }
-
-    /// 画面のどこかを触った
-    func noteActivity() { lastActivity = CACurrentMediaTime() }
-
-    private func watchIdle() {
-        idleTask?.cancel()
-        idleTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(10))
-                guard let self, !Task.isCancelled else { return }
-                if self.cameraActive, !self.running, self.framing == nil, CACurrentMediaTime() - self.lastActivity >= Self.idleSeconds {
-                    self.pauseCamera(idle: true)
-                    return
-                }
-            }
-        }
     }
 
     /// 画面の数字・網目・顔の絵・グラフを、今から数え直す
@@ -175,86 +237,6 @@ final class AnalysisModel: ObservableObject {
         startHost = CACurrentMediaTime()
         smooth = [:]; lastAudioAt = 0; recentFace = []
         faceReadable = true
-    }
-
-    /// 記録を始める。マイクはここで初めて使う
-    func start() async {
-        guard framing == nil else { return }
-        await prepareCamera()
-        guard cameraActive else { return }
-        guard await AVAudioApplication.requestRecordPermission() else { status = "マイクの許可がありません（設定アプリから許可してください）"; return }
-        do {
-            try logger.start()
-            try audio.start()
-        } catch {
-            audio.stop()
-            logger.stop()
-            status = "開始できませんでした: \(error.localizedDescription)"
-            return
-        }
-
-        resetLive()
-        recordedFrames = 0
-        scene = nil; markMessage = nil
-        resetBaseline()
-        running = true
-        status = "記録中…"
-    }
-
-    /// 記録だけ止める。カメラの映像はそのまま動かす
-    func stop() {
-        audio.stop()
-        logger.stop()
-        running = false
-        baselineSec = nil; baselineReady = false; differences = []; insufficient = []
-        scene = nil; markMessage = nil
-        rmsDb = nil; f0Hz = nil
-        status = "保存しました: \(logger.fileName ?? "-")（\(recordedFrames)コマ）"
-        noteActivity()
-        if !cameraActive { UIApplication.shared.isIdleTimerDisabled = false }
-    }
-
-    // MARK: 映り方チェック（表情の記録・普段・マイクは使わない。要約だけを framing-checks.jsonl に残す）
-
-    func toggleFramingCheck() async {
-        if framing != nil { finishFramingCheck(endedBy: "button") } else { await startFramingCheck() }
-    }
-
-    func startFramingCheck() async {
-        guard !running, framing == nil else { return }
-        await prepareCamera()
-        guard cameraActive else { return }
-        framing = FramingCheck(startHost: CACurrentMediaTime())
-        framingSince = Date()
-        framingResult = nil; framingNoteSaved = nil
-        status = "映り方チェック中…（表情・音声は記録していません）"
-    }
-
-    func finishFramingCheck(endedBy: String) {
-        guard var f = framing else { return }
-        f.finish(atHost: CACurrentMediaTime())
-        framing = nil; framingSince = nil
-        let sum = f.summary(endedBy: endedBy)
-        framingResult = sum
-        do {
-            try FramingLog.append(sum)
-            status = "映り方チェックの要約を保存しました: \(FramingLog.fileName)"
-                + (endedBy == "background" ? "（アプリが裏に回ったので、そこで終えました）" : "")
-        } catch {
-            status = "要約を保存できませんでした: \(error.localizedDescription)"
-        }
-        noteActivity()
-    }
-
-    func saveFramingNote(_ text: String) {
-        let note = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let r = framingResult, !note.isEmpty else { return }
-        do {
-            try FramingLog.append(FramingNote(id: r.id, tMs: Self.nowMs(), note: note))
-            framingNoteSaved = note
-        } catch {
-            status = "メモを保存できませんでした: \(error.localizedDescription)"
-        }
     }
 
     /// 普段を取り直す
@@ -316,13 +298,11 @@ final class AnalysisModel: ObservableObject {
     private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot) {
         guard cameraActive else { return }
         frames += 1
-        if running { recordedFrames += 1 }
         if r.face { faceFrames += 1 }
         if r.procMs >= 0 { procSum += r.procMs; procN += 1 }
         latSum += r.latMs
 
         let captureT = Double(r.captureMs) / 1000
-        framing?.add(captureT: captureT, face: r.face, yaw: r.pose?.yaw)
         recentFace.append((captureT, r.face))
         recentFace.removeAll { $0.t < captureT - 1 }
 
@@ -371,7 +351,7 @@ final class AnalysisModel: ObservableObject {
             if let f0 = a.f0Hz { voiceValues[.f0Hz] = Double(f0) }
         }
 
-        let collecting = running && !baselineReady   // 普段を記録するのは「開始」後だけ
+        let collecting = running && !baselineReady   // 普段を記録するのはセッションの記録中だけ
         for (m, x) in faceValues {
             smooth[m, default: Smoother()].add(x, at: captureT)
             if collecting { stats[m, default: Welford()].add(x) }
@@ -389,7 +369,6 @@ final class AnalysisModel: ObservableObject {
         if meshEnabled, readable, r.face, !r.mesh.isEmpty {
             mesh = FaceMesh(points: r.mesh, imageSize: r.imageSize, values: faceValues)
             meshLagSum += (now - captureT) * 1000; meshN += 1
-            framing?.addMeshLag((now - captureT) * 1000)
             meshLagMs = meshLagSum / Double(meshN)
         } else if mesh != nil {
             mesh = nil

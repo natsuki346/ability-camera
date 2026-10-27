@@ -403,6 +403,73 @@ class BlinkAndVoiceFloorTest(unittest.TestCase):
             self.assertIn("std下限 6", doc)
 
 
+class CompositeTest(unittest.TestCase):
+    """研究用：上半分の顔の動きの合計（PSPI 型）。区間の判定には使わない"""
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        cls.dir = tempfile.TemporaryDirectory()
+        out = []
+        for line in FIXTURE.read_text(encoding="utf-8").splitlines():
+            o = json.loads(line)
+            if o.get("type") == "frame" and o.get("bs"):
+                ts = o["t_ms"] / 1000 - T0
+                bs = o["bs"]
+                if 74 <= ts < 77:                        # 75 の印（快）の前後で、鼻にしわを寄せる動き
+                    bs["noseSneerLeft"] = bs["noseSneerRight"] = 0.3
+                if 80 <= ts < 81 or 85 <= ts < 85.2:     # 目を閉じる 1秒と、短いまばたき 0.2秒
+                    bs["eyeBlinkLeft"] = bs["eyeBlinkRight"] = 0.8
+            out.append(json.dumps(o, ensure_ascii=False))
+        cls.path = Path(cls.dir.name) / "comp.jsonl"
+        cls.path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        cls.rec = review.load(cls.path)
+        cls.c = review.load_criteria(review.HERE / "criteria.json", [])
+        cls.a = review.analyze(cls.rec, cls.c)
+        cls.comp = review.research_composite(cls.a)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def at(self, sec):
+        return self.comp.value[int(np.searchsorted(self.rec.t, T0 + sec))]
+
+    def test_values(self):
+        self.assertEqual(self.comp.means[0]["values"]["noseSneer"], 0.02)   # baseline 行の時間のコマから数え直し
+        self.assertAlmostEqual(self.at(76), 0.28, delta=0.01)               # max(noseSneer, mouthUpperUp) の差
+        self.assertAlmostEqual(self.at(30.8), 0.0, delta=0.01)              # 普段どおりなら 0（マイナスは 0）
+        self.assertAlmostEqual(self.at(80.7), 0.75, delta=0.01)             # 目を閉じて 0.5秒以上：eyeBlink の差
+        self.assertAlmostEqual(self.at(85.1), 0.0, delta=0.01)              # 短いまばたきは入れない
+        self.assertTrue(np.isnan(self.at(51)))                              # 横を向いている（判定対象外）
+        self.assertTrue(np.isnan(self.at(95)))                              # 普段を取り直している間
+
+    def test_marks(self):
+        rows = {r["value"]: r for r in self.comp.mark_rows}
+        self.assertGreater(rows["快"]["mean"], self.comp.no_mark_mean)
+        self.assertEqual(set(self.comp.by_value), {"不快", "分からない", "快"})
+
+    def test_not_used_for_segments(self):
+        import copy
+        c2 = copy.deepcopy(self.c)
+        c2["research_composite"]["enabled"] = False
+        a2 = review.analyze(self.rec, c2)
+        self.assertIsNone(review.research_composite(a2))
+        self.assertEqual(len(a2.segments), len(self.a.segments))
+        self.assertEqual(len(review.candidates(a2)), len(review.candidates(self.a)))
+
+    def test_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            review.main([str(self.path), "--calm", "--out-dir", d])
+            doc = (Path(d) / "comp.html").read_text(encoding="utf-8")
+            self.assertIn("上半分の顔の動きの合計（PSPI 型・研究用）", doc)
+            self.assertIn("数が少ない", doc)                     # 印は3件（10件たまるまで）
+            self.assertIn("印のない時間", doc)
+            self.assertNotIn("痛み", doc)
+            self.assertNotIn("目安", doc.split("<h2>区間の数")[1].split("</p>")[0])   # 10分に1回以下の目安は出さない
+            self.assertNotIn("10分に1", doc.split("<h2>区間の数")[1].split("</table>")[0])
+
+
 class CandidateTest(unittest.TestCase):
     """作った区間を与えて、通知候補の条件 A・B・C と場面の振り分けを見る（fixture の時刻を使う）"""
 

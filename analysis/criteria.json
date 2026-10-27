@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-27.2",
+  "version": "2026-10-27.3",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -16,6 +16,10 @@
     {
       "date": "2026-10-27",
       "reason": "eye_squint に blink_mask（threshold 0.3、pad_s 0.2）を追加：まばたき（eyeBlinkLeft/Right の平均）が0.3以上のコマと前後0.2秒は、目を細めるを判定対象外にし、普段にも数えない。何もしない記録の2本目で、目を細める数値がまばたきの多い時間帯ほど高かったため。rms_db の std_floor を 2dB → 6dB：静かな部屋で普段を取ったとき（-63dB）、10〜25dB の物音で区間になったため。どちらもまずレポートだけで、アプリは何もしない記録で効果を確かめてから揃える（docs/validation-log.md）。"
+    },
+    {
+      "date": "2026-10-27",
+      "reason": "research_composite（上半分の顔の動きの合計、PSPI 型・研究用）を追加。区間の判定・通知候補には使わず、家族の印と照らし合わせて意味があるかを確かめるためにレポートにだけ出す。重みは根拠がないため付けない。あわせて calm_target_per_10min（10分に1回以下の目安）を外した：根拠のない仮の値だったため、--calm では数字だけを出す（docs/validation-log.md）。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor はアプリと同じ値（rms_db だけ、2026-10-27 からレポートは 6dB・アプリは 2dB のまま）。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -83,7 +87,6 @@
   },
   "stale_s": 1.0,
   "mark_window_s": 10.0,
-  "calm_target_per_10min": 1.0,
   "notify": {
     "_note": "通知候補の基準。すべて仮の値。実際には通知しない（docs/wording-guide.md）",
     "provisional": true,
@@ -101,5 +104,29 @@
     1.0,
     4.0
   ],
-  "_eda_note": "将来の手首の記録（ability-lab.raw.v1、皮膚電気活動）用：出来事の1〜4秒後に反応を探す窓。今は使っていない。"
+  "_eda_note": "将来の手首の記録（ability-lab.raw.v1、皮膚電気活動）用：出来事の1〜4秒後に反応を探す窓。今は使っていない。",
+  "research_composite": {
+    "_note": "研究用。区間の判定・通知候補には使わない。アプリ・見る側の画面には出さない。groups は表情の数値の名前（Left/Right は左右平均）。各グループの中で普段からの差が一番大きいものを取り、重みを付けずに足す。eyeSquint はまばたきのコマを除く（metrics.eye_squint.blink_mask）",
+    "enabled": true,
+    "groups": [
+      [
+        "browDown"
+      ],
+      [
+        "cheekSquint",
+        "eyeSquint"
+      ],
+      [
+        "noseSneer",
+        "mouthUpperUp"
+      ]
+    ],
+    "eye_closed": {
+      "threshold": 0.5,
+      "min_s": 0.5
+    },
+    "smooth_s": 0.3,
+    "mark_window_s": 30,
+    "min_marks": 10
+  }
 }

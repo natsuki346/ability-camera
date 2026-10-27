@@ -32,7 +32,9 @@ def bs_from(v):
     return {"mouthSmileLeft": v["mouth_smile"], "mouthSmileRight": v["mouth_smile"],
             "browDownLeft": v["brow_down"], "browDownRight": v["brow_down"],
             "eyeSquintLeft": v["eye_squint"], "eyeSquintRight": v["eye_squint"],
-            "jawOpen": v["jaw_open"], "eyeBlinkLeft": 0.05}
+            "jawOpen": v["jaw_open"], "eyeBlinkLeft": 0.05, "eyeBlinkRight": 0.05,
+            "cheekSquintLeft": 0.05, "cheekSquintRight": 0.05, "noseSneerLeft": 0.02, "noseSneerRight": 0.02,
+            "mouthUpperUpLeft": 0.03, "mouthUpperUpRight": 0.03}
 
 
 def baseline_line(t):

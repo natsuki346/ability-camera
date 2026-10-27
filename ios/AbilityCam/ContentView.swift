@@ -1,18 +1,18 @@
 import AVFoundation
-import Charts
 import SwiftUI
 
 /// 撮る側の「いま」：スクロールなしの1画面。小さい iPhone（SE の高さ）でも家族の印のボタンまで見える。
-/// 数字とグラフはサイドバーの「詳しい数字」（DetailNumbersView）にある
+/// 真ん中は横にスワイプして「いま」「グラフ」「数字」を切り替える（LivePages.swift）
 struct ContentView: View {
     @ObservedObject var model: AnalysisModel
     var openMenu: (() -> Void)?            // サイドバーを開く（iPad のサイドバーがあるときは nil）
     @State private var cameraLarge = false
     @State private var showSettings = false
+    @State private var middlePage = 0
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
 
     static let sketchSize: CGFloat = 140
-    static let maxDifferenceLines = 2
+    static let dotsHeight: CGFloat = 26   // ページの点の分（中身と重ならないように）
 
     var body: some View {
         VStack(spacing: 8) {
@@ -22,8 +22,7 @@ struct ContentView: View {
                 faceSketch
                 camera
             }
-            differencesCard
-            Spacer(minLength: 0)
+            middle
             marks
             scenes
         }
@@ -84,46 +83,17 @@ struct ContentView: View {
         return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
     }
 
-    /// いつもとの違い（最大2行。多いときは「ほか2件」）。普段の記録中は進み具合。状態の名前は出さない
-    private var differencesCard: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("いつもとの違い").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("普段を取り直す") { model.restartBaseline() }
-                    .font(.caption)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(!model.running)
-            }
-            if !model.running {
-                Text("記録が始まると、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します")
-                    .foregroundStyle(.secondary).lineLimit(2)
-            } else if let sec = model.baselineSec {
-                HStack {
-                    Text("普段を記録中 \(sec)/\(Int(model.baselineTarget))秒").monospacedDigit()
-                    ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget)
-                }
-                Text(model.baselineWait ?? (model.faceReadable ? "落ち着いているときに。顔が映っている間だけ数えます" : "顔が読めません"))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            } else if model.baselineReady {
-                let shown = model.differences.prefix(Self.maxDifferenceLines)
-                if model.differences.isEmpty {
-                    Text(model.faceReadable ? "いつもと大きな違いはありません" : "声は、いつもと大きな違いはありません")
-                }
-                ForEach(Array(shown), id: \.self) { Text($0).bold().lineLimit(1).minimumScaleFactor(0.7) }
-                let rest = model.differences.count - shown.count
-                let notes = [rest > 0 ? "ほか\(rest)件" : nil,
-                             model.faceReadable ? nil : "顔が読めません（表情は比べていません）",
-                             model.insufficient.isEmpty ? nil : "データ不足：\(model.insufficient.map(\.label).joined(separator: "・"))"]
-                    .compactMap { $0 }
-                if !notes.isEmpty {
-                    Text(notes.joined(separator: "　")).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-            }
+    /// 真ん中：横にスワイプして切り替えるページ（下にページの点）。グラフのページでは、グラフの外でスワイプする
+    private var middle: some View {
+        TabView(selection: $middlePage) {
+            NowPage(model: model).padding(.bottom, Self.dotsHeight).tag(0)
+            GraphPage(graph: model.graph).padding(.bottom, Self.dotsHeight).tag(1)
+            NumbersPage(model: model).padding(.bottom, Self.dotsHeight).tag(2)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
+        .tabViewStyle(.page(indexDisplayMode: .always))
+        .indexViewStyle(.page(backgroundDisplayMode: .always))
+        .padding(.bottom, 2)
+        .frame(maxHeight: .infinity)
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
     }
 
@@ -232,56 +202,6 @@ struct ContentView: View {
         }
         .disabled(!model.running)
         .opacity(model.running ? 1 : 0.5)
-    }
-}
-
-/// サイドバーの「詳しい数字」：前は「いま」の画面にあった数字とグラフ
-struct DetailNumbersView: View {
-    @ObservedObject var model: AnalysisModel
-
-    private let series = ["口角を上げる", "眉を寄せる", "目を細める", "口を開ける", "音量", "声の高さ"]
-    private let colors: [Color] = [Metric.mouthSmile, .browDown, .eyeSquint, .jawOpen, .rmsDb, .f0Hz].map(\.color)
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 105))], spacing: 8) {
-                    stat("顔が映っている割合", model.faceRatio.map { "\(Int($0 * 100))%" })
-                    stat("解析コマ/秒", model.fps.map { String(format: "%.1f", $0) })
-                    stat("解析時間 ms", model.procMs.map { String(format: "%.0f", $0) })
-                    stat("撮影→結果 ms", model.latMs.map { String(format: "%.0f", $0) })
-                    stat("撮影→網目 ms", model.meshLagMs.map { String(format: "%.0f", $0) })
-                    stat("音量 dB", model.rmsDb.map { String(format: "%.0f", $0) })
-                    stat("声の高さ Hz", model.f0Hz.map { String(format: "%.0f", $0) })
-                    stat("カメラ", model.lensInUse?.label)
-                }
-                Text("直近\(Int(AnalysisModel.chartWindow))秒").font(.caption).foregroundStyle(.secondary)
-                Chart(model.points) { p in
-                    LineMark(x: .value("秒", p.t), y: .value("値", p.value), series: .value("系列", p.series))
-                        .foregroundStyle(by: .value("系列", p.series))
-                        .lineStyle(StrokeStyle(lineWidth: 1.5))
-                }
-                .chartForegroundStyleScale(domain: series, range: colors)
-                .chartYScale(domain: 0...1)
-                .chartXAxis(.hidden)
-                .frame(height: 220)
-
-                Text(model.status).font(.footnote).foregroundStyle(.secondary)
-                Text("映像と音声は保存せず、この端末の中でその場で解析します。記録（JSONL）は「ファイル」アプリ > このiPhone内 > Ability Cam に保存されます。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            .padding()
-        }
-    }
-
-    private func stat(_ label: String, _ value: String?) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(value ?? "–").font(.title3.monospacedDigit()).bold()
-            Text(label).font(.caption2).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(8)
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
     }
 }
 

@@ -82,6 +82,8 @@ struct DiffEngine {
 
     /// 今の z（判定できたコマのもの。判定できないときは入れない）
     private(set) var z: [Metric: Double] = [:]
+    /// 今のならした値（判定したコマのもの。値が古いときは入れない）
+    private(set) var value: [Metric: Double] = [:]
     /// 続いている違い（表情の「弱い」も含む。出すかは shown で決める）
     private(set) var active: [Metric: DiffSegment] = [:]
     /// 終わった違い（呼ぶ側が取り出す）
@@ -157,6 +159,7 @@ struct DiffEngine {
                 }
             }
             var zz: Double?
+            value[m] = smooth[m].flatMap { x.t - $0.t <= DiffCriteria.staleS ? $0.v : nil }
             if let s = smooth[m], x.t - s.t <= DiffCriteria.staleS, let b = baseline?[m] {
                 zz = (s.v - b.mean) / b.sd
             }

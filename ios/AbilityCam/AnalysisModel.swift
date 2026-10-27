@@ -2,13 +2,6 @@ import AVFoundation
 import QuartzCore
 import SwiftUI
 
-struct ChartPoint: Identifiable {
-    let id = UUID()
-    let t: Double        // 開始からの秒
-    let series: String
-    let value: Double    // 0〜1 に正規化
-}
-
 enum CareScene: String, CaseIterable, Identifiable {
     case meal = "食事", posture = "姿勢を変える", bath = "入浴・着替え", visitor = "人が来た", other = "その他"
     var id: String { rawValue }
@@ -32,7 +25,11 @@ final class AnalysisModel: ObservableObject {
     @Published var latMs: Double?
     @Published var rmsDb: Float?
     @Published var f0Hz: Float?
-    @Published var points: [ChartPoint] = []
+    @Published var meterZ: [Metric: Double] = [:]          // 「いま」の小さいメーター：指標ごとの今の z
+    @Published var diffMetrics: [Metric: Bool] = [:]       // 違いとして出ている指標（値は「上」か）
+    @Published var baselineStats: [Metric: DiffEngine.Stat]?   // 今の普段（いつもの範囲を描く。下限をかけた標準偏差）
+    let graph = GraphStore()                                 // 「グラフ」のページ（メモリだけ、直近5分）
+    private var lastGraphHost: CFTimeInterval = 0
 
     @Published var baselineSec: Int?          // 普段を記録中の経過秒（記録中でなければ nil）
     @Published var baselineReady = false
@@ -92,7 +89,6 @@ final class AnalysisModel: ObservableObject {
     private var diffCount = 0                                 // このセッションで違いが出た回数（segments と同じ数え方）
     private var head = HeadTurnTracker()                      // 顔を向ける・そむける（0.5秒続いたら記録）
 
-    static let chartWindow = 20.0
     static let baselineChoices = [30, 60] // 普段の長さ（数えた時間。時計の時間ではない）。撮る側の設定で選ぶ
     static let defaultBaselineSeconds = 30   // 2026-10-27 に60秒から変えた（docs/validation-log.md）
     /// 設定で選んだ普段の長さ（秒）
@@ -173,6 +169,7 @@ final class AnalysisModel: ObservableObject {
         resetLive()
         scene = nil; markMessage = nil
         diffCount = 0
+        graph.reset()
         link.headTurns = []   // 見る側の「直近の顔の向き」は、セッションごと
         sessionStartHost = CACurrentMediaTime()
         resetBaseline()   // 普段（設定の長さ）も自動で始める
@@ -287,7 +284,6 @@ final class AnalysisModel: ObservableObject {
         faceRatio = nil; fps = nil; procMs = nil; latMs = nil
         mesh = nil; meshLagMs = nil
         faceShape = nil; shapeSmooth = [:]; lastShapeT = -.infinity
-        points = []
         startHost = CACurrentMediaTime()
         lastAudioAt = 0; lastAudioAtEngine = 0; recentFace = []
         lastBlinkT = -.infinity; squintPending = []
@@ -335,6 +331,7 @@ final class AnalysisModel: ObservableObject {
         scene = scene == s ? nil : s
         let t = Self.nowMs(), v = scene?.rawValue ?? "なし"
         logger.write(EventRecord(tMs: t, kind: "scene", value: .text(v)))
+        graph.addEvent(t: Double(t) / 1000, label: "場面：\(v)", isMark: false)
         link.send(LiveEvent(tMs: t, kind: "scene", value: v))
     }
 
@@ -360,6 +357,7 @@ final class AnalysisModel: ObservableObject {
         }
         r.source = "viewer"; r.by = name; r.clockCorrected = clockCorrected
         logger.write(r)
+        graph.addEvent(t: Double(e.tMs) / 1000, label: e.kind == "mark" ? "家族の印：\(e.value)" : "場面：\(e.value)", isMark: e.kind == "mark")
         var out = e
         out.by = name
         link.send(out)
@@ -377,6 +375,7 @@ final class AnalysisModel: ObservableObject {
         guard running else { return }
         let now = Date()
         logger.write(EventRecord(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: .text(m.rawValue)))
+        graph.addEvent(t: now.timeIntervalSince1970, label: "家族の印：\(m.rawValue)", isMark: true)
         link.send(LiveEvent(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: m.rawValue))
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
@@ -398,6 +397,7 @@ final class AnalysisModel: ObservableObject {
         engine.finished = []
         liveZ = [:]; liveDiffs = []
         link.baseline = nil   // 見る側の「いつもの範囲」も消す（記録し終えたら、また送る）
+        meterZ = [:]; diffMetrics = [:]; baselineStats = nil
     }
 
     private func finishBaseline(now: CFTimeInterval) {
@@ -417,6 +417,7 @@ final class AnalysisModel: ObservableObject {
                                     minN: Self.minSamples, targetS: baselineTarget, blinkMasked: true, metrics: out))
         insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
         engine.setBaseline(Self.engineBaseline(out))
+        baselineStats = Self.engineBaseline(out)
         baselineSec = nil; baselineWait = nil
         baselineReady = true
         link.baseline = LiveBaseline(startedMs: baselineStartMs, tMs: Self.nowMs(), metrics: out)   // 見る側へ1回
@@ -493,7 +494,6 @@ final class AnalysisModel: ObservableObject {
         engine.add(DiffInput(t: epochT, face: r.face, yaw: r.pose?.yaw, faceValues: Self.faceValues(r), blink: blink,
                              voice: engineVoice))
 
-        let t = captureT - startHost
         guard frames % 3 == 0 else { return }   // 画面の更新は 1/3 に間引く（記録は全コマ）
 
         let now = CACurrentMediaTime()
@@ -567,22 +567,12 @@ final class AnalysisModel: ObservableObject {
         sendLive(r, now: now, readable: readable, values: faceValues, audio: a)
         adjustVideo(now: now)
 
-        // グラフ
-        var new: [ChartPoint] = []
-        if r.face {
-            new.append(ChartPoint(t: t, series: "口角を上げる", value: faceValues[.mouthSmile]!))
-            new.append(ChartPoint(t: t, series: "眉を寄せる", value: faceValues[.browDown]!))
-            new.append(ChartPoint(t: t, series: "目を細める", value: faceValues[.eyeSquint]!))
-            new.append(ChartPoint(t: t, series: "口を開ける", value: faceValues[.jawOpen]!))
+        // グラフ：1秒に10回まで（解析のコマ/秒を落とさないため）。z は判定に使ったもの（約0.2秒前のコマ）
+        if now - lastGraphHost >= 0.1, engine.processedT.isFinite {
+            lastGraphHost = now
+            graph.append(t: engine.processedT, z: running && baselineReady ? engine.z : [:], values: engine.value,
+                         baseline: running && baselineReady ? baselineStats : nil)
         }
-        if let db = a.rmsDb {
-            new.append(ChartPoint(t: t, series: "音量", value: min(1, max(0, Double(db + 60) / 60))))
-        }
-        if let f0 = a.f0Hz {
-            new.append(ChartPoint(t: t, series: "声の高さ", value: min(1, max(0, log(Double(f0) / 70) / log(1000.0 / 70)))))
-        }
-        points.append(contentsOf: new)
-        points.removeAll { $0.t < t - Self.chartWindow }
     }
 
     /// 見る側へ（1秒に10回まで）。映像・音声・顔の点は送らない
@@ -649,6 +639,9 @@ final class AnalysisModel: ObservableObject {
         let messages = shown.map { "\($0.message)（\(Int(max(0, latestT - $0.startT)))秒）" }
         let keys = shown.map(\.key)
         if differences != messages { differences = messages }
+        if meterZ != engine.z { meterZ = engine.z }
+        let dm = Dictionary(uniqueKeysWithValues: shown.map { ($0.metric, $0.above) })
+        if diffMetrics != dm { diffMetrics = dm }
         liveZ = Dictionary(uniqueKeysWithValues: engine.z.map { ($0.key.rawValue, ($0.value * 100).rounded() / 100) })
         liveDiffs = shown.map { LiveDiff(metric: $0.metric.rawValue, above: $0.above, seconds: Int(max(0, latestT - $0.startT))) }
 

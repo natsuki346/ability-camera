@@ -2,14 +2,13 @@ import SwiftUI
 
 /// サイドバーの項目
 enum SidebarPage: String, Hashable, Identifiable {
-    case now, history, numbers, settings
+    case now, history, settings
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .now: "いま"
         case .history: "これまでの記録"
-        case .numbers: "詳しい数字"
         case .settings: "設定"
         }
     }
@@ -18,7 +17,6 @@ enum SidebarPage: String, Hashable, Identifiable {
         switch self {
         case .now: "dot.radiowaves.left.and.right"
         case .history: "clock.arrow.circlepath"
-        case .numbers: "chart.xyaxis.line"
         case .settings: "gearshape"
         }
     }
@@ -129,11 +127,10 @@ struct CameraShell: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        SidebarShell(pages: [.now, .history, .numbers, .settings], page: $page) { p, menu in
+        SidebarShell(pages: [.now, .history, .settings], page: $page) { p, menu in
             switch p {
             case .now: ContentView(model: model, openMenu: menu)
             case .history: CameraHistoryView(sessions: model.sessions, openMenu: menu)
-            case .numbers: PageFrame(title: p.title, openMenu: menu) { DetailNumbersView(model: model) }
             case .settings: SettingsView(link: model.link, inSidebar: true, openMenu: menu)
             }
         }
@@ -162,7 +159,7 @@ struct ViewerShell: View {
             switch p {
             case .now: ViewerView(link: link, openMenu: menu)
             case .history: OpenedRecordsView(opened: $opened, openMenu: menu)
-            case .settings, .numbers: SettingsView(inSidebar: true, openMenu: menu)
+            case .settings: SettingsView(inSidebar: true, openMenu: menu)
             }
         }
         .onChange(of: scenePhase, initial: true) { _, phase in

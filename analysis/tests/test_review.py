@@ -575,3 +575,35 @@ class CompareSavedTest(unittest.TestCase):
     def test_missing_saved(self):
         rec = review.load(FIXTURE)
         self.assertIn("missing", review.compare_saved(rec, self.c))
+
+
+class SavedOffTest(unittest.TestCase):
+    """v1.2.1：「保存した普段ですぐ始める」がオフの記録。保存した普段は compared: false で書かれ、今日の普段で判定する"""
+
+    def test_off_record(self):
+        import json
+        out = []
+        for line in FIXTURE.read_text(encoding="utf-8").splitlines():
+            o = json.loads(line)
+            if o.get("type") == "baseline":
+                o["source"], o["compared"], o["blink_masked"] = "today", True, True
+                if o["t_ms"] / 1000 - T0 < 20:
+                    sv = json.loads(json.dumps(o))
+                    sv.update({"source": "saved", "compared": False, "saved_ms": int((T0 - 86400) * 1000),
+                               "t_ms": int((T0 + 0.5) * 1000)})
+                    sv.pop("started_ms", None)
+                    sv["metrics"]["brow_down"]["mean"] = 0.20
+                    out.append(json.dumps(sv, ensure_ascii=False))
+            out.append(json.dumps(o, ensure_ascii=False))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "off.jsonl"
+            path.write_text("\n".join(out) + "\n", encoding="utf-8")
+            rec = review.load(path)
+            c = review.load_criteria(review.HERE / "criteria.json", [])
+            self.assertEqual([b.get("source") for b in rec.baselines], ["today", "today"])   # 判定は今日の普段だけ
+            base = review.analyze(review.load(FIXTURE), c)
+            self.assertEqual(len(review.analyze(rec, c).segments), len(base.segments))      # 保存した普段の行があっても区間は変わらない
+            cs = review.compare_saved(rec, c)
+            self.assertNotIn("missing", cs)
+            self.assertIn("saved", cs["runs"])
+            self.assertAlmostEqual(cs["shift"]["brow_down"]["shift"], (0.20 - 0.05) / 0.03, places=3)

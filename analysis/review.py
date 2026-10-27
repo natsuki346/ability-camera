@@ -963,7 +963,7 @@ def compare_saved(rec: Recording, c: dict) -> dict:
     rows = {k: sorted([b for b in rec.all_baselines if baseline_kind(b) == k], key=lambda b: b["t_ms"]) for k in ("saved", "today")}
     out: dict = {"saved_rows": rows["saved"], "today_rows": rows["today"], "shift": {}, "runs": {}}
     if not rows["saved"] or not rows["today"]:
-        out["missing"] = ("保存した普段の行がありません（保存した普段ですぐ始める、がオフの記録）" if not rows["saved"]
+        out["missing"] = ("保存した普段の行がありません（人を選んでいない・その人の保存した普段が無い・カメラが違う、または v1.2.1 より前で設定がオフの記録）" if not rows["saved"]
                           else "今日の普段の行がありません（今日の普段を記録し終える前に閉じた記録）")
     sv, td = (rows["saved"][0] if rows["saved"] else None), (rows["today"][0] if rows["today"] else None)
     for m in METRICS:

@@ -40,6 +40,7 @@ final class AnalysisModel: ObservableObject {
     @Published var savedFromMs: Int64?        // 保存した普段で比べているとき、その普段を保存した日時
     @Published var canOverwriteSaved = false  // 「今日の普段で上書き」を出す
     @Published var maxFaces = 2               // 一度に探す顔の数（解析コマ/秒が落ちたら1）
+    @Published var analyzedRatio: Double?     // 直近10秒で、カメラから解析に渡したコマのうち解析できた割合
     @Published var baselineTarget = AnalysisModel.selectedBaselineSeconds   // 今の普段の長さ（数えた時間の目標）
     @Published var baselineWait: String?      // 普段を数えていない理由（数えている間は nil）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
@@ -188,7 +189,7 @@ final class AnalysisModel: ObservableObject {
         todayBaseline = nil
         face.setPreferred(nil)
         resetBaseline()   // 普段（設定の長さ）も自動で始める
-        applySavedIfWanted()   // 設定でオンなら、保存した普段ですぐ比べ始める（今日の普段もうしろで記録する）
+        applySaved()   // 保存した普段の行を書く（設定でオンなら、その普段ですぐ比べ始める。今日の普段もうしろで記録する）
         running = true
         sessionStartedAt = Date()
         status = "記録しています: \(logger.fileName ?? "-")" + note
@@ -308,7 +309,7 @@ final class AnalysisModel: ObservableObject {
         lastAudioAt = 0; lastAudioAtEngine = 0; recentFace = []
         lastBlinkT = -.infinity; squintPending = []
         faceReadable = true
-        faceCount = nil; faceCountPending = nil; facesCheck = nil
+        faceCount = nil; faceCountPending = nil; facesCheck = nil; analyzedRatio = nil
         head.reset()   // カメラを止めていた間の向きは分からないので、今から数え直す（最初に決まった向きは記録しない）
     }
 
@@ -423,18 +424,29 @@ final class AnalysisModel: ObservableObject {
         boxStats = (Welford(), Welford(), Welford())
     }
 
-    /// 設定「保存した普段ですぐ始める」がオンで、選んだ人の保存した普段があり、カメラが同じとき：その普段で比べ始める。
-    /// 記録には source: "saved" の baseline 行を書く
-    private func applySavedIfWanted() {
-        guard UserDefaults.standard.bool(forKey: "useSavedBaseline"), let p = PersonStore.shared.selected, let sv = p.saved,
-              sv.camera == (lensInUse ?? camera.lens).rawValue else { return }
+    /// 選んだ人の保存した普段があれば、セッションの始めに source: "saved" の baseline 行を書く（v1.2.1〜、設定がオフでも）。
+    /// 設定「保存した普段ですぐ始める」がオンなら、その普段で比べ始める（compared: true）。オフなら記録するだけ（compared: false）。
+    /// カメラが保存した普段と違うときは書かず、理由を event（kind: "saved_baseline_skipped"）に残す
+    private func applySaved() {
+        guard let p = PersonStore.shared.selected, let sv = p.saved else { return }
+        let lens = (lensInUse ?? camera.lens).rawValue
         let now = Self.nowMs()
+        guard sv.camera == lens else {
+            var e = EventRecord(tMs: now, kind: "saved_baseline_skipped",
+                                value: .text("カメラが保存した普段と違うため、保存した普段の行を書きませんでした"))
+            e.camera = lens
+            e.savedCamera = sv.camera
+            logger.write(e)
+            return
+        }
+        let use = UserDefaults.standard.bool(forKey: "useSavedBaseline")
         var row = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
                                  yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                  minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: sv.metrics)
-        row.source = BaselineSource.saved.rawValue; row.compared = true
+        row.source = BaselineSource.saved.rawValue; row.compared = use
         row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox
         logger.write(row)
+        guard use else { return }   // オフ：比べるのは今まで通り今日の普段だけ
         let b = Self.engineBaseline(sv.metrics)
         engine.setBaseline(b)
         baselineStats = b
@@ -726,16 +738,18 @@ final class AnalysisModel: ObservableObject {
         logger.write(e)
     }
 
-    /// 顔を2つまで探していて、解析できたコマがカメラから来たコマの9割を下回ったら（10秒ごとに見る）、1つに戻して記録に書く。
-    /// 映像を送っている間は、そちらで落ちることがあるので見ない
+    /// 10秒ごとに、カメラから解析に渡したコマのうち解析できた割合を数える（顔を1つ探しているときも。「数字」のページに出す）。
+    /// 顔を2つまで探していて9割を下回ったら、1つに戻して記録に書く。映像を送っている間は、そちらで落ちることがあるので戻さない
     private func checkFaceLimit(now: CFTimeInterval) {
-        guard maxFaces > 1, cameraActive, !videoSending else { facesCheck = nil; return }
+        guard cameraActive else { facesCheck = nil; return }
         let submitted = face.submittedCount()
         guard let c = facesCheck else { facesCheck = (now, submitted, analyzedFrames); return }
         guard now - c.host >= 10 else { return }
         let sent = submitted - c.submitted, done = analyzedFrames - c.analyzed
         facesCheck = (now, submitted, analyzedFrames)
-        guard sent > 30, Double(done) < Double(sent) * 0.9 else { return }
+        guard sent > 30 else { return }
+        analyzedRatio = min(1, Double(done) / Double(sent))
+        guard maxFaces > 1, !videoSending, Double(done) < Double(sent) * 0.9 else { return }
         do { try face.setNumFaces(1) } catch { return }
         maxFaces = 1
         let msg = String(format: "解析コマ/秒が落ちたため、探す顔の数を1にしました（カメラ %.1f → 解析 %.1f コマ/秒）",

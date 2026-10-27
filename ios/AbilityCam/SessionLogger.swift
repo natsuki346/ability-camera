@@ -53,10 +53,11 @@ struct EventRecord: Encodable {
     var count: Int?             // faces：映っている顔の数（0.5秒続いたもの）。faces_limit：探す顔の数
     var baseline: String?       // change：どちらの普段で比べたか（today / saved、v1.2〜）
     var personId: String?       // person：選んだ人の id（名前は書かない）
+    var savedCamera: String?    // saved_baseline_skipped：保存した普段のカメラ
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
-        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id"
+        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera"
     }
 }
 

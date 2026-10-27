@@ -280,6 +280,7 @@ struct NumbersPage: View {
             stat("声の高さ Hz", model.f0Hz.map { String(format: "%.0f", $0) })
             stat("カメラ", model.lensInUse?.label)
             stat("探す顔の数", "\(model.maxFaces)")
+            stat("解析できた割合（10秒）", model.analyzedRatio.map { "\(Int(($0 * 100).rounded()))%" })
         }
         .padding(10)
         .frame(maxHeight: .infinity, alignment: .top)

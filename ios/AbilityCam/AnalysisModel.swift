@@ -46,6 +46,7 @@ final class AnalysisModel: ObservableObject {
     @Published var mesh: FaceMesh?           // 顔が読めないときは nil（古い網目を残さない）
     @Published var faceShape: [String: Double]?   // 顔の絵用に約0.2秒でならした値。読めないときは nil
     @Published var meshLagMs: Double?        // 撮影→網目を出すまで（解析の遅れ＋画面の間引き）
+    @Published var lensInUse: CameraLens?    // 今使っているカメラ（設定で超広角を選んでも、無い端末では広角）
 
     let camera = CameraManager()
     private let face = FaceAnalyzer()
@@ -86,6 +87,7 @@ final class AnalysisModel: ObservableObject {
     private var liveZ: [String: Double] = [:]                 // 見る側へ：指標ごとの今の z
     private var liveDiffs: [LiveDiff] = []                    // 見る側へ：違いの一覧（指標・向き・秒数）
     private var diffCount = 0                                 // このセッションで違いが出た回数（segments と同じ数え方）
+    private var head = HeadTurnTracker()                      // 顔を向ける・そむける（0.5秒続いたら記録）
 
     static let chartWindow = 20.0
     static let baselineSeconds = 60.0     // 数えた時間（時計の時間ではない）
@@ -147,7 +149,7 @@ final class AnalysisModel: ObservableObject {
     private func startSession() async {
         guard await startCamera() else { return }
         do {
-            try logger.start()
+            try logger.start(camera: camera.lens)
         } catch {
             status = "記録を始められませんでした: \(error.localizedDescription)"
             return
@@ -224,7 +226,7 @@ final class AnalysisModel: ObservableObject {
         }
         do {
             try face.load()
-            try camera.configureIfNeeded()
+            lensInUse = try camera.configureIfNeeded(lens: CameraLens.selected)
         } catch {
             status = "カメラを使えませんでした: \(error.localizedDescription)"
             return false
@@ -244,7 +246,7 @@ final class AnalysisModel: ObservableObject {
                                      yawDeg: r.pose.map { round1($0.yaw) }, pitchDeg: r.pose.map { round1($0.pitch) },
                                      rollDeg: r.pose.map { round1($0.roll) }),
                          notBefore: tMs)
-            Task { @MainActor in self?.update(r, audio: a) }
+            Task { @MainActor in self?.update(r, audio: a, tMs: tMs) }
         }
         let video = self.video, link = self.link
         video.onJPEG = { [weak link] d in link?.sendVideo(d) }
@@ -279,6 +281,27 @@ final class AnalysisModel: ObservableObject {
         startHost = CACurrentMediaTime()
         smooth = [:]; lastAudioAt = 0; recentFace = []
         faceReadable = true
+        head.reset()   // カメラを止めていた間の向きは分からないので、今から数え直す（最初に決まった向きは記録しない）
+    }
+
+    /// 設定で「カメラ」を変えた。記録中なら、切り替えたことを記録し、普段を取り直す
+    /// （広角と超広角では顔の大きさ・歪みが違い、表情の数値が変わるので、前の普段とは比べない）
+    func applyLens() {
+        guard cameraActive else { return }   // 止まっているときは、次にカメラを始めるときに使う
+        do {
+            let before = lensInUse
+            let used = try camera.switchLens(CameraLens.selected)
+            lensInUse = used
+            guard used != before, running else { return }
+            var e = EventRecord(tMs: Self.nowMs(), kind: "camera", value: .text(used.label))
+            e.camera = used.rawValue
+            logger.write(e)
+            head.reset()
+            restartBaseline()
+            showMessage("カメラを\(used.label)にしました。普段を取り直しています")
+        } catch {
+            status = "カメラを切り替えられませんでした: \(error.localizedDescription)"
+        }
     }
 
     /// 普段を取り直す
@@ -376,8 +399,15 @@ final class AnalysisModel: ObservableObject {
         link.baseline = LiveBaseline(startedMs: baselineStartMs, tMs: Self.nowMs(), metrics: out)   // 見る側へ1回
     }
 
-    private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot) {
+    private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64) {
         guard cameraActive else { return }
+        // 顔を向ける・そむける：0.5秒以上続いたときだけ記録する（全コマで見る）
+        if let c = head.add(tMs: tMs, face: r.face, yaw: r.pose?.yaw) {
+            var e = EventRecord(tMs: c.tMs, kind: "head_turn", value: .text(c.value))
+            e.head = c.to.rawValue; e.from = c.from.rawValue
+            e.yawDeg = c.yawDeg.map { ($0 * 10).rounded() / 10 }
+            logger.write(e)
+        }
         frames += 1
         if r.face { faceFrames += 1 }
         if r.procMs >= 0 { procSum += r.procMs; procN += 1 }
@@ -543,7 +573,8 @@ final class AnalysisModel: ObservableObject {
             recording: running, sessionStartedMs: sessionStartedAt.map { Int64($0.timeIntervalSince1970 * 1000) },
             scene: scene?.rawValue,
             faceRatio: faceRatio, fps: fps,
-            z: baselineReady ? liveZ : nil, diffs: baselineReady ? liveDiffs : nil, diffCount: running ? diffCount : nil))
+            z: baselineReady ? liveZ : nil, diffs: baselineReady ? liveDiffs : nil, diffCount: running ? diffCount : nil,
+            head: head.state?.rawValue))
     }
 
     /// z =（ならした今の値 − 普段の平均）÷ max(普段の標準偏差, 下限)

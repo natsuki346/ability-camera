@@ -441,10 +441,11 @@ struct ViewerView: View {
                     Spacer()
                     if !live { Text(lastReceivedText).font(.system(size: 14 * k)).foregroundStyle(.secondary) }
                 }
-                TimelineChart(bands: link.bands, scenes: link.scenes,
+                TimelineChart(bands: link.bands, scenes: link.scenes, heads: link.heads,
                               marks: link.events.filter { $0.kind == "mark" },
                               start: end - span, end: end, k: k)
                 timelineLegend(k)
+                headLegend(k)
             }
         }
     }
@@ -468,6 +469,19 @@ struct ViewerView: View {
             HStack(spacing: 4) {
                 Rectangle().fill(Self.navy).frame(width: 2, height: 12 * k)
                 Text("家族の印")
+            }
+        }
+        .font(.system(size: 12 * k)).foregroundStyle(.secondary)
+        .lineLimit(1).minimumScaleFactor(0.6)
+    }
+
+    /// 顔の向きの段の色（向きの事実だけ。良い・悪いに見える色は使わない）
+    private func headLegend(_ k: CGFloat) -> some View {
+        let sw = { (c: Color) in RoundedRectangle(cornerRadius: 2).fill(c).frame(width: 20 * k, height: 10 * k) }
+        return HStack(spacing: 14 * k) {
+            Text("顔の向き：")
+            ForEach(HeadState.allCases, id: \.self) { h in
+                HStack(spacing: 4) { sw(h.color); Text(h.legend) }
             }
         }
         .font(.system(size: 12 * k)).foregroundStyle(.secondary)
@@ -567,10 +581,34 @@ struct MeterTrack: View {
     }
 }
 
-/// 時間の流れ：上から 家族の印・場面・指標6段。範囲の外に出ていた時間を塗る。家族の印は縦線
+extension HeadState {
+    /// 時間の流れの「顔の向き」の段の色。赤と赤・黄・緑の組み合わせは使わない
+    var color: Color {
+        switch self {
+        case .front: ViewerView.usualBand                                            // 薄い青灰
+        case .right: ViewerView.slate                                                // 青灰
+        case .left: Color(red: 0xB8 / 255, green: 0xA0 / 255, blue: 0x7A / 255)      // 砂色
+        case .hidden: Color(red: 0x7D / 255, green: 0x84 / 255, blue: 0x8C / 255)    // 灰
+        case .oblique: Color(red: 0xC9 / 255, green: 0xC4 / 255, blue: 0xD9 / 255)   // 薄い藤色
+        }
+    }
+
+    var legend: String {
+        switch self {
+        case .front: "正面"
+        case .right: "右（35°超）"
+        case .left: "左（35°超）"
+        case .hidden: "見えない"
+        case .oblique: "斜め（見えるようになったあと 15〜35°）"
+        }
+    }
+}
+
+/// 時間の流れ：上から 家族の印・場面・顔の向き・指標6段。範囲の外に出ていた時間を塗る。家族の印は縦線
 struct TimelineChart: View {
     let bands: [Metric: [ViewerLink.Run<ViewerLink.Band>]]
     let scenes: [ViewerLink.Run<String>]
+    let heads: [ViewerLink.Run<HeadState>]
     let marks: [LiveEvent]
     let start: Double
     let end: Double
@@ -580,13 +618,13 @@ struct TimelineChart: View {
 
     var body: some View {
         let rowH = 22 * k, gap = 4 * k, markH = 20 * k, axisH = 18 * k
-        let labels = ["家族の印", "場面"] + Metric.allCases.map(\.label)
-        let heights = [markH, rowH] + Array(repeating: rowH, count: Metric.allCases.count)
+        let labels = ["家族の印", "場面", "顔の向き"] + Metric.allCases.map(\.label)
+        let heights = [markH, rowH, rowH] + Array(repeating: rowH, count: Metric.allCases.count)
         HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .trailing, spacing: gap) {
                 ForEach(Array(labels.enumerated()), id: \.offset) { i, l in
                     HStack(spacing: 4) {
-                        if i >= 2 { Circle().fill(Metric.allCases[i - 2].color).frame(width: 8 * k, height: 8 * k) }
+                        if i >= 3 { Circle().fill(Metric.allCases[i - 3].color).frame(width: 8 * k, height: 8 * k) }
                         Text(l).font(.system(size: 13 * k)).lineLimit(1)
                     }
                     .frame(height: heights[i])
@@ -618,7 +656,8 @@ struct TimelineChart: View {
         let w = size.width, span = max(end - start, 1)
         let x = { (t: Double) in CGFloat((t - start) / span) * w }
         let sceneY = markH + gap
-        let rowY = { (i: Int) in sceneY + rowH + gap + CGFloat(i) * (rowH + gap) }
+        let headY = sceneY + rowH + gap
+        let rowY = { (i: Int) in headY + rowH + gap + CGFloat(i) * (rowH + gap) }
         let bottom = rowY(Metric.allCases.count) - gap
 
         func rect(_ r: ViewerLink.Run<some Equatable>, y: CGFloat) -> CGRect? {
@@ -636,6 +675,21 @@ struct TimelineChart: View {
                 var c = ctx
                 c.clip(to: Path(rr))
                 c.draw(Text(r.value).font(.system(size: 12 * k)).foregroundColor(ViewerView.navy),
+                       at: CGPoint(x: rr.minX + 4, y: rr.midY), anchor: .leading)
+            }
+        }
+
+        // 顔の向きの段：撮る側で0.5秒続いて決まった向き。届いていない・まだ決まっていない間は斜線
+        ctx.fill(Path(CGRect(x: 0, y: headY, width: w, height: rowH)), with: .color(.secondary.opacity(0.08)))
+        hatch(ctx, CGRect(x: 0, y: headY, width: w, height: rowH))
+        for r in heads {
+            guard let rr = rect(r, y: headY) else { continue }
+            ctx.fill(Path(rr), with: .color(r.value.color))
+            if rr.width > 36 * k, r.value != .oblique {
+                var c = ctx
+                c.clip(to: Path(rr))
+                c.draw(Text(r.value.label).font(.system(size: 12 * k))
+                        .foregroundColor(r.value == .front ? ViewerView.navy : .white),
                        at: CGPoint(x: rr.minX + 4, y: rr.midY), anchor: .leading)
             }
         }

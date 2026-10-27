@@ -6,6 +6,7 @@ struct ContentView: View {
     @StateObject private var model = AnalysisModel()
     @State private var cameraLarge = false
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
+    @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
 
@@ -41,6 +42,7 @@ struct ContentView: View {
                     stat("撮影→網目 ms", model.meshLagMs.map { String(format: "%.0f", $0) })
                     stat("音量 dB", model.rmsDb.map { String(format: "%.0f", $0) })
                     stat("声の高さ Hz", model.f0Hz.map { String(format: "%.0f", $0) })
+                    stat("カメラ", model.lensInUse?.label)
                 }
 
                 Chart(model.points) { p in
@@ -62,6 +64,7 @@ struct ContentView: View {
             .padding()
         }
         .sheet(isPresented: $showSettings) { SettingsView(link: model.link) }
+        .onChange(of: cameraLens) { model.applyLens() }   // 設定で広角／超広角を変えた
         .onDisappear { model.shutdown() }   // 役割を「見る側」に変えた
         .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {

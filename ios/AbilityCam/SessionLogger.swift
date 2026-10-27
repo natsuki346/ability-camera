@@ -37,16 +37,20 @@ struct EventRecord: Encodable {
 
     let type = "event"
     let tMs: Int64
-    let kind: String            // scene / mark / change / baseline_restart
+    let kind: String            // scene / mark / change / baseline_restart / head_turn / camera
     let value: Value?
     var faceReadable: Bool?     // change のときだけ
     var source: String?         // 見る側で押したときは "viewer"（撮る側で押したときは書かない）
     var by: String?             // 見る側の端末の名前
     var clockCorrected: Bool?   // 見る側：押した瞬間の時刻を、2台の時計のずれを直して記録したか
+    var head: String?           // head_turn：新しい向き（front / right / left / hidden / oblique）
+    var from: String?           // head_turn：前の向き
+    var yawDeg: Double?         // head_turn：なり始めたときの yaw（見えない：見えなくなる直前の yaw）
+    var camera: String?         // camera：切り替えたカメラ（wide / ultra_wide）
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
-        case clockCorrected = "clock_corrected"
+        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera
     }
 }
 
@@ -83,7 +87,7 @@ final class SessionLogger {
     private var startedMs = Int64.max   // queue の上でだけ触る
     private var stats = SessionStats()  // queue の上でだけ触る。書いた行から要約を数える
 
-    func start() throws {
+    func start(camera: CameraLens) throws {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd-HHmmss"
         let name = "ability-cam-\(f.string(from: Date())).jsonl"
@@ -99,7 +103,10 @@ final class SessionLogger {
             "started_at_ms": Int64(Date().timeIntervalSince1970 * 1000),
             "device": UIDevice.current.model,
             "ios": UIDevice.current.systemVersion,
-            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果"
+            // 使ったカメラ。超広角は画角の端で顔が歪み、表情の数値が変わることがある
+            "camera": camera.rawValue,
+            "camera_label": camera.label,
+            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角。超広角は画角の端で顔が歪み表情の数値が変わることがある)"
         ]
         let data = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
         let ms = header["started_at_ms"] as! Int64

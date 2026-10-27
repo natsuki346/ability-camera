@@ -26,6 +26,8 @@ struct LiveState: Codable {
     var z: [String: Double]?          // 指標ごとの今の z（約1秒でならした値から）。比べられない指標は入らない
     var diffs: [LiveDiff]?            // いつもとの違い（指標・向き・続いている秒数）。differences と同じもの
     var diffCount: Int?               // このセッションで違いが出た回数（sessions.jsonl の segments と同じ数え方）
+    // v0.8〜
+    var head: String?                 // 顔の向き（HeadState：front / right / left / hidden / oblique）。0.5秒続いて決まったもの。まだ決まっていなければ nil
 }
 
 /// いつもとの違い1つ
@@ -384,6 +386,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     @Published private(set) var events: [LiveEvent] = []   // 直近15分の家族の印・場面（画面に出すだけ）
     @Published private(set) var bands: [Metric: [Run<Band>]] = [:]   // 直近15分の時間の流れ（メモリだけ）
     @Published private(set) var scenes: [Run<String>] = []
+    @Published private(set) var heads: [Run<HeadState>] = []   // 顔の向きの段（撮る側で0.5秒続いて決まった向き）
     @Published private(set) var baseline: LiveBaseline?    // 撮る側の普段（いつもの範囲を描く）
     @Published private(set) var video: UIImage?
     @Published private(set) var videoAt: Date?
@@ -530,6 +533,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
             if let i = runs.firstIndex(where: { $0.end >= from }), i > 0 { bands[m]!.removeFirst(i) }
         }
         if let i = scenes.firstIndex(where: { $0.end >= from }), i > 0 { scenes.removeFirst(i) }
+        if let i = heads.firstIndex(where: { $0.end >= from }), i > 0 { heads.removeFirst(i) }
         events.removeAll { Double($0.tMs) / 1000 < from }
     }
 
@@ -556,6 +560,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         for m in Metric.allCases { Self.extend(&b[m, default: []], at: t, Self.band(m, in: s)) }
         bands = b
         if let name = s.scene { Self.extend(&scenes, at: t, name) }
+        if let h = s.head.flatMap(HeadState.init(rawValue:)) { Self.extend(&heads, at: t, h) }   // 古い撮る側・まだ決まっていないときは塗らない
     }
 
     // MARK: delegate
@@ -593,7 +598,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
                 let id = self.cameraIDs[peerID] ?? self.currentCameraID
                 if id != self.historyCameraID {
                     self.historyCameraID = id
-                    self.bands = [:]; self.scenes = []; self.events = []   // 普段は、撮る側がつながったときに必ず送ってくる
+                    self.bands = [:]; self.scenes = []; self.heads = []; self.events = []   // 普段は、撮る側がつながったときに必ず送ってくる
                 }
                 self.ping()
             case .notConnected:

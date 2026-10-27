@@ -14,6 +14,7 @@
   105–106 jaw_open を高く                   → 区間 1件（上）
   （50–52 の直後に z が2を超えて残るが、始まりが見えていないので短い動きには数えない）
 場面：15 食事 → 25 なし。印：20.8 不快（区間の中）、21.5 分からない（区間の終わりの直後）、75 快
+顔の向き（head_turn、アプリが書くのと同じもの）：50 右へ → 52 正面に戻った → 60 見えなくなった（直前は正面） → 62 正面に戻った
 """
 import json
 import math
@@ -77,11 +78,21 @@ def event(t, kind, value=None):
     return o
 
 
+def head(t, value, frm, to, yaw):
+    o = event(t, "head_turn", value)
+    o.update({"head": to, "from": frm, "yaw_deg": yaw})
+    return o
+
+
 def build():
-    lines = [{"schema": "ability-cam.ios.v0.2", "started_at_ms": T0_MS, "note": "テスト用の作り物"}]
+    lines = [{"schema": "ability-cam.ios.v0.2", "started_at_ms": T0_MS, "camera": "wide", "camera_label": "広角",
+              "note": "テスト用の作り物"}]
     extra = [(10.0, baseline_line(10.0)), (15.0, event(15.0, "scene", "食事")), (25.0, event(25.0, "scene", "なし")),
              (20.8, event(20.8, "mark", "不快")), (21.5, event(21.5, "mark", "分からない")), (75.0, event(75.0, "mark", "快")),
-             (90.0, event(90.0, "baseline_restart")), (100.0, baseline_line(100.0))]
+             (90.0, event(90.0, "baseline_restart")), (100.0, baseline_line(100.0)),
+             (50.0, head(50.0, "右へ", "front", "right", 50.0)), (52.0, head(52.0, "正面に戻った", "right", "front", 2.0)),
+             (60.0, head(60.0, "見えなくなった（直前は正面）", "front", "hidden", 2.0)),
+             (62.0, head(62.0, "正面に戻った", "hidden", "front", 2.0))]
     rows = [(i / FPS, frame(i / FPS)) for i in range(int(END * FPS))]
     rows += extra
     rows.sort(key=lambda r: r[0])

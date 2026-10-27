@@ -163,6 +163,77 @@ class FixtureTest(unittest.TestCase):
             self.assertIn("時計の時間で数えた（v0.3 までの記録）", doc)   # 2つ目の baseline は古い形のまま
 
 
+class HeadTurnTest(unittest.TestCase):
+    """顔を向ける・そむける：アプリの HeadTurnTracker と同じ決まり（0.5秒続いたら、15° と 35° のヒステリシス）"""
+
+    def run_yaw(self, pieces):
+        """pieces：(秒, yaw)。yaw が None なら顔が見えない"""
+        t, face, yaw = [], [], []
+        for dur, y in pieces:
+            for _ in range(int(round(dur * 30))):
+                t.append(len(t) / 30)
+                face.append(y is not None)
+                yaw.append(np.nan if y is None else y)
+        return review.head_states(np.array(t), np.array(face), np.array(yaw, float))
+
+    def test_sequence(self):
+        states, ch = self.run_yaw([(1, 0), (0.3, 40), (0.5, 0), (1, 40), (1, 25), (1, 10), (1, None),
+                                   (1, -20), (1, -40), (1, 0)])
+        self.assertEqual([c["value"] for c in ch],
+                         ["右へ", "正面に戻った", "見えなくなった（直前は正面）", "見えるようになった（左 20°）",
+                          "左へ", "正面に戻った"])
+        self.assertAlmostEqual(ch[0]["t"], 1.8, delta=0.05)    # 0.3秒だけの右は数えない。右は 1.8秒から
+        self.assertEqual(ch[0]["from"], "front")
+        self.assertAlmostEqual(ch[1]["t"], 3.8, delta=0.05)    # 25° の間は右を続け、10° になった時刻から正面
+        self.assertEqual(states[0], "front")                   # 0.5秒続いて決まったら、なり始めた時刻から数える
+        self.assertEqual(states[int(2.5 * 30)], "right")
+        self.assertEqual(states[int(3.5 * 30)], "right")   # 25° の間は右を続ける
+        self.assertEqual(states[int(5.5 * 30)], "hidden")
+        self.assertEqual(states[int(6.3 * 30)], "oblique")
+
+    def test_hidden_keeps_last_yaw(self):
+        _, ch = self.run_yaw([(1, 40), (1, None)])
+        self.assertEqual([c["value"] for c in ch], ["見えなくなった（直前は右 40°）"])
+        self.assertEqual(ch[0]["yaw"], 40)
+
+    def test_fixture_events_match(self):
+        """作り物の記録に書いた head_turn と、1コマごとの向きから数え直したものが同じ"""
+        rec = review.load(FIXTURE)
+        _, ch = review.head_states(rec.t, rec.face, rec.yaw)
+        written = review.head_events(rec)
+        self.assertEqual([c["value"] for c in ch], [e["value"] for e in written])
+        for c, e in zip(ch, written):
+            self.assertAlmostEqual(c["t"], e["t_ms"] / 1000, delta=0.05)
+            self.assertEqual((c["from"], c["to"]), (e["from"], e["head"]))
+
+    def test_report(self):
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        a = review.analyze(review.load(FIXTURE), c)
+        q = review.quality(a, calm=False)
+        self.assertAlmostEqual(q["head"]["right"][0], 2.0, delta=0.1)
+        self.assertAlmostEqual(q["head"]["hidden"][0], 2.0, delta=0.1)
+        with tempfile.TemporaryDirectory() as d:
+            review.main([str(FIXTURE), "--out-dir", d])
+            doc = (Path(d) / "fixture_basic.html").read_text(encoding="utf-8")
+            self.assertIn("顔を向けた・そむけた記録（head_turn、4件）", doc)
+            self.assertIn("見えなくなった（直前は正面）", doc)
+            self.assertIn("カメラ：広角", doc)
+            self.assertNotIn("超広角で記録しています", doc)
+
+    def test_ultra_wide_note(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            lines = FIXTURE.read_text(encoding="utf-8").splitlines()
+            h = json.loads(lines[0])
+            h.update({"camera": "ultra_wide", "camera_label": "超広角"})
+            p = Path(d) / "uw.jsonl"
+            p.write_text("\n".join([json.dumps(h, ensure_ascii=False)] + lines[1:]) + "\n", encoding="utf-8")
+            review.main([str(p), "--out-dir", d])
+            doc = (Path(d) / "uw.html").read_text(encoding="utf-8")
+            self.assertIn("カメラ：超広角", doc)
+            self.assertIn("超広角で記録しています", doc)
+
+
 class CandidateTest(unittest.TestCase):
     """作った区間を与えて、通知候補の条件 A・B・C と場面の振り分けを見る（fixture の時刻を使う）"""
 

@@ -305,6 +305,111 @@ def analyze(rec: Recording, c: dict) -> Analysis:
     return a
 
 
+# ---------------------------------------------------------------- 顔の向き（head_turn）
+
+HEAD_SIDE_DEG, HEAD_FRONT_DEG, HEAD_HOLD_S = 35.0, 15.0, 0.5
+HEAD_LABEL = {"front": "正面", "right": "右（35°超）", "left": "左（35°超）", "hidden": "見えない",
+              "oblique": "斜め（見えるようになったあと 15〜35°）", "unknown": "まだ決まっていない"}
+HEAD_ORDER = ["front", "right", "left", "hidden", "oblique", "unknown"]
+# 色は見る側の「時間の流れ」と同じ（docs/wording-guide.md：赤と赤・黄・緑の組み合わせは使わない）
+HEAD_COLOR = {"front": "#DCE3EA", "right": "#5B7FA6", "left": "#B8A07A", "hidden": "#7D848C",
+              "oblique": "#C9C4D9", "unknown": "#ffffff"}
+
+
+def _head_side(yaw: float) -> str:
+    if abs(yaw) < HEAD_FRONT_DEG:
+        return "正面"
+    return f"{'右' if yaw > 0 else '左'} {int(round(abs(yaw)))}°"
+
+
+def head_text(to: str, yaw: float | None) -> str:
+    """アプリ（HeadTurnTracker.text）と同じ value"""
+    if to == "right":
+        return "右へ"
+    if to == "left":
+        return "左へ"
+    if to == "front":
+        return "正面に戻った"
+    if to == "hidden":
+        return "見えなくなった" if yaw is None else f"見えなくなった（直前は{_head_side(yaw)}）"
+    return f"見えるようになった（{'斜め' if yaw is None else _head_side(yaw)}）"
+
+
+def head_states(t: np.ndarray, face: np.ndarray, yaw: np.ndarray, gap_s: float = 1.0):
+    """アプリの HeadTurnTracker と同じ決まりで、各コマの顔の向きと、向きが変わったところを求める。
+    正面は |yaw|<15°、横は |yaw|>35°、その間は今の向きを続ける（見えなかったあとなら「斜め」）。0.5秒続いたら決まり、
+    その向きになり始めた時刻に遡って塗る。コマの間が gap_s 秒より空いたら（カメラを止めていた）、決まっていない状態から数え直す。
+    返り値：(各コマの向き, 変わったところ [{t, from, to, yaw, value}]（最初に決まったときは含めない）)"""
+    starts: list[tuple[float, str]] = []
+    changes: list[dict] = []
+    state = None
+    pending = None          # (向き, 始まりの時刻, yaw)
+    last_yaw = None
+    prev_t = None
+    for i in range(len(t)):
+        ti = float(t[i])
+        if prev_t is not None and ti - prev_t > gap_s:
+            state, pending, last_yaw = None, None, None
+            starts.append((prev_t + 1e-6, "unknown"))
+        prev_t = ti
+        f = bool(face[i])
+        y = None if yaw[i] != yaw[i] else float(yaw[i])
+        if f and y is None:
+            continue
+        if not f:
+            target = "hidden"
+        elif y > HEAD_SIDE_DEG:
+            target = "right"
+        elif y < -HEAD_SIDE_DEG:
+            target = "left"
+        elif abs(y) < HEAD_FRONT_DEG:
+            target = "front"
+        else:
+            target = "oblique" if state in (None, "hidden") else state
+        before = last_yaw
+        if f:
+            last_yaw = y
+        if target == state:
+            pending = None
+            continue
+        if pending is None or pending[0] != target:
+            pending = (target, ti, before if target == "hidden" else y)
+        if ti - pending[1] >= HEAD_HOLD_S:
+            if state is not None:
+                changes.append({"t": pending[1], "from": state, "to": target, "yaw": pending[2],
+                                "value": head_text(target, pending[2])})
+            starts.append((pending[1], target))
+            state, pending = target, None
+    out = np.full(len(t), "unknown", dtype=object)
+    if starts:
+        times = np.array([x[0] for x in starts])
+        pos = np.searchsorted(times, t, side="right") - 1
+        for i, k in enumerate(pos):
+            if k >= 0:
+                out[i] = starts[k][1]
+    return out, changes
+
+
+def head_events(rec: Recording) -> list[dict]:
+    """記録に書かれた head_turn（v0.8〜）"""
+    return [e for e in rec.events if e.get("kind") == "head_turn"]
+
+
+def camera_label(rec: Recording) -> str:
+    """記録のヘッダの camera（v0.8〜）。途中で切り替えたら camera の event"""
+    code = rec.header.get("camera")
+    names = {"wide": "広角", "ultra_wide": "超広角"}
+    first = names.get(code, code) if code else "広角（記録にカメラが書かれていない v0.8 より前の記録）"
+    later = [f"{jst(e['t_ms'] / 1000)} に{e.get('value') or names.get(e.get('camera'), '?')}へ"
+             for e in rec.events if e.get("kind") == "camera"]
+    return first + (f"（{'、'.join(later)}）" if later else "")
+
+
+def uses_ultra_wide(rec: Recording) -> bool:
+    return rec.header.get("camera") == "ultra_wide" or any(
+        e.get("kind") == "camera" and e.get("camera") == "ultra_wide" for e in rec.events)
+
+
 # ---------------------------------------------------------------- 区間の数字
 
 def jst(ts: float, ms=False) -> str:
@@ -478,6 +583,14 @@ def quality(a: Analysis, calm: bool) -> dict:
                     "lt15": float((ay < 15).mean()), "15to35": float(((ay >= 15) & (ay < 35)).mean()),
                     "ge35": float((ay >= 35).mean())}
 
+    # 顔の向き：アプリと同じ決まりで、1コマごとの向きから数え直した時間の割合
+    if rec.has_pose:
+        states, _ = head_states(t, rec.face, rec.yaw)
+        total = float(dt.sum())
+        q["head"] = {k: (float(dt[states == k].sum()), float(dt[states == k].sum()) / total if total > 0 else None)
+                     for k in HEAD_ORDER}
+        q["head_states"] = states
+
     # 何もしていない記録での区間の数（多すぎないかの目安）：普段がある時間の区間数
     minutes = q["judged_s"] / 60
     per = {}
@@ -603,6 +716,21 @@ def metric_track(a: Analysis, m: str, scene_color: dict) -> Track:
     return Track(LABEL[m], draw)
 
 
+def head_track(a: Analysis, states: np.ndarray) -> Track:
+    t = a.rec.t
+
+    def draw(ax):
+        for k in HEAD_ORDER:
+            if k == "unknown":
+                continue
+            for t0, t1 in spans(states == k, t):
+                ax.axvspan(to_num(t0), to_num(t1), color=HEAD_COLOR[k], lw=0)
+        ax.set_yticks([])
+        ax.set_title("顔の向き（正面・右・左・見えない）", loc="left", fontsize=10)
+
+    return Track("顔の向き", draw, height=0.7)
+
+
 def figure_tracks(a: Analysis, tracks: list[Track]) -> str:
     plt = setup_matplotlib()
     import matplotlib.dates as mdates
@@ -687,7 +815,10 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     rec, c, e = a.rec, a.criteria, html.escape
     parts = []
     parts.append(f"<h1>振り返りレポート</h1><p class=sub>{e(rec.path.name)}（{e(rec.header.get('schema', '?'))}）"
-                 f" / {jst(rec.t[0])} 〜 {jst(rec.t[-1])}（日本時間）</p>")
+                 f" / {jst(rec.t[0])} 〜 {jst(rec.t[-1])}（日本時間） / カメラ：{e(camera_label(rec))}</p>")
+    if uses_ultra_wide(rec):
+        parts.append("<p class=note>超広角で記録しています。画角の端では顔が歪み、表情の数値が変わることがあります"
+                     "（顔が画面の端にあった時間の区間は、特に参考程度に見てください）。</p>")
     parts.append("<p class=note>記録から、観測された変化（いつもの範囲から数値が外れた区間）を確認するための手がかりです。"
                  "本人の気持ちや状態は判断していません。文言と色は docs/wording-guide.md に従っています。</p>")
 
@@ -715,6 +846,25 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     yimg = figure_yaw(a)
     if yimg:
         parts.append(f"<img class=small src='{yimg}' alt='yaw の分布'>")
+
+    # 顔の向き
+    parts.append("<h2>顔の向き</h2>")
+    if "head" in q:
+        hrows = [[HEAD_LABEL[k], fmt_s(sec), pc(r)] for k, (sec, r) in q["head"].items() if sec > 0 or k != "unknown"]
+        parts.append("<p class=note>正面は |yaw| < 15°、右・左は 35° を超えたとき。15〜35° の間は前の向きを続けます。"
+                     "どれも 0.5秒以上続いたときだけ向きが変わったとし、変わり始めた時刻から数えます（アプリと同じ決まりで、1コマごとの向きから数え直したもの）。"
+                     "「斜め」は、見えなくなったあと 15〜35° で見えるようになった時間です。</p>"
+                     + table(["顔の向き", "時間", "割合"], hrows))
+    else:
+        parts.append("<p>記録に顔の向きがありません（v0.3 より前）。</p>")
+    hev = head_events(rec)
+    if hev:
+        parts.append(f"<h3>顔を向けた・そむけた記録（head_turn、{len(hev)}件）</h3>"
+                     + table(["時刻", "記録", "前の向き"],
+                             [[jst(x["t_ms"] / 1000, ms=True), x.get("value", ""),
+                               HEAD_LABEL.get(x.get("from"), x.get("from") or "")] for x in hev]))
+    else:
+        parts.append("<p>head_turn の記録はありません（v0.8 より前の記録、または向きが変わらなかった）。</p>")
 
     # 普段
     if rec.baselines:
@@ -780,7 +930,7 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     # グラフ
     scene_names = list(dict.fromkeys(n for _, _, n in scene_intervals(rec, rec.t[-1])))
     scene_color = {n: SCENE_COLORS[i % len(SCENE_COLORS)] for i, n in enumerate(scene_names)}
-    tracks = [metric_track(a, m, scene_color) for m in METRICS]
+    tracks = ([head_track(a, q["head_states"])] if "head_states" in q else []) + [metric_track(a, m, scene_color) for m in METRICS]
     # ここに手首の記録の Track を足せば、同じ時間軸に並ぶ（今は未実装）
     img = figure_tracks(a, tracks)
     legend = "".join(f"<span class=chip style='background:{col}'>{e(n)}</span>" for n, col in scene_color.items())

@@ -63,6 +63,7 @@ struct SettingsView: View {
     @AppStorage("role") private var role = ""
     @AppStorage("deviceName") private var deviceName = ""
     @AppStorage("sendVideo") private var sendVideo = false
+    @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
     @State private var allowed = AllowedViewers.all()
     @Environment(\.dismiss) private var dismiss
 
@@ -83,6 +84,17 @@ struct SettingsView: View {
                     Text("つないだ相手の画面に「〇〇が見ています」「〇〇に状態を送りますか？」のように出ます。次につなぐときから使われます")
                 }
                 if link != nil {
+                    Section {
+                        Picker("カメラ", selection: $cameraLens) {
+                            ForEach(CameraLens.allCases) { l in
+                                Text(l.available ? l.label : "\(l.label)（この端末にはありません）").tag(l.rawValue)
+                                    .disabled(!l.available)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    } header: { Text("カメラ") } footer: {
+                        Text("初めは広角。超広角は広く映るので顔が画面から外れにくくなりますが、画角の端では顔が歪み、表情の数値が変わることがあります。使ったカメラは記録の先頭に書きます。記録中に変えると、変えたことを記録して普段を取り直します")
+                    }
                     Section {
                         Toggle("見る側に映像も送る", isOn: $sendVideo)
                     } footer: {

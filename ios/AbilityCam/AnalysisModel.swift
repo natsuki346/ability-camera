@@ -12,6 +12,9 @@ enum Mark: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// どちらの普段で比べているか（v1.2〜）
+enum BaselineSource: String { case today, saved }
+
 @MainActor
 final class AnalysisModel: ObservableObject {
     @Published var running = false           // セッションの記録中（ファイルが開いている。裏に回って5秒以内も含む）
@@ -31,8 +34,12 @@ final class AnalysisModel: ObservableObject {
     let graph = GraphStore()                                 // 「グラフ」のページ（メモリだけ、直近5分）
     private var lastGraphHost: CFTimeInterval = 0
 
-    @Published var baselineSec: Int?          // 普段を記録中の経過秒（記録中でなければ nil）
-    @Published var baselineReady = false
+    @Published var baselineSec: Int?          // 今日の普段を記録中の経過秒（記録中でなければ nil）
+    @Published var baselineReady = false      // 今日の普段を記録し終えた
+    @Published var comparing: BaselineSource? // いつもとの違いを比べている普段（nil：まだ比べていない）
+    @Published var savedFromMs: Int64?        // 保存した普段で比べているとき、その普段を保存した日時
+    @Published var canOverwriteSaved = false  // 「今日の普段で上書き」を出す
+    @Published var maxFaces = 2               // 一度に探す顔の数（解析コマ/秒が落ちたら1）
     @Published var baselineTarget = AnalysisModel.selectedBaselineSeconds   // 今の普段の長さ（数えた時間の目標）
     @Published var baselineWait: String?      // 普段を数えていない理由（数えている間は nil）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
@@ -88,6 +95,12 @@ final class AnalysisModel: ObservableObject {
     private var liveDiffs: [LiveDiff] = []                    // 見る側へ：違いの一覧（指標・向き・秒数）
     private var diffCount = 0                                 // このセッションで違いが出た回数（segments と同じ数え方）
     private var head = HeadTurnTracker()                      // 顔を向ける・そむける（0.5秒続いたら記録）
+    private var boxStats = (cx: Welford(), cy: Welford(), w: Welford())   // 普段の間の顔の位置と大きさ
+    private var todayBaseline: SavedBaseline?                 // このセッションで記録し終えた今日の普段（保存・上書き用）
+    private var faceCount: Int?                               // 映っている顔の数（0.5秒続いたもの）
+    private var faceCountPending: (n: Int, tMs: Int64)?
+    private var facesCheck: (host: CFTimeInterval, submitted: Int, analyzed: Int)?   // 2つ探して解析コマ/秒が落ちていないか
+    private var analyzedFrames = 0
 
     static let baselineChoices = [30, 60] // 普段の長さ（数えた時間。時計の時間ではない）。撮る側の設定で選ぶ
     static let defaultBaselineSeconds = 30   // 2026-10-27 に60秒から変えた（docs/validation-log.md）
@@ -154,7 +167,7 @@ final class AnalysisModel: ObservableObject {
     private func startSession() async {
         guard await startCamera() else { return }
         do {
-            try logger.start(camera: camera.lens)
+            try logger.start(camera: camera.lens, personId: PersonStore.shared.selectedID)
         } catch {
             status = "記録を始められませんでした: \(error.localizedDescription)"
             return
@@ -172,7 +185,10 @@ final class AnalysisModel: ObservableObject {
         graph.reset()
         link.headTurns = []   // 見る側の「直近の顔の向き」は、セッションごと
         sessionStartHost = CACurrentMediaTime()
+        todayBaseline = nil
+        face.setPreferred(nil)
         resetBaseline()   // 普段（設定の長さ）も自動で始める
+        applySavedIfWanted()   // 設定でオンなら、保存した普段ですぐ比べ始める（今日の普段もうしろで記録する）
         running = true
         sessionStartedAt = Date()
         status = "記録しています: \(logger.fileName ?? "-")" + note
@@ -192,6 +208,7 @@ final class AnalysisModel: ObservableObject {
             running = false
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
+            comparing = nil; savedFromMs = nil; canOverwriteSaved = false; todayBaseline = nil
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
             if let s = logger.finish() {
@@ -246,12 +263,15 @@ final class AnalysisModel: ObservableObject {
             let ageSec = CACurrentMediaTime() - Double(r.captureMs) / 1000
             let tMs = Int64((Date().timeIntervalSince1970 - ageSec) * 1000)
             let round1 = { (x: Double) in (x * 10).rounded() / 10 }
+            let round4 = { (x: Double) in (x * 10000).rounded() / 10000 }
             // ファイルが開いていないとき・記録の開始より前のコマは書かれない
             logger.write(FrameRecord(tMs: tMs, face: r.face,
                                      bs: r.face ? r.blendshapes : nil, pts: r.face ? r.keyPoints : nil,
                                      rmsDb: a.rmsDb, f0Hz: a.f0Hz, procMs: r.procMs, latMs: r.latMs,
                                      yawDeg: r.pose.map { round1($0.yaw) }, pitchDeg: r.pose.map { round1($0.pitch) },
-                                     rollDeg: r.pose.map { round1($0.roll) }),
+                                     rollDeg: r.pose.map { round1($0.roll) },
+                                     faceCx: r.box.map { round4($0.cx) }, faceCy: r.box.map { round4($0.cy) },
+                                     faceW: r.box.map { round4($0.w) }),
                          notBefore: tMs)
             Task { @MainActor in self?.update(r, audio: a, tMs: tMs) }
         }
@@ -288,6 +308,7 @@ final class AnalysisModel: ObservableObject {
         lastAudioAt = 0; lastAudioAtEngine = 0; recentFace = []
         lastBlinkT = -.infinity; squintPending = []
         faceReadable = true
+        faceCount = nil; faceCountPending = nil; facesCheck = nil
         head.reset()   // カメラを止めていた間の向きは分からないので、今から数え直す（最初に決まった向きは記録しない）
     }
 
@@ -398,6 +419,60 @@ final class AnalysisModel: ObservableObject {
         liveZ = [:]; liveDiffs = []
         link.baseline = nil   // 見る側の「いつもの範囲」も消す（記録し終えたら、また送る）
         meterZ = [:]; diffMetrics = [:]; baselineStats = nil
+        comparing = nil; savedFromMs = nil; canOverwriteSaved = false
+        boxStats = (Welford(), Welford(), Welford())
+    }
+
+    /// 設定「保存した普段ですぐ始める」がオンで、選んだ人の保存した普段があり、カメラが同じとき：その普段で比べ始める。
+    /// 記録には source: "saved" の baseline 行を書く
+    private func applySavedIfWanted() {
+        guard UserDefaults.standard.bool(forKey: "useSavedBaseline"), let p = PersonStore.shared.selected, let sv = p.saved,
+              sv.camera == (lensInUse ?? camera.lens).rawValue else { return }
+        let now = Self.nowMs()
+        var row = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
+                                 yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
+                                 minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: sv.metrics)
+        row.source = BaselineSource.saved.rawValue; row.compared = true
+        row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox
+        logger.write(row)
+        let b = Self.engineBaseline(sv.metrics)
+        engine.setBaseline(b)
+        baselineStats = b
+        comparing = .saved
+        savedFromMs = sv.savedMs
+        insufficient = Metric.allCases.filter { sv.metrics[$0.rawValue]?.insufficient ?? true }
+        link.baseline = LiveBaseline(startedMs: sv.savedMs, tMs: now, metrics: sv.metrics)   // 見る側へ（名前は送らない）
+        face.setPreferred(sv.faceBox)
+    }
+
+    /// 「今日の普段で上書き」
+    func overwriteSaved() {
+        guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
+        PersonStore.shared.setSaved(p.id, t)
+        canOverwriteSaved = false
+        showMessage("\(p.displayName)の保存した普段を、今日の普段で上書きしました")
+    }
+
+    /// 上の帯で人を変えた：記録に id を書く（名前は書かない）。今日の普段があれば、その人に保存する（あれば上書きのボタン）
+    func personChanged() {
+        let id = PersonStore.shared.selectedID
+        if running {
+            var e = EventRecord(tMs: Self.nowMs(), kind: "person", value: nil)
+            e.personId = id ?? ""
+            logger.write(e)
+        }
+        saveTodayIfNew()
+    }
+
+    private func saveTodayIfNew() {
+        canOverwriteSaved = false
+        guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
+        if p.saved == nil {
+            PersonStore.shared.setSaved(p.id, t)
+            showMessage("\(p.displayName)の普段を保存しました")
+        } else {
+            canOverwriteSaved = true
+        }
     }
 
     private func finishBaseline(now: CFTimeInterval) {
@@ -410,17 +485,32 @@ final class AnalysisModel: ObservableObject {
                                                   std: w.n > 0 ? (w.std * 10000).rounded() / 10000 : nil,
                                                   insufficient: w.n < Self.minSamples)
         }
-        logger.write(BaselineRecord(tMs: Self.nowMs(), startedMs: baselineStartMs,
-                                    wallS: ((now - baselineStartHost) * 10).rounded() / 10,
-                                    validS: (baselineValidS * 10).rounded() / 10,
-                                    yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
-                                    minN: Self.minSamples, targetS: baselineTarget, blinkMasked: true, metrics: out))
-        insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
-        engine.setBaseline(Self.engineBaseline(out))
-        baselineStats = Self.engineBaseline(out)
+        func box(_ w: Welford) -> FaceBoxStats.S {
+            FaceBoxStats.S(n: w.n, mean: (w.mean * 10000).rounded() / 10000, std: (w.std * 10000).rounded() / 10000)
+        }
+        let faceBox = boxStats.cx.n > 0 ? FaceBoxStats(cx: box(boxStats.cx), cy: box(boxStats.cy), w: box(boxStats.w)) : nil
+        let useToday = comparing == nil   // 保存した普段で比べているときは、比べる相手を自動では切り替えない
+        var row = BaselineRecord(tMs: Self.nowMs(), startedMs: baselineStartMs,
+                                 wallS: ((now - baselineStartHost) * 10).rounded() / 10,
+                                 validS: (baselineValidS * 10).rounded() / 10,
+                                 yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
+                                 minN: Self.minSamples, targetS: baselineTarget, blinkMasked: true, metrics: out)
+        row.source = BaselineSource.today.rawValue; row.compared = useToday; row.faceBox = faceBox
+        row.camera = (lensInUse ?? camera.lens).rawValue
+        logger.write(row)
+        if useToday {
+            insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
+            engine.setBaseline(Self.engineBaseline(out))
+            baselineStats = Self.engineBaseline(out)
+            comparing = .today
+            link.baseline = LiveBaseline(startedMs: baselineStartMs, tMs: Self.nowMs(), metrics: out)   // 見る側へ1回
+            face.setPreferred(faceBox)
+        }
         baselineSec = nil; baselineWait = nil
         baselineReady = true
-        link.baseline = LiveBaseline(startedMs: baselineStartMs, tMs: Self.nowMs(), metrics: out)   // 見る側へ1回
+        todayBaseline = SavedBaseline(metrics: out, camera: (lensInUse ?? camera.lens).rawValue, targetS: baselineTarget,
+                                      savedMs: Self.nowMs(), faceBox: faceBox)
+        saveTodayIfNew()   // 人を選んでいて、保存した普段がまだ無ければ保存する（あれば上書きのボタンを出す）
     }
 
     /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない
@@ -444,6 +534,8 @@ final class AnalysisModel: ObservableObject {
             // 見る側へも（記録に書くのと同じもの。記録していないときは書かないので送らない）
             if running { link.addHeadTurn(LiveEvent(tMs: c.tMs, kind: "head_turn", value: c.value, head: c.to.rawValue)) }
         }
+        trackFaceCount(r.faceCount, tMs: tMs)
+        analyzedFrames += 1
         frames += 1
         if r.face { faceFrames += 1 }
         if r.procMs >= 0 { procSum += r.procMs; procN += 1 }
@@ -539,6 +631,7 @@ final class AnalysisModel: ObservableObject {
                 }
             }
             for (m, x) in voiceValues { stats[m, default: Welford()].add(x) }
+            if let b = r.box { boxStats.cx.add(b.cx); boxStats.cy.add(b.cy); boxStats.w.add(b.w) }
         }
         if faceReadable != readable { faceReadable = readable }
         faceShape = readable && !shapeSmooth.isEmpty ? shapeSmooth : nil
@@ -563,15 +656,16 @@ final class AnalysisModel: ObservableObject {
                 if baselineWait != wait { baselineWait = wait }
             }
         }
-        if running && baselineReady { updateDifferences(latestT: epochT, faceReadable: readable) }
+        if running && comparing != nil { updateDifferences(latestT: epochT, faceReadable: readable) }
+        checkFaceLimit(now: now)
         sendLive(r, now: now, readable: readable, values: faceValues, audio: a)
         adjustVideo(now: now)
 
         // グラフ：1秒に10回まで（解析のコマ/秒を落とさないため）。z は判定に使ったもの（約0.2秒前のコマ）
         if now - lastGraphHost >= 0.1, engine.processedT.isFinite {
             lastGraphHost = now
-            graph.append(t: engine.processedT, z: running && baselineReady ? engine.z : [:], values: engine.value,
-                         baseline: running && baselineReady ? baselineStats : nil)
+            graph.append(t: engine.processedT, z: running && comparing != nil ? engine.z : [:], values: engine.value,
+                         baseline: running && comparing != nil ? baselineStats : nil)
         }
     }
 
@@ -610,13 +704,46 @@ final class AnalysisModel: ObservableObject {
             values: r.face ? Dictionary(uniqueKeysWithValues: values.map { ($0.key.rawValue, ($0.value * 1000).rounded() / 1000) }) : nil,
             rmsDb: a.rmsDb.map(Double.init), f0Hz: a.f0Hz.map(Double.init),
             differences: differences,
-            baselineSec: baselineSec, baselineTotal: Int(baselineTarget), baselineReady: baselineReady,
+            baselineSec: comparing == nil ? baselineSec : nil, baselineTotal: Int(baselineTarget), baselineReady: comparing != nil,
             baselineWait: baselineWait, insufficient: insufficient.map(\.label),
             recording: running, sessionStartedMs: sessionStartedAt.map { Int64($0.timeIntervalSince1970 * 1000) },
             scene: scene?.rawValue,
             faceRatio: faceRatio, fps: fps,
-            z: baselineReady ? liveZ : nil, diffs: baselineReady ? liveDiffs : nil, diffCount: running ? diffCount : nil,
+            z: comparing != nil ? liveZ : nil, diffs: comparing != nil ? liveDiffs : nil, diffCount: running ? diffCount : nil,
             head: head.state?.rawValue))
+    }
+
+    /// 映っている顔の数が変わって0.5秒続いたら、event（kind: "faces"、count）を書く。最初に決まった数は書かない
+    private func trackFaceCount(_ n: Int, tMs: Int64) {
+        guard n != faceCount else { faceCountPending = nil; return }
+        if faceCountPending?.n != n { faceCountPending = (n, tMs) }
+        guard let p = faceCountPending, tMs - p.tMs >= 500 else { return }
+        let first = faceCount == nil
+        faceCount = n; faceCountPending = nil
+        guard !first, running else { return }
+        var e = EventRecord(tMs: p.tMs, kind: "faces", value: nil)
+        e.count = n
+        logger.write(e)
+    }
+
+    /// 顔を2つまで探していて、解析できたコマがカメラから来たコマの9割を下回ったら（10秒ごとに見る）、1つに戻して記録に書く。
+    /// 映像を送っている間は、そちらで落ちることがあるので見ない
+    private func checkFaceLimit(now: CFTimeInterval) {
+        guard maxFaces > 1, cameraActive, !videoSending else { facesCheck = nil; return }
+        let submitted = face.submittedCount()
+        guard let c = facesCheck else { facesCheck = (now, submitted, analyzedFrames); return }
+        guard now - c.host >= 10 else { return }
+        let sent = submitted - c.submitted, done = analyzedFrames - c.analyzed
+        facesCheck = (now, submitted, analyzedFrames)
+        guard sent > 30, Double(done) < Double(sent) * 0.9 else { return }
+        do { try face.setNumFaces(1) } catch { return }
+        maxFaces = 1
+        let msg = String(format: "解析コマ/秒が落ちたため、探す顔の数を1にしました（カメラ %.1f → 解析 %.1f コマ/秒）",
+                         Double(sent) / (now - c.host), Double(done) / (now - c.host))
+        var e = EventRecord(tMs: Self.nowMs(), kind: "faces_limit", value: .text(msg))
+        e.count = 1
+        logger.write(e)
+        status = msg
     }
 
     /// アプリと同じ式（左右の平均）。顔が無いときは空
@@ -650,6 +777,7 @@ final class AnalysisModel: ObservableObject {
             lastChange = (keys, faceReadable)
             var e = EventRecord(tMs: Self.nowMs(), kind: "change", value: .list(keys))
             e.faceReadable = faceReadable
+            e.baseline = comparing?.rawValue   // どちらの普段で比べたか
             logger.write(e)
         }
     }

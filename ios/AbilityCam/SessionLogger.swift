@@ -15,10 +15,13 @@ struct FrameRecord: Encodable {
     var yawDeg: Double?         // 顔の向き（度）。映像で見て右・上・右へ傾く が +
     var pitchDeg: Double?
     var rollDeg: Double?
+    var faceCx: Double?         // 本人として使った顔の枠：中心 x・y と幅（0〜1、v1.2〜）
+    var faceCy: Double?
+    var faceW: Double?
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", face, bs, pts, rmsDb = "rms_db", f0Hz = "f0_hz", procMs = "proc_ms", latMs = "lat_ms"
-        case yawDeg = "yaw_deg", pitchDeg = "pitch_deg", rollDeg = "roll_deg"
+        case yawDeg = "yaw_deg", pitchDeg = "pitch_deg", rollDeg = "roll_deg", faceCx = "face_cx", faceCy = "face_cy", faceW = "face_w"
     }
 }
 
@@ -47,16 +50,19 @@ struct EventRecord: Encodable {
     var from: String?           // head_turn：前の向き
     var yawDeg: Double?         // head_turn：なり始めたときの yaw（見えない：見えなくなる直前の yaw）
     var camera: String?         // camera：切り替えたカメラ（wide / ultra_wide）
+    var count: Int?             // faces：映っている顔の数（0.5秒続いたもの）。faces_limit：探す顔の数
+    var baseline: String?       // change：どちらの普段で比べたか（today / saved、v1.2〜）
+    var personId: String?       // person：選んだ人の id（名前は書かない）
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
-        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera
+        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id"
     }
 }
 
 /// 普段（最初の30秒／60秒。撮る側の設定）の各指標の n / mean / std
 struct BaselineRecord: Encodable {
-    struct Stat: Codable {
+    struct Stat: Codable, Equatable {
         let n: Int
         let mean: Double?
         let std: Double?
@@ -64,18 +70,24 @@ struct BaselineRecord: Encodable {
     }
 
     let type = "baseline"
-    let tMs: Int64              // 記録し終えた時刻
-    let startedMs: Int64        // 記録し始めた時刻
-    let wallS: Double           // 普段を集めるのにかかった実際の時間
-    let validS: Double          // そのうち数えた時間（顔が読めていて |yaw| < 35°、開いてから5秒より後）
+    let tMs: Int64              // 記録し終えた時刻（保存した普段：使い始めた時刻）
+    let startedMs: Int64?       // 記録し始めた時刻（保存した普段には無い）
+    let wallS: Double?          // 普段を集めるのにかかった実際の時間
+    let validS: Double?         // そのうち数えた時間（顔が読めていて |yaw| < 35°、開いてから5秒より後）
     let yawLimitDeg: Double
     let warmupS: Double         // 開いてからこの秒数は数えない（ポケットに入れる間）
     let minN: Int
     let targetS: Double         // 普段の長さ（数えた時間がこの秒数になったら記録し終える。撮る側の設定、v0.9〜）
     let blinkMasked: Bool       // 目を細めるの普段から、まばたき（と前後0.2秒）のコマを外した（v1.0〜。振り返りレポートは数え直さない）
     let metrics: [String: Stat]
+    var source = "today"        // today：今日の30秒 / saved：人ごとに保存した普段（v1.2〜）
+    var compared = true         // この普段で「いつもとの違い」を比べたか（false：記録しただけ）
+    var savedMs: Int64?         // saved：保存した日時
+    var camera: String?         // saved：保存したときのカメラ
+    var faceBox: FaceBoxStats?  // 普段の間の顔の位置と大きさ（v1.2〜）
 
     enum CodingKeys: String, CodingKey {
+        case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box"
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
         case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics
     }
@@ -89,7 +101,7 @@ final class SessionLogger {
     private var startedMs = Int64.max   // queue の上でだけ触る
     private var stats = SessionStats()  // queue の上でだけ触る。書いた行から要約を数える
 
-    func start(camera: CameraLens) throws {
+    func start(camera: CameraLens, personId: String?) throws {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd-HHmmss"
         let name = "ability-cam-\(f.string(from: Date())).jsonl"
@@ -108,6 +120,8 @@ final class SessionLogger {
             // 使ったカメラ。超広角は画角の端で顔が歪み、表情の数値が変わることがある
             "camera": camera.rawValue,
             "camera_label": camera.label,
+            // 人の id（名前は書かない。v1.2〜）
+            "person_id": personId ?? NSNull(),
             "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角。超広角は画角の端で顔が歪み表情の数値が変わることがある)"
         ]
         let data = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])

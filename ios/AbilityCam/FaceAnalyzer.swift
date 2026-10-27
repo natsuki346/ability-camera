@@ -12,6 +12,9 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
     /// 顔の向き（度）。映像で見て右を向く＝yaw +、上を向く＝pitch +、頭の上が映像の右へ傾く＝roll +
     struct Pose { let yaw: Double; let pitch: Double; let roll: Double }
 
+    /// 顔の枠：中心 x・y と幅（解析した画像の中で 0〜1）
+    struct Box { let cx: Double; let cy: Double; let w: Double }
+
     struct Result {
         let captureMs: Int          // 撮影された時刻（端末の起動からの ms、CACurrentMediaTime と同じ時計）
         let face: Bool
@@ -22,14 +25,21 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         let pose: Pose?
         let procMs: Double          // 解析に渡してから結果が返るまで
         let latMs: Double           // 撮影されてから結果が返るまで
+        let faceCount: Int          // 映っていた顔の数（numFaces まで）
+        let box: Box?               // 本人として使った顔の枠
     }
 
     /// 鼻先・額・あご・両目尻・両口角（追跡の安定性を後で確かめる用）
     static let keyPointIndices = [1, 10, 152, 33, 263, 61, 291]
 
     private var landmarker: FaceLandmarker?
+    /// 一度に探す顔の数（v1.2〜は2。解析コマ/秒が落ちるときは1に戻す）
+    private(set) var numFaces = 2
+    /// 2つ映ったときに本人として選ぶ、普段の顔の位置と大きさ（無いときは大きいほう）
+    private var preferred: (box: Box, sd: Box)?
     private var sentAt: [Int: CFTimeInterval] = [:]
     private var lastTs = -1
+    private var submitted = 0      // 解析に渡したコマの数（解析コマ/秒が落ちていないか見る）
     private var imageSize = CGSize.zero
     private let lock = NSLock()
 
@@ -40,27 +50,54 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         super.init()
     }
 
+    func submittedCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return submitted
+    }
+
+    /// 普段の顔の位置と大きさ（標準偏差には下限 0.05 をかける）
+    func setPreferred(_ s: FaceBoxStats?) {
+        lock.lock(); defer { lock.unlock() }
+        preferred = s.map { (Box(cx: $0.cx.mean, cy: $0.cy.mean, w: $0.w.mean),
+                             Box(cx: max($0.cx.std, 0.05), cy: max($0.cy.std, 0.05), w: max($0.w.std, 0.05))) }
+    }
+
+    /// 探す顔の数を変える（作り直す）
+    func setNumFaces(_ n: Int) throws {
+        lock.lock()
+        let changed = n != numFaces
+        numFaces = n
+        if changed { landmarker = nil }
+        lock.unlock()
+        if changed { try load() }
+    }
+
     func load() throws {
-        guard landmarker == nil else { return }
+        lock.lock()
+        let has = landmarker != nil, n = numFaces
+        lock.unlock()
+        guard !has else { return }
         guard let path = Bundle.main.path(forResource: "face_landmarker", ofType: "task") else {
             throw AnalyzerError.modelMissing
         }
         let o = FaceLandmarkerOptions()
         o.baseOptions.modelAssetPath = path
         o.runningMode = .liveStream
-        o.numFaces = 1
+        o.numFaces = n
         o.outputFaceBlendshapes = true
         o.outputFacialTransformationMatrixes = true
         o.faceLandmarkerLiveStreamDelegate = self
-        landmarker = try FaceLandmarker(options: o)
+        let lm = try FaceLandmarker(options: o)
+        lock.lock(); landmarker = lm; lock.unlock()
     }
 
     func process(_ sampleBuffer: CMSampleBuffer) {
-        guard let landmarker else { return }
         let ms = Int(CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * 1000)
         lock.lock()
+        guard let landmarker else { lock.unlock(); return }
         guard ms > lastTs else { lock.unlock(); return }   // 時刻は必ず増えていく必要がある
         lastTs = ms
+        submitted += 1
         if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
             imageSize = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
         }
@@ -96,15 +133,37 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
                         timestampInMilliseconds: Int,
                         error: Error?) {
         let now = CACurrentMediaTime()
-        lock.lock(); let sent = sentAt.removeValue(forKey: timestampInMilliseconds); let size = imageSize; lock.unlock()
+        lock.lock()
+        let sent = sentAt.removeValue(forKey: timestampInMilliseconds), size = imageSize, pref = preferred
+        lock.unlock()
+
+        // 顔が2つ映ったら、普段の位置・大きさに近いほうを本人として使う（普段がまだ無ければ大きいほう）
+        let faces = result?.faceLandmarks ?? []
+        let boxes: [Box?] = faces.map { lms in
+            guard !lms.isEmpty else { return nil }
+            let xs = lms.map { Double($0.x) }, ys = lms.map { Double($0.y) }
+            let x0 = xs.min()!, x1 = xs.max()!, y0 = ys.min()!, y1 = ys.max()!
+            return Box(cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0)
+        }
+        var pick = 0
+        if boxes.count > 1 {
+            func dist(_ b: Box?) -> Double {
+                guard let b else { return .infinity }
+                guard let p = pref else { return -b.w }
+                let dx = (b.cx - p.box.cx) / p.sd.cx, dy = (b.cy - p.box.cy) / p.sd.cy, dw = (b.w - p.box.w) / p.sd.w
+                return dx * dx + dy * dy + dw * dw
+            }
+            pick = boxes.indices.min { dist(boxes[$0]) < dist(boxes[$1]) } ?? 0
+        }
 
         var bs: [String: Float] = [:]
         var pts: [[Float]] = []
         var mesh: [CGPoint] = []
         var pose: Pose?
-        let lms = result?.faceLandmarks.first
+        let lms = faces.indices.contains(pick) ? faces[pick] : nil
         if let lms, !lms.isEmpty {
-            for c in result?.faceBlendshapes.first?.categories ?? [] {
+            let blend = result?.faceBlendshapes ?? []
+            for c in (blend.indices.contains(pick) ? blend[pick] : blend.first)?.categories ?? [] {
                 if let name = c.categoryName { bs[name] = (c.score * 1000).rounded() / 1000 }
             }
             pts = Self.keyPointIndices.compactMap { i in
@@ -113,7 +172,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
                 return [p.x, p.y, p.z].map { ($0 * 10000).rounded() / 10000 }
             }
             mesh = lms.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
-            pose = result?.facialTransformationMatrixes.first.flatMap(Self.pose)
+            let mats = result?.facialTransformationMatrixes ?? []
+            pose = (mats.indices.contains(pick) ? mats[pick] : mats.first).flatMap(Self.pose)
         }
         onResult?(Result(
             captureMs: timestampInMilliseconds,
@@ -124,7 +184,9 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
             imageSize: size,
             pose: pose,
             procMs: sent.map { (now - $0) * 1000 } ?? -1,
-            latMs: now * 1000 - Double(timestampInMilliseconds)
+            latMs: now * 1000 - Double(timestampInMilliseconds),
+            faceCount: boxes.compactMap { $0 }.count,
+            box: boxes.indices.contains(pick) ? boxes[pick] : nil
         ))
     }
 }

@@ -141,7 +141,8 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         let recount = Self.squintWithoutBlinks(t: t, face: face, yaw: yaw, squint: squint, blink: blink, start0: startedAt)
         var bItems: [(t: Double, stats: [Metric: DiffEngine.Stat]?)] = []
         for b in baselines {
-            guard let bt = ms(b) else { continue }
+            // 撮る側が比べるのに使わなかった行（v1.2〜の compared: false）は使わない（振り返りレポートと同じ）
+            guard let bt = ms(b), (b["compared"] as? Bool) != false else { continue }
             let metrics = b["metrics"] as? [String: [String: Any]] ?? [:]
             var stats: [Metric: DiffEngine.Stat] = [:]
             for m in Metric.allCases {

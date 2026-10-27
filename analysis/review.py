@@ -58,6 +58,7 @@ class Recording:
     baselines: list[dict]
     events: list[dict]
     baseline_source: str = "記録の baseline 行（アプリが記録したもの）"
+    all_baselines: list[dict] = field(default_factory=list)   # 比べるのに使わなかった行（compared: false）も含む
     pairs: dict[str, np.ndarray] = field(default_factory=dict)   # 表情の数値 52種を左右平均したもの（browDown など。顔が無いコマは NaN）
 
     @property
@@ -132,7 +133,10 @@ def load(path: Path) -> Recording:
         p = o.get("proc_ms", -1)
         proc[i] = p if p is not None and p >= 0 else np.nan
     t = np.array([o["t_ms"] for o in frames], float) / 1000
-    return Recording(path, header, t, face, raw, yaw, blink, lat, proc, baselines, events, pairs=pairs)
+    # v1.2〜：保存した普段（source: "saved"）で比べたときは、今日の普段の行も compared: false で書かれる。
+    # 区間はアプリと同じく、比べるのに使った行（compared が false でないもの）で判定する
+    used = [b for b in baselines if b.get("compared", True) is not False]
+    return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines)
 
 
 # ---------------------------------------------------------------- 基準
@@ -948,6 +952,40 @@ def compare_baselines(rec: Recording, c: dict, lengths: list[float]) -> list[dic
     return rows
 
 
+def baseline_kind(b: dict) -> str:
+    """baseline 行がどの普段か（v1.2〜の source。無ければ今日の普段）"""
+    return "saved" if b.get("source") == "saved" else "today"
+
+
+def compare_saved(rec: Recording, c: dict) -> dict:
+    """同じ記録を「保存した普段」と「今日の普段」のそれぞれで判定し、指標ごとの平均のずれと区間の数を並べる。
+    ずれ =（保存した普段の平均 − 今日の普段の平均）÷ 今日の標準偏差（下限をかけたもの）。どちらも、記録の中の最初の行で比べる"""
+    rows = {k: sorted([b for b in rec.all_baselines if baseline_kind(b) == k], key=lambda b: b["t_ms"]) for k in ("saved", "today")}
+    out: dict = {"saved_rows": rows["saved"], "today_rows": rows["today"], "shift": {}, "runs": {}}
+    if not rows["saved"] or not rows["today"]:
+        out["missing"] = ("保存した普段の行がありません（保存した普段ですぐ始める、がオフの記録）" if not rows["saved"]
+                          else "今日の普段の行がありません（今日の普段を記録し終える前に閉じた記録）")
+    sv, td = (rows["saved"][0] if rows["saved"] else None), (rows["today"][0] if rows["today"] else None)
+    for m in METRICS:
+        a_ = (sv or {}).get("metrics", {}).get(m, {})
+        b_ = (td or {}).get("metrics", {}).get(m, {})
+        shift = None
+        if a_.get("mean") is not None and b_.get("mean") is not None and not a_.get("insufficient") and not b_.get("insufficient"):
+            shift = (a_["mean"] - b_["mean"]) / max(b_.get("std") or 0, c["std_floor"][m])
+        out["shift"][m] = {"saved_mean": a_.get("mean"), "today_mean": b_.get("mean"), "today_std": b_.get("std"), "shift": shift}
+    for k in ("saved", "today"):
+        if not rows[k]:
+            continue
+        r = copy.copy(rec)
+        r.baselines = rows[k]
+        an = analyze(r, c)
+        judged = float(frame_dt(r.t)[an.bidx >= 0].sum())
+        out["runs"][k] = {"total": len(an.segments), "judged_s": judged,
+                          "per_metric": {m: sum(1 for x in an.segments if x.metric == m) for m in METRICS},
+                          "from": rows[k][0]["t_ms"] / 1000}
+    return out
+
+
 # ---------------------------------------------------------------- グラフ
 
 def setup_matplotlib():
@@ -1154,7 +1192,9 @@ def baseline_time_row(b: dict) -> list:
     started = jst(b["started_ms"] / 1000) if b.get("started_ms") else "–"
     wall = b.get("wall_s", b.get("duration_s"))
     valid = b.get("valid_s")
-    if valid is None:
+    if baseline_kind(b) == "saved":
+        cond = "保存した普段" + (f"（{jst(b['saved_ms'] / 1000)} に保存）" if b.get("saved_ms") else "")
+    elif valid is None:
         cond = "時計の時間で数えた（v0.3 までの記録）"
     else:
         cond = f"顔が読めていて |yaw| < {b.get('yaw_limit_deg', 35):g}°、開いてから {b.get('warmup_s', 5):g}秒より後"
@@ -1248,6 +1288,11 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                      + (f"<p class=note>{e(a.blink_note)}</p>" if a.blink_note else "")
                      + table(["記録し始めた時刻", "記録し終えた時刻", "普段の長さ", "かかった時間", "数えた時間", "数えた条件"],
                              [baseline_time_row(b) for b in rec.baselines])
+                     + (table(["時刻", "どの普段", "比べるのに使った"],
+                              [[jst(b["t_ms"] / 1000), "保存した普段" + (f"（{jst(b['saved_ms'] / 1000)} に保存）" if b.get("saved_ms") else "")
+                                if baseline_kind(b) == "saved" else "今日の普段",
+                                "はい" if b.get("compared", True) is not False else "いいえ（記録しただけ）"] for b in rec.all_baselines])
+                        if any("source" in b for b in rec.all_baselines) else "")
                      + table(["記録し終えた時刻", "指標", "", "n", "mean", "std", ""], brows))
     else:
         parts.append("<h2>普段（baseline）</h2><p>普段（" + e(rec.baseline_source) + "）が無いため、区間は判定できません。</p>")
@@ -1281,6 +1326,24 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                      + table(["普段", "普段を記録し終えた時刻", "判定した時間", "区間", "短い動き"] + [LABEL[m] for m in METRICS]
                              + (["表情の弱い方への変化（参考）"] if weak_on else [])
                              + (["10分あたりの区間"] if calm else []), crow))
+
+    # 保存した普段と今日の普段（--compare-saved）
+    if q.get("compare_saved"):
+        cs = q["compare_saved"]
+        f2 = lambda v: "–" if v is None else f"{v:g}"
+        srows = [[LABEL[m], f2(x["saved_mean"]), f2(x["today_mean"]), f2(x["today_std"]),
+                  "–" if x["shift"] is None else f"{x['shift']:+.2f}"] for m, x in cs["shift"].items()]
+        rr = cs["runs"]
+        cnt = lambda k, m=None: "–" if k not in rr else (rr[k]["total"] if m is None else rr[k]["per_metric"][m])
+        crows = [[LABEL[m], cnt("saved", m), cnt("today", m)] for m in METRICS] + [["合計", cnt("saved"), cnt("today")]]
+        saved_at = "、".join(jst(b["saved_ms"] / 1000) for b in cs["saved_rows"] if b.get("saved_ms")) or "–"
+        parts.append("<h2>保存した普段と今日の普段（--compare-saved）</h2>"
+                     + (f"<p>{e(cs['missing'])}</p>" if cs.get("missing") else "")
+                     + f"<p class=note>保存した普段を保存した日時：{e(saved_at)}。ずれ ＝（保存した普段の平均 − 今日の普段の平均）÷ 今日の標準偏差（下限をかけたもの）。"
+                       "±2 を超えると、保存した普段では、今日のいつもの範囲から外れた所を「普段」として比べていることになります。"
+                       "区間は、同じ記録をそれぞれの普段だけで判定し直して数えたものです（保存した普段は記録の始めから、今日の普段は記録し終えた時刻から判定します）。</p>"
+                     + table(["指標", "保存した普段の平均", "今日の普段の平均", "今日の標準偏差", "ずれ"], srows)
+                     + table(["指標", "保存した普段で比べた区間", "今日の普段で比べた区間"], crows))
 
     # 印との対応
     if q["mark_rows"]:
@@ -1402,6 +1465,8 @@ def main(argv=None) -> int:
                    help="普段を、記録の中の1コマごとの値からこの長さ（数えた時間）で作り直して区間を数える（例 30）")
     p.add_argument("--compare-baseline", metavar="秒,秒",
                    help="同じ記録を、普段の長さを変えて数えた区間の数を並べる（例 30,60）")
+    p.add_argument("--compare-saved", action="store_true",
+                   help="保存した普段（source: saved）と今日の普段（source: today）のずれと、それぞれで判定した区間の数を並べる（v1.2〜の記録）")
     p.add_argument("--out-dir", type=Path, help="出力先（省略時は記録と同じ場所）")
     args = p.parse_args(argv)
 
@@ -1434,6 +1499,18 @@ def main(argv=None) -> int:
         for x in compare_rows:
             per = "" if not args.calm or x["per_10min"] is None else f" / 10分あたり {x['per_10min']:.1f}件"
             print(f"{x['label']}: 区間 {x['total']}件（判定した {x['judged_s'] / 60:.1f}分）{per}")
+
+    if args.compare_saved:
+        cs = compare_saved(rec, c)
+        q["compare_saved"] = cs
+        if cs.get("missing"):
+            print(cs["missing"])
+        for k, label in (("saved", "保存した普段"), ("today", "今日の普段")):
+            if k in cs["runs"]:
+                print(f"{label}で比べた区間: {cs['runs'][k]['total']}件")
+        for m, x in cs["shift"].items():
+            if x["shift"] is not None:
+                print(f"  {LABEL[m]}: ずれ {x['shift']:+.2f}（保存 {x['saved_mean']:g} / 今日 {x['today_mean']:g}）")
 
     out = args.out_dir or args.jsonl.parent
     out.mkdir(parents=True, exist_ok=True)

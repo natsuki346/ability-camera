@@ -521,3 +521,57 @@ class CandidateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompareSavedTest(unittest.TestCase):
+    """v1.2：保存した普段（source: saved）で比べた記録。今日の普段は compared: false で書かれる"""
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        cls.dir = tempfile.TemporaryDirectory()
+        out = []
+        for line in FIXTURE.read_text(encoding="utf-8").splitlines():
+            o = json.loads(line)
+            if o.get("type") == "baseline" and o["t_ms"] / 1000 - T0 < 20:
+                o["source"], o["compared"], o["blink_masked"] = "today", False, True
+                saved = json.loads(json.dumps(o))
+                saved.update({"source": "saved", "compared": True, "saved_ms": int((T0 - 86400) * 1000),
+                              "t_ms": int((T0 + 0.5) * 1000)})
+                saved.pop("started_ms", None)
+                saved["metrics"]["brow_down"]["mean"] = 0.20      # 前に保存した眉の普段は高め
+                out.append(json.dumps(saved, ensure_ascii=False))
+            elif o.get("type") == "baseline":
+                o["source"], o["compared"], o["blink_masked"] = "today", True, True   # 取り直したあとは今日の普段で比べる
+            out.append(json.dumps(o, ensure_ascii=False))
+        cls.path = Path(cls.dir.name) / "saved.jsonl"
+        cls.path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        cls.rec = review.load(cls.path)
+        cls.c = review.load_criteria(review.HERE / "criteria.json", [])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def test_uses_compared_rows(self):
+        self.assertEqual([b.get("source") for b in self.rec.baselines], ["saved", "today"])
+        self.assertEqual(len(self.rec.all_baselines), 3)
+
+    def test_compare(self):
+        cs = review.compare_saved(self.rec, self.c)
+        self.assertNotIn("missing", cs)
+        self.assertAlmostEqual(cs["shift"]["brow_down"]["shift"], (0.20 - 0.05) / 0.03, places=3)   # 今日の std 0.02 → 下限 0.03
+        self.assertAlmostEqual(cs["shift"]["mouth_smile"]["shift"], 0.0)
+        # 眉の普段が高い保存した普段では、20秒・40秒の眉の区間が出ない
+        self.assertLess(cs["runs"]["saved"]["per_metric"]["brow_down"], cs["runs"]["today"]["per_metric"]["brow_down"])
+
+    def test_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            review.main([str(self.path), "--compare-saved", "--out-dir", d])
+            doc = (Path(d) / "saved.html").read_text(encoding="utf-8")
+            self.assertIn("保存した普段と今日の普段（--compare-saved）", doc)
+            self.assertIn("いいえ（記録しただけ）", doc)
+
+    def test_missing_saved(self):
+        rec = review.load(FIXTURE)
+        self.assertIn("missing", review.compare_saved(rec, self.c))

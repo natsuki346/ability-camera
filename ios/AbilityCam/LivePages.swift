@@ -41,9 +41,15 @@ struct NowPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .center) {
-                Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
-                Spacer(minLength: 4)
+            HStack(alignment: .center, spacing: 6) {
+                Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(2).minimumScaleFactor(0.6)
+                Spacer(minLength: 2)
+                if model.canOverwriteSaved {
+                    Button("今日の普段で上書き") { model.overwriteSaved() }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                }
                 Button("普段を取り直す") { model.restartBaseline() }
                     .font(.caption)
                     .buttonStyle(.bordered)
@@ -51,7 +57,6 @@ struct NowPage: View {
                     .disabled(!model.running)
             }
             differences
-            Spacer(minLength: 0)
             meters
         }
         .padding(10)
@@ -61,11 +66,15 @@ struct NowPage: View {
     /// 「顔：読めています・普段：記録しました」
     private var statusText: String {
         let face = !model.cameraActive ? "顔：–" : model.faceReadable ? "顔：読めています" : "顔：読めません"
-        let base: String
-        if let sec = model.baselineSec { base = "普段：記録中 \(sec)/\(Int(model.baselineTarget))秒" }
-        else if model.baselineReady { base = "普段：記録しました" }
-        else { base = "普段：まだありません" }
-        return "\(face)・\(base)"
+        let today: String
+        if let sec = model.baselineSec { today = "記録中 \(sec)/\(Int(model.baselineTarget))秒" }
+        else if model.baselineReady { today = "記録しました" }
+        else { today = "まだありません" }
+        if model.comparing == .saved {
+            let at = model.savedFromMs.map { PersonPickerView.date(Date(timeIntervalSince1970: Double($0) / 1000)) } ?? ""
+            return "\(face)・保存した普段（\(at)）で比べています・今日の普段：\(today)"
+        }
+        return "\(face)・普段：\(today)"
     }
 
     private var differences: some View {
@@ -73,18 +82,19 @@ struct NowPage: View {
             if !model.running {
                 Text("記録が始まると、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します")
                     .font(.callout).foregroundStyle(.secondary).lineLimit(2)
-            } else if let sec = model.baselineSec {
-                Text("普段を記録しています").font(.title3.bold()).foregroundStyle(ContentView.navy)
+            } else if model.comparing == nil, let sec = model.baselineSec {
+                Text("普段を記録しています").font(.title3.bold()).foregroundStyle(ContentView.navyText)
                 ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget)
+                    .tint(ContentView.navyText)
                 Text(model.baselineWait ?? "落ち着いているときに。顔が映っている間だけ数えます")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             } else if model.differences.isEmpty {
                 Text(model.faceReadable ? "いつもと大きな違いはありません" : "声は、いつもと大きな違いはありません")
-                    .font(.title3.bold()).foregroundStyle(ContentView.navy)
+                    .font(.title3.bold()).foregroundStyle(ContentView.navyText)
                     .lineLimit(1).minimumScaleFactor(0.6)
             } else {
                 ForEach(Array(model.differences.prefix(Self.maxLines)), id: \.self) {
-                    Text($0).font(.title3.bold()).foregroundStyle(ContentView.navy).lineLimit(1).minimumScaleFactor(0.6)
+                    Text($0).font(.title3.bold()).foregroundStyle(ContentView.navyText).lineLimit(1).minimumScaleFactor(0.6)
                 }
                 if model.differences.count > Self.maxLines {
                     Text("ほか\(model.differences.count - Self.maxLines)件").font(.caption).foregroundStyle(.secondary)
@@ -93,25 +103,24 @@ struct NowPage: View {
         }
     }
 
-    /// 見る側の「いま」のメーターを小さくしたもの（2列×3段）。いつもの範囲の帯と今の点、外れたらアンバー
+    /// 見る側の「いま」のメーターを小さくしたもの（縦1列6本。空いている高さに合わせて太くなる）。
+    /// いつもの範囲の帯と今の点、外れたらアンバー。顔が読めないときに薄くするのは表情の4本だけ（声の2本は普通の濃さ）
     private var meters: some View {
-        Grid(horizontalSpacing: 10, verticalSpacing: 4) {
-            ForEach(0..<3, id: \.self) { row in
-                GridRow {
-                    ForEach([Metric.allCases[row], Metric.allCases[row + 3]], id: \.self) { m in
-                        HStack(spacing: 4) {
-                            Circle().fill(m.color).frame(width: 6, height: 6)
-                            Text(m.label).font(.caption2).lineLimit(1).minimumScaleFactor(0.7)
-                                .frame(width: 58, alignment: .leading)
-                            MeterTrack(z: model.meterZ[m], hasRange: model.baselineStats?[m] != nil,
-                                       outside: model.diffMetrics[m] != nil)
-                                .frame(height: 12)
-                        }
-                        .opacity(m.isFace && !model.faceReadable ? 0.35 : 1)
-                    }
+        VStack(spacing: 3) {
+            ForEach(Metric.allCases, id: \.self) { m in
+                HStack(spacing: 6) {
+                    Circle().fill(m.color).frame(width: 8, height: 8)
+                    Text(m.label).font(.footnote).lineLimit(1).minimumScaleFactor(0.7)
+                        .frame(width: 84, alignment: .leading)
+                    MeterTrack(z: model.meterZ[m], hasRange: model.baselineStats?[m] != nil,
+                               outside: model.diffMetrics[m] != nil)
+                        .frame(minHeight: 12, maxHeight: 26)
                 }
+                .frame(maxHeight: .infinity)
+                .opacity(m.isFace && !model.faceReadable ? 0.35 : 1)
             }
         }
+        .frame(maxHeight: .infinity)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("指標ごとのメーター")
     }
@@ -270,6 +279,7 @@ struct NumbersPage: View {
             stat("音量 dB", model.rmsDb.map { String(format: "%.0f", $0) })
             stat("声の高さ Hz", model.f0Hz.map { String(format: "%.0f", $0) })
             stat("カメラ", model.lensInUse?.label)
+            stat("探す顔の数", "\(model.maxFaces)")
         }
         .padding(10)
         .frame(maxHeight: .infinity, alignment: .top)

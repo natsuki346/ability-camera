@@ -65,6 +65,7 @@ struct SettingsView: View {
     @AppStorage("role") private var role = ""
     @AppStorage("deviceName") private var deviceName = ""
     @AppStorage("sendVideo") private var sendVideo = false
+    @AppStorage("useSavedBaseline") private var useSavedBaseline = false
     @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
     @AppStorage("baselineSeconds") private var baselineSeconds = AnalysisModel.defaultBaselineSeconds
     @State private var allowed = AllowedViewers.all()
@@ -106,6 +107,12 @@ struct SettingsView: View {
                     } header: { Text("普段の長さ") } footer: {
                         Text("初めは30秒。顔が映っていて横を向きすぎていない時間がこの秒数になったら、普段を記録し終えます。普段を記録している途中に変えると、今の記録にすぐ使います（数えた分はそのまま）。記録し終えたあとに変えると、次に普段を記録するとき（取り直す・次のセッション）から使います。使った長さは記録の baseline 行（target_s）に書きます")
                     }
+                    Section {
+                        Toggle("保存した普段ですぐ始める", isOn: $useSavedBaseline)
+                    } footer: {
+                        Text("初めはオフ。オンにすると、選んだ人の保存した普段があり、カメラが同じときは、開いてすぐその普段で「いつもとの違い」を出し始めます。今日の普段もうしろで記録します（記録し終えても、比べる相手は自動では切り替えません）。前に保存した普段がその日にも使えるかはまだ分からないので、記録には両方を書き、振り返りレポートの --compare-saved で比べます")
+                    }
+                    PeopleSettingsSection()
                     Section {
                         Toggle("見る側に映像も送る", isOn: $sendVideo)
                     } footer: {

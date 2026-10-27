@@ -9,6 +9,8 @@ struct ContentView: View {
     @State private var cameraLarge = false
     @State private var showSettings = false
     @State private var middlePage = 0
+    @State private var showPeople = false
+    @ObservedObject private var people = PersonStore.shared
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
 
     static let sketchSize: CGFloat = 140
@@ -30,6 +32,8 @@ struct ContentView: View {
         .padding(.bottom, 8)
         .overlay { if cameraLarge { largeCamera } }
         .sheet(isPresented: $showSettings) { SettingsView(link: model.link) }
+        .sheet(isPresented: $showPeople) { PersonPickerView() }
+        .onChange(of: people.selectedID) { model.personChanged() }
     }
 
     /// 上：左に ≡、真ん中に「記録中 12分34秒」、右に歯車
@@ -46,30 +50,40 @@ struct ContentView: View {
                     .accessibilityLabel("設定")
             }
         }
-        .foregroundStyle(Self.navy)
+        .foregroundStyle(Self.navyText)
     }
 
-    /// いつも出す：記録中かどうかと経過時間
+    /// いつも出す：記録中かどうかと経過時間。下に小さく選んでいる人（タップで変える）
     private var recordingBanner: some View {
-        Group {
-            if model.running, let since = model.sessionStartedAt {
-                TimelineView(.periodic(from: since, by: 1)) { ctx in
-                    Label("記録中 \(Self.duration(ctx.date.timeIntervalSince(since)))", systemImage: "record.circle")
-                        .monospacedDigit()
+        Button { showPeople = true } label: {
+            VStack(spacing: 1) {
+                Group {
+                    if model.running, let since = model.sessionStartedAt {
+                        TimelineView(.periodic(from: since, by: 1)) { ctx in
+                            Label("記録中 \(Self.duration(ctx.date.timeIntervalSince(since)))", systemImage: "record.circle")
+                                .monospacedDigit()
+                        }
+                    } else {
+                        Label("記録の準備中…", systemImage: "hourglass")
+                    }
                 }
-            } else {
-                Label("記録の準備中…", systemImage: "hourglass")
+                .font(.callout.bold())
+                Text("\(people.selected?.displayName ?? "人を選んでいません") ▾")
+                    .font(.caption2)
             }
+            .foregroundStyle(Self.navy)
+            .lineLimit(1)
+            .padding(.horizontal, 14).padding(.vertical, 5)
+            .background(Self.paleSlate, in: Capsule())   // 薄い青灰
         }
-        .font(.callout.bold())
-        .foregroundStyle(Self.navy)
-        .lineLimit(1)
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(Self.paleSlate, in: Capsule())   // 薄い青灰
+        .buttonStyle(.plain)
+        .accessibilityHint("タップで人を選ぶ")
     }
 
     static let navy = Color(red: 0x1F / 255, green: 0x3A / 255, blue: 0x5F / 255)   // 濃紺
     static let paleSlate = Color(red: 0xDC / 255, green: 0xE3 / 255, blue: 0xEA / 255)   // 薄い青灰
+    /// 文字の濃紺。ダークモードでは読めないので、明るい青灰にする（ライトモードは濃紺のまま）
+    static let navyText = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(paleSlate) : UIColor(navy) })
 
     static func duration(_ s: Double) -> String {
         let n = Int(s.rounded())

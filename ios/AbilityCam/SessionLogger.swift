@@ -72,11 +72,12 @@ struct BaselineRecord: Encodable {
     let warmupS: Double         // 開いてからこの秒数は数えない（ポケットに入れる間）
     let minN: Int
     let targetS: Double         // 普段の長さ（数えた時間がこの秒数になったら記録し終える。撮る側の設定、v0.9〜）
+    let blinkMasked: Bool       // 目を細めるの普段から、まばたき（と前後0.2秒）のコマを外した（v1.0〜。振り返りレポートは数え直さない）
     let metrics: [String: Stat]
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
-        case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", metrics
+        case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics
     }
 }
 

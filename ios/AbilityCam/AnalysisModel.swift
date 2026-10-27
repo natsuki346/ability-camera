@@ -80,11 +80,13 @@ final class AnalysisModel: ObservableObject {
     private var lastValidHost: CFTimeInterval = -.infinity
     private var sessionStartHost: CFTimeInterval = 0
     private var stats: [Metric: Welford] = [:]
-    private var smooth: [Metric: Smoother] = [:]
-    private var lastAudioAt: CFTimeInterval = 0
+    private var engine = DiffEngine()                         // いつもとの違い（振り返りレポートと同じ決まり）
+    private var lastAudioAt: CFTimeInterval = 0               // 普段に数えた最後の音
+    private var lastAudioAtEngine: CFTimeInterval = 0         // 違いの判定に入れた最後の音
+    private var lastBlinkT = -Double.infinity                 // 最後にまばたき（eyeBlink ≥ 0.3）があった撮影時刻
+    private var squintPending: [(t: Double, x: Double)] = []  // 普段に数える前の目を細めるの値（後ろ 0.2秒にまばたきが無いか待つ）
     private var recentFace: [(t: Double, face: Bool)] = []   // 直近1秒のコマ
     private var lastChange: (diffs: [String], faceReadable: Bool)?
-    private var diffSince: [String: CFTimeInterval] = [:]     // 違いが出ている間の開始時刻（続いている秒数を出す）
     private var liveZ: [String: Double] = [:]                 // 見る側へ：指標ごとの今の z
     private var liveDiffs: [LiveDiff] = []                    // 見る側へ：違いの一覧（指標・向き・秒数）
     private var diffCount = 0                                 // このセッションで違いが出た回数（segments と同じ数え方）
@@ -287,7 +289,8 @@ final class AnalysisModel: ObservableObject {
         faceShape = nil; shapeSmooth = [:]; lastShapeT = -.infinity
         points = []
         startHost = CACurrentMediaTime()
-        smooth = [:]; lastAudioAt = 0; recentFace = []
+        lastAudioAt = 0; lastAudioAtEngine = 0; recentFace = []
+        lastBlinkT = -.infinity; squintPending = []
         faceReadable = true
         head.reset()   // カメラを止めていた間の向きは分からないので、今から数え直す（最初に決まった向きは記録しない）
     }
@@ -390,12 +393,15 @@ final class AnalysisModel: ObservableObject {
         baselineTarget = Self.selectedBaselineSeconds
         baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []
         lastChange = nil
-        diffSince = [:]
+        squintPending = []
+        engine.setBaseline(nil)   // 普段が無い間は比べない
+        engine.finished = []
         liveZ = [:]; liveDiffs = []
         link.baseline = nil   // 見る側の「いつもの範囲」も消す（記録し終えたら、また送る）
     }
 
     private func finishBaseline(now: CFTimeInterval) {
+        squintPending = []   // 後ろ 0.2秒を確かめられなかった分は数えない
         var out: [String: BaselineRecord.Stat] = [:]
         for m in Metric.allCases {
             let w = stats[m] ?? Welford()
@@ -408,11 +414,22 @@ final class AnalysisModel: ObservableObject {
                                     wallS: ((now - baselineStartHost) * 10).rounded() / 10,
                                     validS: (baselineValidS * 10).rounded() / 10,
                                     yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
-                                    minN: Self.minSamples, targetS: baselineTarget, metrics: out))
+                                    minN: Self.minSamples, targetS: baselineTarget, blinkMasked: true, metrics: out))
         insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
+        engine.setBaseline(Self.engineBaseline(out))
         baselineSec = nil; baselineWait = nil
         baselineReady = true
         link.baseline = LiveBaseline(startedMs: baselineStartMs, tMs: Self.nowMs(), metrics: out)   // 見る側へ1回
+    }
+
+    /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない
+    static func engineBaseline(_ metrics: [String: BaselineRecord.Stat]) -> [Metric: DiffEngine.Stat] {
+        var b: [Metric: DiffEngine.Stat] = [:]
+        for m in Metric.allCases {
+            guard let st = metrics[m.rawValue] else { continue }
+            b[m] = DiffEngine.stat(for: m, mean: st.mean, std: st.std, insufficient: st.insufficient)
+        }
+        return b
     }
 
     private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64) {
@@ -453,6 +470,29 @@ final class AnalysisModel: ObservableObject {
             lastShapeT = captureT
         }
 
+        // いつもとの違い：全コマで判定する（振り返りレポートと同じ。目を細めるのまばたきを外すため 0.2秒遅れて進む）
+        let blink = r.face ? Double(((r.blendshapes["eyeBlinkLeft"] ?? 0) + (r.blendshapes["eyeBlinkRight"] ?? 0)) / 2) : nil
+        let epochT = Double(tMs) / 1000
+        if (blink ?? 0) >= DiffCriteria.blinkThreshold {
+            lastBlinkT = epochT
+            squintPending.removeAll { $0.t >= epochT - DiffCriteria.blinkPadS }   // 前 0.2秒の値も普段に数えない
+        }
+        if !squintPending.isEmpty {   // 後ろ 0.2秒にまばたきが無かった値だけ、普段に数える
+            let ready = squintPending.filter { $0.t < epochT - DiffCriteria.blinkPadS }
+            if !ready.isEmpty {
+                for p in ready { stats[.eyeSquint, default: Welford()].add(p.x) }
+                squintPending.removeFirst(ready.count)
+            }
+        }
+        var engineVoice: [Metric: Double] = [:]
+        if a.at > lastAudioAtEngine {   // 同じ音の結果を二度入れない
+            lastAudioAtEngine = a.at
+            if let db = a.rmsDb { engineVoice[.rmsDb] = Double(db) }
+            if let f0 = a.f0Hz { engineVoice[.f0Hz] = Double(f0) }
+        }
+        engine.add(DiffInput(t: epochT, face: r.face, yaw: r.pose?.yaw, faceValues: Self.faceValues(r), blink: blink,
+                             voice: engineVoice))
+
         let t = captureT - startHost
         guard frames % 3 == 0 else { return }   // 画面の更新は 1/3 に間引く（記録は全コマ）
 
@@ -466,16 +506,7 @@ final class AnalysisModel: ObservableObject {
         f0Hz = a.f0Hz
 
         // 今の値
-        func avg(_ a: String, _ b: String) -> Double {
-            Double(((r.blendshapes[a] ?? 0) + (r.blendshapes[b] ?? 0)) / 2)
-        }
-        var faceValues: [Metric: Double] = [:]
-        if r.face {
-            faceValues[.mouthSmile] = avg("mouthSmileLeft", "mouthSmileRight")
-            faceValues[.browDown] = avg("browDownLeft", "browDownRight")
-            faceValues[.eyeSquint] = avg("eyeSquintLeft", "eyeSquintRight")
-            faceValues[.jawOpen] = Double(r.blendshapes["jawOpen"] ?? 0)
-        }
+        let faceValues = Self.faceValues(r)
         var voiceValues: [Metric: Double] = [:]
         if a.at > lastAudioAt {   // 同じ音の結果を二度数えない
             lastAudioAt = a.at
@@ -498,13 +529,16 @@ final class AnalysisModel: ObservableObject {
             baselineLastT = captureT
             if valid { lastValidHost = now }
         }
-        for (m, x) in faceValues {
-            smooth[m, default: Smoother()].add(x, at: captureT)
-            if valid { stats[m, default: Welford()].add(x) }
-        }
-        for (m, x) in voiceValues {
-            smooth[m, default: Smoother()].add(x, at: a.at)
-            if valid { stats[m, default: Welford()].add(x) }
+        if valid {
+            for (m, x) in faceValues {
+                if m == .eyeSquint {
+                    // まばたき（と前後 0.2秒）のコマは普段に数えない。後ろ 0.2秒を確かめてから数える
+                    if epochT - lastBlinkT > DiffCriteria.blinkPadS { squintPending.append((epochT, x)) }
+                } else {
+                    stats[m, default: Welford()].add(x)
+                }
+            }
+            for (m, x) in voiceValues { stats[m, default: Welford()].add(x) }
         }
         if faceReadable != readable { faceReadable = readable }
         faceShape = readable && !shapeSmooth.isEmpty ? shapeSmooth : nil
@@ -529,7 +563,7 @@ final class AnalysisModel: ObservableObject {
                 if baselineWait != wait { baselineWait = wait }
             }
         }
-        if running && baselineReady { updateDifferences(now: now, faceReadable: readable) }
+        if running && baselineReady { updateDifferences(latestT: epochT, faceReadable: readable) }
         sendLive(r, now: now, readable: readable, values: faceValues, audio: a)
         adjustVideo(now: now)
 
@@ -595,26 +629,28 @@ final class AnalysisModel: ObservableObject {
             head: head.state?.rawValue))
     }
 
-    /// z =（ならした今の値 − 普段の平均）÷ max(普段の標準偏差, 下限)
-    private func updateDifferences(now: CFTimeInterval, faceReadable: Bool) {
-        var messages: [String] = [], keys: [String] = []
-        var zs: [String: Double] = [:], items: [LiveDiff] = []
-        for m in Metric.allCases {
-            if m.isFace && !faceReadable { continue }
-            guard let w = stats[m], w.n >= Self.minSamples,
-                  let s = smooth[m], s.fresh(now: now), let v = s.value else { continue }
-            let z = (v - w.mean) / max(w.std, m.stdFloor)
-            zs[m.rawValue] = (z * 100).rounded() / 100
-            if let msg = m.message(z: z), let key = m.diffKey(z: z) {
-                let since = diffSince[key] ?? now
-                diffSince[key] = since
-                messages.append("\(msg)（\(Int(now - since))秒）"); keys.append(key)
-                items.append(LiveDiff(metric: m.rawValue, above: z > 0, seconds: Int(now - since)))
-            }
+    /// アプリと同じ式（左右の平均）。顔が無いときは空
+    static func faceValues(_ r: FaceAnalyzer.Result) -> [Metric: Double] {
+        guard r.face else { return [:] }
+        func avg(_ a: String, _ b: String) -> Double {
+            Double(((r.blendshapes[a] ?? 0) + (r.blendshapes[b] ?? 0)) / 2)
         }
-        diffSince = diffSince.filter { keys.contains($0.key) }
+        return [.mouthSmile: avg("mouthSmileLeft", "mouthSmileRight"),
+                .browDown: avg("browDownLeft", "browDownRight"),
+                .eyeSquint: avg("eyeSquintLeft", "eyeSquintRight"),
+                .jawOpen: Double(r.blendshapes["jawOpen"] ?? 0)]
+    }
+
+    /// DiffEngine が判定した違いを、画面・見る側・記録の change に出す。
+    /// z =（0.3秒でならした今の値 − 普段の平均）÷ max(普段の標準偏差, 下限)。|z| ≥ 2 が 0.5秒続いたら違い、|z| < 1.5 が 0.5秒で終わり
+    private func updateDifferences(latestT: Double, faceReadable: Bool) {
+        engine.finished.removeAll()
+        let shown = Metric.allCases.compactMap { engine.active[$0] }.filter(\.shown)
+        let messages = shown.map { "\($0.message)（\(Int(max(0, latestT - $0.startT)))秒）" }
+        let keys = shown.map(\.key)
         if differences != messages { differences = messages }
-        liveZ = zs; liveDiffs = items
+        liveZ = Dictionary(uniqueKeysWithValues: engine.z.map { ($0.key.rawValue, ($0.value * 100).rounded() / 100) })
+        liveDiffs = shown.map { LiveDiff(metric: $0.metric.rawValue, above: $0.above, seconds: Int(max(0, latestT - $0.startT))) }
 
         if lastChange == nil || lastChange!.diffs != keys || lastChange!.faceReadable != faceReadable {
             diffCount += Set(keys).subtracting(lastChange?.diffs ?? []).count

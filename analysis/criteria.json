@@ -26,7 +26,7 @@
       "reason": "research_composite の groups から [noseSneer, mouthUpperUp] を外し、browDown ／ max(cheekSquint, eyeSquint) ／ 目を閉じている間の eyeBlink の3つにした。わざと動かす記録（3分37秒）で、noseSneer は鼻にしわを寄せてもずっと 0（MediaPipe では AU9 が取れない）、mouthUpperUp は声を出す・口を開ける動きで上がったため。あわせて、記録全体で最大値が 0.01 未満の表情の数値を「記録の質」に出すようにした（docs/validation-log.md）。"
     }
   ],
-  "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor はアプリと同じ値（rms_db だけ、2026-10-27 からレポートは 6dB・アプリは 2dB のまま）。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
+  "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
   "std_floor": {
     "mouth_smile": 0.03,
     "brow_down": 0.03,

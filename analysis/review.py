@@ -343,6 +343,7 @@ class Analysis:
     z: dict[str, np.ndarray] = field(default_factory=dict)
     judge: dict[str, np.ndarray] = field(default_factory=dict)   # 判定したコマ
     segments: list[Segment] = field(default_factory=list)
+    weak_segments: list[Segment] = field(default_factory=list)  # 表情の「いつもより弱い」（face_below_counts=false のとき、違いに数えない）
     shorts: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     usable: dict[str, bool] = field(default_factory=dict)        # 普段にデータがあったか（insufficient でない）
 
@@ -371,9 +372,14 @@ def analyze(rec: Recording, c: dict) -> Analysis:
         segs, shorts = detect(t, a.z[m], ok, mc)
         for s in segs:
             s.metric = m
+        if m in FACE_METRICS and not c.get("face_below_counts", False):
+            # アプリは表情の「いつもより強い」だけを違いとして出すので、弱い方は参考として別にする
+            a.weak_segments += [x for x in segs if x.sign < 0]
+            segs = [x for x in segs if x.sign > 0]
         a.segments += segs
         a.shorts[m] = shorts
     a.segments.sort(key=lambda s: (t[s.i0], METRICS.index(s.metric)))
+    a.weak_segments.sort(key=lambda s: (t[s.i0], METRICS.index(s.metric)))
     return a
 
 
@@ -519,13 +525,13 @@ def frame_dt(t: np.ndarray, cap=1.0) -> np.ndarray:
     return np.clip(d, 0, cap)
 
 
-def segment_rows(a: Analysis) -> list[dict]:
+def segment_rows(a: Analysis, segs: list[Segment] | None = None, kind: str = "違い") -> list[dict]:
     rec, t = a.rec, a.rec.t
     scenes = scene_intervals(rec, t[-1])
     mk = marks(rec)
     w = a.criteria["mark_window_s"]
     rows = []
-    for s in a.segments:
+    for s in (a.segments if segs is None else segs):
         t0, t1 = t[s.i0], t[s.i1]
         b = rec.baselines[a.bidx[s.i0]]["metrics"][s.metric]
         sl = slice(s.i0, s.i1 + 1)
@@ -541,7 +547,7 @@ def segment_rows(a: Analysis) -> list[dict]:
             "前後の家族の印": "、".join(near) or "なし",
             "顔が映っていた割合": round(float(rec.face[sl].mean()), 2),
             "yawの平均": round(float(np.nanmean(yaw)), 1) if np.isfinite(yaw).any() else "",
-            "備考": s.truncated,
+            "備考": s.truncated, "区分": kind,
         })
     return rows
 
@@ -554,6 +560,8 @@ def criteria_lines(c: dict) -> list[str]:
         mc = c["metrics"][m]
         out.append(f"{m}: ならし {mc['smooth_s']}秒 / 開始 |z|≥{mc['start_z']} が {mc['start_min_s']}秒以上 / "
                    f"終了 |z|<{mc['end_z']} が {mc['end_min_s']}秒 / std下限 {c['std_floor'][m]}")
+    out.append("表情の「いつもより弱い」区間：" + ("区間に数える" if c.get("face_below_counts", False)
+               else "区間・通知候補・10分あたりには数えず、「表情の弱い方への変化（参考）」として別に出す（アプリと同じ。face_below_counts=false）"))
     fv = c["face_valid"]
     out.append(f"表情の判定条件: 直近{fv['window_s']}秒で顔が映るコマ≥{fv['min_face_ratio']:.0%}、|yaw|<{fv['max_abs_yaw_deg']}°")
     out.append(f"{a_short(c)}秒未満で |z|≥開始値 になったものは「短い動き」として区間とは別に数える")
@@ -571,7 +579,7 @@ def a_short(c: dict) -> str:
 
 
 def write_csv(path: Path, rows: list[dict], c: dict) -> None:
-    cols = ["開始", "終了", "長さ_秒", "指標", "指標名", "向き", "ピークのz", "普段の平均", "ピークの値",
+    cols = ["区分", "開始", "終了", "長さ_秒", "指標", "指標名", "向き", "ピークのz", "普段の平均", "ピークの値",
             "場面", "前後の家族の印", "顔が映っていた割合", "yawの平均", "備考"]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         for line in criteria_lines(c):
@@ -669,7 +677,7 @@ def quality(a: Analysis, calm: bool) -> dict:
     for m in METRICS:
         n = sum(1 for s in a.segments if s.metric == m)
         ns = len(a.shorts[m])
-        per[m] = (n, ns)
+        per[m] = (n, ns, sum(1 for s in a.weak_segments if s.metric == m))
     total = sum(v[0] for v in per.values())
     q["rates"] = {"minutes": minutes, "per_metric": per, "total": total,
                   "per_min": total / minutes if minutes > 0 else None,
@@ -709,6 +717,7 @@ def compare_baselines(rec: Recording, c: dict, lengths: list[float]) -> list[dic
                      "baselines": "、".join(jst(b["t_ms"] / 1000) for b in r.baselines) or "作れなかった（数えた時間が足りない）",
                      "judged_s": judged, "total": total, "shorts": sum(len(v) for v in a.shorts.values()),
                      "per_metric": {m: sum(1 for x in a.segments if x.metric == m) for m in METRICS},
+                     "weak": len(a.weak_segments),
                      "per_10min": total / (judged / 60) * 10 if judged > 0 else None})
     return rows
 
@@ -978,15 +987,19 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
 
     # 区間の数（--calm では、何もしていない記録で区間が多すぎないかの目安）
     r = q["rates"]
-    rrows = [[m, LABEL[m], r["per_metric"][m][0], r["per_metric"][m][1]] for m in METRICS]
-    rrows.append(["合計", "", r["total"], sum(v[1] for v in r["per_metric"].values())])
+    weak_on = not c.get("face_below_counts", False)
+    rrows = [[m, LABEL[m], r["per_metric"][m][0], r["per_metric"][m][1]]
+             + ([r["per_metric"][m][2] if m in FACE_METRICS else "–"] if weak_on else []) for m in METRICS]
+    rrows.append(["合計", "", r["total"], sum(v[1] for v in r["per_metric"].values())]
+                 + ([sum(v[2] for v in r["per_metric"].values())] if weak_on else []))
     head = "<h2>区間の数" + ("（何もしていない記録：多すぎないかの目安）" if r["calm"] else "") + "</h2>"
     rate = ("–" if r["per_min"] is None else
             f"判定した {r['minutes']:.1f}分 で {r['total']}件 = 1分あたり {r['per_min']:.2f}件 / 10分あたり {r['per_10min']:.1f}件")
     if r["calm"] and r["per_10min"] is not None:
         verdict = "目安以内" if r["per_10min"] <= r["target"] else "目安を超えています"
         rate += f"（目安：10分に{r['target']:g}回以下 → {verdict}）"
-    parts.append(head + f"<p>{e(rate)}</p>" + table(["指標", "", "区間", "短い動き"], rrows))
+    parts.append(head + f"<p>{e(rate)}</p>"
+                 + table(["指標", "", "区間", "短い動き"] + (["表情の弱い方への変化（参考）"] if weak_on else []), rrows))
 
     # 普段の長さの比べ
     if q.get("compare"):
@@ -995,12 +1008,14 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         for x in q["compare"]:
             crow.append([x["label"], x["baselines"], fmt_s(x["judged_s"]), x["total"], x["shorts"]]
                         + [x["per_metric"][m] for m in METRICS]
+                        + ([x["weak"]] if weak_on else [])
                         + (["–" if x["per_10min"] is None else f"{x['per_10min']:.1f}"] if calm else []))
         parts.append("<h2>普段の長さの比べ（--compare-baseline）</h2>"
                      "<p class=note>同じ記録について、普段を記録の中の1コマごとの値から指定の長さで作り直し、区間を数え直したものです"
                      "（普段に数えるコマの条件はアプリと同じ）。普段が短いほど早く判定を始めるので、判定した時間も変わります。"
                      "基準（criteria.json）はどれも同じです。</p>"
                      + table(["普段", "普段を記録し終えた時刻", "判定した時間", "区間", "短い動き"] + [LABEL[m] for m in METRICS]
+                             + (["表情の弱い方への変化（参考）"] if weak_on else [])
                              + (["10分あたりの区間"] if calm else []), crow))
 
     # 印との対応
@@ -1051,6 +1066,16 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     parts.append(f"<h2>区間の一覧（{len(rows)}件）</h2><p class=sub>CSV：{e(csv_name)}</p>"
                  + (table([k if k != "普段の平均" else "普段の平均 → ピークの値" for k in cols if k != "ピークの値"], body)
                     if rows else "<p>区間はありません。</p>"))
+    if weak_on:
+        wrows = segment_rows(a, a.weak_segments, "参考（表情の弱い方）")
+        wbody = [[rw[k] if k != "普段の平均" else f"{rw['普段の平均']:g} → {rw['ピークの値']:g}"
+                  for k in cols if k != "ピークの値"] for rw in wrows]
+        parts.append(f"<h2>表情の弱い方への変化（参考）（{len(wrows)}件）</h2>"
+                     "<p class=note>表情の指標が、いつもより弱い方へ外れた区間です。アプリは表情の「いつもより強い」だけを違いとして出すので、"
+                     "揃えて区間・通知候補・10分あたりの数には入れていません（criteria.json の face_below_counts で変えられます）。"
+                     "CSV には「区分」が「参考（表情の弱い方）」の行として入っています。</p>"
+                     + (table([k if k != "普段の平均" else "普段の平均 → ピークの値" for k in cols if k != "ピークの値"], wbody)
+                        if wrows else "<p>ありません。</p>"))
 
     css = """
     :root{--fg:#1a1a1a;--sub:#666;--bg:#fff;--line:#ddd}
@@ -1110,6 +1135,7 @@ def main(argv=None) -> int:
         rec = with_baseline(rec, args.baseline_s)
     a = analyze(rec, c)
     rows = segment_rows(a)
+    weak_rows = segment_rows(a, a.weak_segments, "参考（表情の弱い方）")
     q = quality(a, args.calm)
     if compare_rows:
         q["compare"] = compare_rows
@@ -1121,9 +1147,10 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     csv_path = out / f"{args.jsonl.stem}_segments.csv"
     html_path = out / f"{args.jsonl.stem}.html"
-    write_csv(csv_path, rows, c)
+    write_csv(csv_path, rows + weak_rows, c)
     write_html(html_path, a, q, rows, csv_path.name)
-    print(f"区間 {len(rows)}件 → {html_path} / {csv_path}")
+    print(f"区間 {len(rows)}件" + (f"（ほかに表情の弱い方への変化 {len(weak_rows)}件、参考）" if weak_rows else "")
+          + f" → {html_path} / {csv_path}")
     return 0
 
 

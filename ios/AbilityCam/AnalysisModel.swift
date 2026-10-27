@@ -92,7 +92,7 @@ final class AnalysisModel: ObservableObject {
 
     static let chartWindow = 20.0
     static let baselineChoices = [30, 60] // 普段の長さ（数えた時間。時計の時間ではない）。撮る側の設定で選ぶ
-    static let defaultBaselineSeconds = 60
+    static let defaultBaselineSeconds = 30   // 2026-10-27 に60秒から変えた（docs/validation-log.md）
     /// 設定で選んだ普段の長さ（秒）
     static var selectedBaselineSeconds: Double {
         let v = UserDefaults.standard.integer(forKey: "baselineSeconds")

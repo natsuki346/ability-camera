@@ -274,6 +274,58 @@ class BaselineRebuildTest(unittest.TestCase):
         self.assertGreater(rows[1]["judged_s"], rows[2]["judged_s"])   # 短い普段ほど早く判定を始める
 
 
+class FaceBelowTest(unittest.TestCase):
+    """表情の「いつもより弱い」は、アプリと揃えて違いに数えず、参考として別に出す（face_below_counts=false）"""
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        cls.dir = tempfile.TemporaryDirectory()
+        out = []
+        for line in FIXTURE.read_text(encoding="utf-8").splitlines():
+            o = json.loads(line)
+            if o.get("type") == "baseline":
+                o["metrics"]["mouth_smile"]["std"] = 0.02          # 下限 0.03 → 0 にすると z≈−3.3
+            if o.get("type") == "frame" and o.get("bs") and 25 <= (o["t_ms"] / 1000 - T0) < 27:
+                o["bs"]["mouthSmileLeft"] = o["bs"]["mouthSmileRight"] = 0.0
+            out.append(json.dumps(o, ensure_ascii=False))
+        cls.path = Path(cls.dir.name) / "weak.jsonl"
+        cls.path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        cls.rec = review.load(cls.path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def test_not_counted_by_default(self):
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        self.assertFalse(c["face_below_counts"])
+        a = review.analyze(self.rec, c)
+        self.assertEqual([(s.metric, s.sign) for s in a.weak_segments], [("mouth_smile", -1)])
+        self.assertNotIn("mouth_smile", [s.metric for s in a.segments])
+        q = review.quality(a, calm=True)
+        self.assertEqual(q["rates"]["total"], 5)                  # 10分あたりにも入れない（元の5件のまま）
+        self.assertEqual(q["rates"]["per_metric"]["mouth_smile"][2], 1)
+        self.assertEqual([x["weak"] for x in review.compare_baselines(self.rec, c, [])], [1])
+
+    def test_counted_when_enabled(self):
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        c["face_below_counts"] = True
+        a = review.analyze(self.rec, c)
+        self.assertEqual(a.weak_segments, [])
+        self.assertIn(("mouth_smile", -1), [(s.metric, s.sign) for s in a.segments])
+
+    def test_outputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            review.main([str(self.path), "--calm", "--out-dir", d])
+            doc = (Path(d) / "weak.html").read_text(encoding="utf-8")
+            self.assertIn("表情の弱い方への変化（参考）（1件）", doc)
+            self.assertIn("face_below_counts=false", doc)
+            csv_text = (Path(d) / "weak_segments.csv").read_text(encoding="utf-8-sig")
+            self.assertIn("参考（表情の弱い方）", csv_text)
+            self.assertIn("違い,", csv_text)
+
+
 class CandidateTest(unittest.TestCase):
     """作った区間を与えて、通知候補の条件 A・B・C と場面の振り分けを見る（fixture の時刻を使う）"""
 

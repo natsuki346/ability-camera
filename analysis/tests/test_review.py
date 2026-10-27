@@ -326,6 +326,83 @@ class FaceBelowTest(unittest.TestCase):
             self.assertIn("違い,", csv_text)
 
 
+class BlinkAndVoiceFloorTest(unittest.TestCase):
+    """目を細める：まばたきのコマ（と前後0.2秒）は判定対象外・普段にも数えない。声の大きさ：std の下限 6dB"""
+
+    BLINKS = [7.0, 8.5, 33.0, 36.0]   # 7・8.5 は普段（0–10）の中
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        cls.dir = tempfile.TemporaryDirectory()
+        out = []
+        for line in FIXTURE.read_text(encoding="utf-8").splitlines():
+            o = json.loads(line)
+            if o.get("type") == "frame" and o.get("bs"):
+                ts = o["t_ms"] / 1000 - T0
+                for b in cls.BLINKS:
+                    if b - 0.15 <= ts < b + 0.3:            # 目を細める数値が、まばたきの前後で高くなる（外す範囲の内側）
+                        o["bs"]["eyeSquintLeft"] = o["bs"]["eyeSquintRight"] = 0.4
+                    if b <= ts < b + 0.2:                  # まばたき
+                        o["bs"]["eyeBlinkLeft"] = o["bs"]["eyeBlinkRight"] = 0.8
+            out.append(json.dumps(o, ensure_ascii=False))
+        cls.path = Path(cls.dir.name) / "blink.jsonl"
+        cls.path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        cls.rec = review.load(cls.path)
+        cls.c = review.load_criteria(review.HERE / "criteria.json", [])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def test_criteria(self):
+        self.assertEqual(self.c["metrics"]["eye_squint"]["blink_mask"], {"threshold": 0.3, "pad_s": 0.2})
+        self.assertEqual(self.c["std_floor"]["rms_db"], 6.0)
+
+    def test_mask_frames(self):
+        m = review.blink_mask(self.rec, self.c)
+        rel = self.rec.t - T0
+        self.assertTrue(m[np.searchsorted(rel, 33.0)] and m[np.searchsorted(rel, 32.85)] and m[np.searchsorted(rel, 33.3)])
+        self.assertFalse(m[np.searchsorted(rel, 32.7)] or m[np.searchsorted(rel, 33.5)])
+
+    def test_no_eye_squint_segments_with_mask(self):
+        a = review.analyze(self.rec, self.c)
+        self.assertEqual([s for s in a.segments if s.metric == "eye_squint"], [])
+        import copy
+        c2 = copy.deepcopy(self.c)
+        del c2["metrics"]["eye_squint"]["blink_mask"]
+        a2 = review.analyze(self.rec, c2)
+        starts = [round(self.rec.t[s.i0] - T0) for s in a2.segments if s.metric == "eye_squint"]
+        self.assertEqual(starts, [33, 36])                # 外さなければ、まばたきの前後が区間になる
+
+    def test_baseline_without_blinks(self):
+        a = review.analyze(self.rec, self.c)
+        b = a.rec.baselines[0]
+        self.assertTrue(b["blink_masked"])
+        self.assertEqual(b["metrics"]["eye_squint"]["mean"], 0.1)    # まばたきの前後（0.4）は数えていない
+        self.assertEqual(b["eye_squint_app"]["mean"], 0.1)          # アプリの値は残す
+        self.assertFalse(b["metrics"]["eye_squint"]["insufficient"])
+        r = review.rebuild_baselines(self.rec, 30, self.c)[0]["metrics"]["eye_squint"]
+        r0 = review.rebuild_baselines(self.rec, 30)[0]["metrics"]["eye_squint"]
+        self.assertEqual(r["mean"], 0.1)
+        self.assertGreater(r0["mean"], 0.1)
+        self.assertLess(r["n"], r0["n"])
+
+    def test_voice_floor(self):
+        a = review.analyze(self.rec, self.c)
+        i = int(np.searchsorted(self.rec.t, T0 + 71.4))
+        self.assertAlmostEqual(a.z["rms_db"][i], (-30 + 50) / 6, delta=0.1)   # std 3dB → 下限 6dB で割る
+
+    def test_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            review.main([str(self.path), "--out-dir", d])
+            doc = (Path(d) / "blink.html").read_text(encoding="utf-8")
+            self.assertIn("まばたき（eyeBlinkLeft/Right の平均）が 0.3 以上", doc)
+            self.assertIn("目を細めるだけ判定対象外だった時間（まばたき）", doc)
+            self.assertIn("まばたきを外して数え直し", doc)
+            self.assertIn("std下限 6", doc)
+
+
 class CandidateTest(unittest.TestCase):
     """作った区間を与えて、通知候補の条件 A・B・C と場面の振り分けを見る（fixture の時刻を使う）"""
 

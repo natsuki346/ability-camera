@@ -52,6 +52,7 @@ class Recording:
     face: np.ndarray                 # 顔が見つかったか
     raw: dict[str, np.ndarray]       # 指標ごとの値（無いコマは NaN）
     yaw: np.ndarray
+    blink: np.ndarray                # まばたき（eyeBlinkLeft/Right の平均、顔が無いコマは NaN）
     lat_ms: np.ndarray
     proc_ms: np.ndarray
     baselines: list[dict]
@@ -99,13 +100,15 @@ def load(path: Path) -> Recording:
 
     n = len(frames)
     raw = {m: np.full(n, np.nan) for m in METRICS}
-    yaw, lat, proc = (np.full(n, np.nan) for _ in range(3))
+    yaw, lat, proc, blink = (np.full(n, np.nan) for _ in range(4))
     face = np.zeros(n, bool)
     for i, o in enumerate(frames):
         if o.get("face") and o.get("bs"):
             face[i] = True
             for m, v in face_values(o["bs"]).items():
                 raw[m][i] = v
+            bs = o["bs"]
+            blink[i] = ((bs.get("eyeBlinkLeft") or 0) + (bs.get("eyeBlinkRight") or 0)) / 2
         if o.get("rms_db") is not None:
             raw["rms_db"][i] = o["rms_db"]
         if o.get("f0_hz") is not None:
@@ -116,7 +119,7 @@ def load(path: Path) -> Recording:
         p = o.get("proc_ms", -1)
         proc[i] = p if p is not None and p >= 0 else np.nan
     t = np.array([o["t_ms"] for o in frames], float) / 1000
-    return Recording(path, header, t, face, raw, yaw, lat, proc, baselines, events)
+    return Recording(path, header, t, face, raw, yaw, blink, lat, proc, baselines, events)
 
 
 # ---------------------------------------------------------------- 基準
@@ -196,7 +199,87 @@ def baseline_index(rec: Recording) -> np.ndarray:
 BASELINE_YAW_LIMIT, BASELINE_WARMUP_S, BASELINE_MIN_N = 35.0, 5.0, 30
 
 
-def rebuild_baselines(rec: Recording, target_s: float) -> list[dict]:
+def blink_mask(rec: Recording, c: dict | None) -> np.ndarray:
+    """eye_squint を判定対象外にするコマ：まばたき（eyeBlinkLeft/Right の平均）が threshold 以上のコマと、その前後 pad_s 秒。
+    criteria.json の metrics.eye_squint.blink_mask。無ければ（または c が None なら）外さない"""
+    bm = (c or {}).get("metrics", {}).get("eye_squint", {}).get("blink_mask") if c else None
+    out = np.zeros(len(rec.t), bool)
+    if not bm:
+        return out
+    hit = rec.t[np.nan_to_num(rec.blink, nan=0.0) >= bm["threshold"]]
+    if not len(hit):
+        return out
+    pos = np.searchsorted(hit, rec.t)
+    left = np.abs(rec.t - hit[np.clip(pos - 1, 0, len(hit) - 1)])
+    right = np.abs(hit[np.clip(pos, 0, len(hit) - 1)] - rec.t)
+    return np.minimum(left, right) <= bm["pad_s"] + 1e-9
+
+
+def baseline_candidates(rec: Recording) -> tuple[np.ndarray, np.ndarray, float]:
+    """アプリが普段を数えるときの、各コマの状態。
+    processed：アプリが数えるコマ（画面の更新に合わせて3コマに1コマ。カメラを止めた後＝1秒より空いた後は数え直す）
+    valid：普段に数える条件（直近1秒で顔が映るコマが半分以上・そのコマに顔がある・|yaw|<35°・開いてから5秒より後）
+    返り値：(processed, valid, 記録の始まりの時刻)"""
+    t = rec.t
+    start0 = rec.header.get("started_at_ms")
+    start0 = start0 / 1000 if start0 else float(t[0])
+    cum = np.concatenate([[0], np.cumsum(rec.face)])
+    lo = np.searchsorted(t, t - 1.0, side="left")
+    idx = np.arange(len(t))
+    readable = (cum[idx + 1] - cum[lo]) * 2 >= (idx + 1 - lo)
+    processed = np.zeros(len(t), bool)
+    k, prev = 0, None
+    for i in range(len(t)):
+        k = 1 if prev is None or t[i] - prev > 1.0 else k + 1
+        prev = t[i]
+        processed[i] = k % 3 == 0
+    with np.errstate(invalid="ignore"):
+        facing = np.abs(rec.yaw) < BASELINE_YAW_LIMIT
+    valid = processed & (t - start0 >= BASELINE_WARMUP_S) & readable & rec.face & facing
+    return processed, valid, start0
+
+
+def baseline_stat(x: np.ndarray) -> dict:
+    n = len(x)
+    st = {"n": n, "insufficient": n < BASELINE_MIN_N}
+    if n:
+        st["mean"] = round(float(x.mean()), 4)
+        st["std"] = round(float(x.std(ddof=1)) if n > 1 else 0.0, 4)
+    return st
+
+
+def mask_baselines_blink(rec: Recording, c: dict) -> tuple[list[dict], str | None]:
+    """アプリが記録した baseline 行の eye_squint は、まばたきのコマも入っている。
+    blink_mask があれば、その普段を集めた時間（started_ms〜t_ms）のコマから、まばたきのコマを外して eye_squint だけ数え直す。
+    返り値：(baseline 行, 数え直せなかった理由)"""
+    if not blink_mask_on(c) or not rec.baselines:
+        return rec.baselines, None
+    if not rec.has_pose:
+        return rec.baselines, "顔の向きが無い記録（v0.3 より前）なので、目を細めるの普段はまばたきを外さずに使っています"
+    processed, valid, _ = baseline_candidates(rec)
+    keep = valid & ~blink_mask(rec, c) & np.isfinite(rec.raw["eye_squint"])
+    out, missing = [], False
+    for b in rec.baselines:
+        if b.get("blink_masked"):
+            out.append(b)
+            continue
+        if b.get("started_ms") is None:
+            out.append(b); missing = True
+            continue
+        sel = keep & (rec.t >= b["started_ms"] / 1000) & (rec.t <= b["t_ms"] / 1000 + 1e-6)
+        nb = copy.deepcopy(b)
+        nb["metrics"]["eye_squint"] = baseline_stat(rec.raw["eye_squint"][sel])
+        nb["blink_masked"] = True
+        nb["eye_squint_app"] = b.get("metrics", {}).get("eye_squint")
+        out.append(nb)
+    return out, ("記録し始めた時刻が無い baseline 行は、目を細めるの普段をまばたきを外さずに使っています" if missing else None)
+
+
+def blink_mask_on(c: dict | None) -> bool:
+    return bool(c and c.get("metrics", {}).get("eye_squint", {}).get("blink_mask"))
+
+
+def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) -> list[dict]:
     """記録の中の1コマごとの値から、普段を target_s 秒（数えた時間）で作り直す。アプリと同じ条件：
     直近1秒で顔が映るコマが半分以上・そのコマに顔がある・|yaw|<35°・開いてから5秒より後。
     普段は記録の始まりと「普段を取り直す」（baseline_restart）から集め始める。
@@ -204,60 +287,43 @@ def rebuild_baselines(rec: Recording, target_s: float) -> list[dict]:
     数えた時間は、前に数えたコマからの幅（0.5秒で切る）を足していく。std は標本標準偏差。
     声は、そのコマに書かれている値を使う（アプリは新しく計算した音だけを数えるので、n は少しずれることがある）"""
     t = rec.t
-    start0 = rec.header.get("started_at_ms")
-    start0 = start0 / 1000 if start0 else float(t[0])
+    processed, valid_arr, start0 = baseline_candidates(rec)
     starts = sorted([start0] + [e["t_ms"] / 1000 for e in rec.events if e.get("kind") == "baseline_restart"])
-    cum = np.concatenate([[0], np.cumsum(rec.face)])
-    lo = np.searchsorted(t, t - 1.0, side="left")
-    idx = np.arange(len(t))
-    readable = (cum[idx + 1] - cum[lo]) * 2 >= (idx + 1 - lo)
+    blinked = blink_mask(rec, c)
 
     out: list[dict] = []
     period = -1
     vals: dict[str, list[float]] = {}
     valid_s, last, done = 0.0, None, False
-    k = 0                              # カメラを始めてからのコマ数（1コマ以上空いたら数え直す）
-    prev = None
     for i in range(len(t)):
         ti = float(t[i])
-        k = 1 if prev is None or ti - prev > 1.0 else k + 1
-        prev = ti
         p = int(np.searchsorted(starts, ti, side="right")) - 1
         if p != period:
             period, vals, valid_s, last, done = p, {m: [] for m in METRICS}, 0.0, None, False
-        if done or p < 0 or k % 3 != 0:
+        if done or p < 0 or not processed[i]:
             continue
-        y = rec.yaw[i]
-        valid = (ti - start0 >= BASELINE_WARMUP_S and bool(readable[i]) and bool(rec.face[i])
-                 and y == y and abs(y) < BASELINE_YAW_LIMIT)
+        valid = bool(valid_arr[i])
         if valid and last is not None and ti > last:
             valid_s += min(ti - last, 0.5)
         last = ti
         if valid:
             for m in METRICS:
                 v = rec.raw[m][i]
-                if v == v:
+                if v == v and not (m == "eye_squint" and blinked[i]):
                     vals[m].append(float(v))
         if valid_s >= target_s:
-            metrics = {}
-            for m in METRICS:
-                x = np.array(vals[m])
-                n = len(x)
-                metrics[m] = {"n": n, "insufficient": n < BASELINE_MIN_N}
-                if n:
-                    metrics[m]["mean"] = round(float(x.mean()), 4)
-                    metrics[m]["std"] = round(float(x.std(ddof=1)) if n > 1 else 0.0, 4)
             out.append({"type": "baseline", "t_ms": int(round(ti * 1000)), "started_ms": int(round(starts[p] * 1000)),
                         "wall_s": round(ti - starts[p], 1), "valid_s": round(valid_s, 1),
                         "yaw_limit_deg": BASELINE_YAW_LIMIT, "warmup_s": BASELINE_WARMUP_S, "min_n": BASELINE_MIN_N,
-                        "target_s": target_s, "rebuilt": True, "metrics": metrics})
+                        "target_s": target_s, "rebuilt": True, "blink_masked": blink_mask_on(c),
+                        "metrics": {m: baseline_stat(np.array(vals[m])) for m in METRICS}})
             done = True
     return out
 
 
-def with_baseline(rec: Recording, target_s: float) -> Recording:
+def with_baseline(rec: Recording, target_s: float, c: dict | None = None) -> Recording:
     r = copy.copy(rec)
-    r.baselines = rebuild_baselines(rec, target_s)
+    r.baselines = rebuild_baselines(rec, target_s, c)
     r.baseline_source = f"記録の中の1コマごとの値から {target_s:g}秒で作り直したもの（--baseline-s）"
     return r
 
@@ -346,10 +412,21 @@ class Analysis:
     weak_segments: list[Segment] = field(default_factory=list)  # 表情の「いつもより弱い」（face_below_counts=false のとき、違いに数えない）
     shorts: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     usable: dict[str, bool] = field(default_factory=dict)        # 普段にデータがあったか（insufficient でない）
+    blinked: np.ndarray | None = None                            # 目を細めるを判定対象外にした、まばたきのコマ
+    blink_note: str | None = None
 
 
 def analyze(rec: Recording, c: dict) -> Analysis:
+    # 目を細める：まばたきのコマ（と前後）は値を使わず、判定対象外にする。普段からも外す
+    blinked = blink_mask(rec, c)
+    note = None
+    if blink_mask_on(c):
+        rec = copy.copy(rec)
+        rec.raw = dict(rec.raw)
+        rec.raw["eye_squint"] = np.where(blinked, np.nan, rec.raw["eye_squint"])
+        rec.baselines, note = mask_baselines_blink(rec, c)
     a = Analysis(rec, c, baseline_index(rec), face_valid(rec, c))
+    a.blinked, a.blink_note = blinked, note
     t = rec.t
     for m in METRICS:
         mc = c["metrics"][m]
@@ -368,6 +445,8 @@ def analyze(rec: Recording, c: dict) -> Analysis:
         ok = np.isfinite(mean)
         if m in FACE_METRICS:
             ok &= a.fvalid
+        if m == "eye_squint":
+            ok &= ~blinked
         a.judge[m] = ok
         segs, shorts = detect(t, a.z[m], ok, mc)
         for s in segs:
@@ -562,6 +641,10 @@ def criteria_lines(c: dict) -> list[str]:
                    f"終了 |z|<{mc['end_z']} が {mc['end_min_s']}秒 / std下限 {c['std_floor'][m]}")
     out.append("表情の「いつもより弱い」区間：" + ("区間に数える" if c.get("face_below_counts", False)
                else "区間・通知候補・10分あたりには数えず、「表情の弱い方への変化（参考）」として別に出す（アプリと同じ。face_below_counts=false）"))
+    bm = c["metrics"]["eye_squint"].get("blink_mask")
+    if bm:
+        out.append(f"目を細める（eye_squint）：まばたき（eyeBlinkLeft/Right の平均）が {bm['threshold']:g} 以上のコマと前後 {bm['pad_s']:g}秒は"
+                   "判定対象外（普段にも数えない）")
     fv = c["face_valid"]
     out.append(f"表情の判定条件: 直近{fv['window_s']}秒で顔が映るコマ≥{fv['min_face_ratio']:.0%}、|yaw|<{fv['max_abs_yaw_deg']}°")
     out.append(f"{a_short(c)}秒未満で |z|≥開始値 になったものは「短い動き」として区間とは別に数える")
@@ -655,6 +738,10 @@ def quality(a: Analysis, calm: bool) -> dict:
     q["judged_s"] = float(dt[based].sum())
     q["excluded_s"] = float(dt[based & ~a.fvalid].sum())
     q["excluded_ratio"] = q["excluded_s"] / q["judged_s"] if q["judged_s"] > 0 else None
+    if a.blinked is not None and blink_mask_on(c):
+        bl = based & a.fvalid & a.blinked
+        q["blink_s"] = float(dt[bl].sum())
+        q["blink_ratio"] = q["blink_s"] / q["judged_s"] if q["judged_s"] > 0 else None
 
     yaw = rec.yaw[np.isfinite(rec.yaw)]
     if len(yaw):
@@ -708,7 +795,7 @@ def quality(a: Analysis, calm: bool) -> dict:
 def compare_baselines(rec: Recording, c: dict, lengths: list[float]) -> list[dict]:
     """記録の baseline 行と、指定の長さで作り直した普段のそれぞれで、区間を数える"""
     rows = []
-    for label, r in [("記録の baseline 行（アプリ）", rec)] + [(f"{L:g}秒で作り直し", with_baseline(rec, L)) for L in lengths]:
+    for label, r in [("記録の baseline 行（アプリ）", rec)] + [(f"{L:g}秒で作り直し", with_baseline(rec, L, c)) for L in lengths]:
         a = analyze(r, c)
         dt = frame_dt(r.t)
         judged = float(dt[a.bidx >= 0].sum())
@@ -788,7 +875,10 @@ def metric_track(a: Analysis, m: str, scene_color: dict) -> Track:
         for t0, t1 in spans(a.bidx < 0, t):
             ax.axvspan(to_num(t0), to_num(t1), color="#e6e6e6", lw=0)
         if m in FACE_METRICS:
-            for t0, t1 in spans((a.bidx >= 0) & ~a.fvalid, t):
+            excl = (a.bidx >= 0) & ~a.fvalid
+            if m == "eye_squint" and a.blinked is not None:
+                excl = excl | ((a.bidx >= 0) & a.blinked)   # まばたきのコマも判定対象外
+            for t0, t1 in spans(excl, t):
                 ax.axvspan(to_num(t0), to_num(t1), color="#9e9e9e", alpha=0.45, lw=0)
         for s in a.segments:
             if s.metric == m:
@@ -932,6 +1022,8 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
              ["顔が映っていた割合", pc(q["face_ratio"])],
              ["普段がある時間（判定した時間）", fmt_s(q["judged_s"])],
              ["そのうち表情の判定対象外だった時間", f"{fmt_s(q['excluded_s'])}（{pc(q['excluded_ratio'])}）"],
+             *([["そのほか、目を細めるだけ判定対象外だった時間（まばたき）", f"{fmt_s(q['blink_s'])}（{pc(q['blink_ratio'])}）"]]
+               if "blink_s" in q else []),
              ["解析コマ/秒", f"{q['fps']:.1f}"],
              ["撮影→結果の遅れ ms（中央値 / 95%）", ms(q["lat"])],
              ["解析時間 ms（中央値 / 95%）", ms(q["proc"])]]
@@ -972,13 +1064,20 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
             for m in METRICS:
                 st = b.get("metrics", {}).get(m, {})
                 f = lambda v: "" if v is None else f"{v:g}"
+                app = b.get("eye_squint_app") if m == "eye_squint" else None
                 brows.append([jst(b["t_ms"] / 1000), m, LABEL[m], st.get("n", ""), f(st.get("mean")), f(st.get("std")),
-                              "データ不足（計算しない）" if st.get("insufficient") else ""])
+                              "　".join(filter(None, ["データ不足（計算しない）" if st.get("insufficient") else "",
+                                                     f"まばたきを外して数え直し（アプリの値 n={app.get('n')} mean={f(app.get('mean'))} std={f(app.get('std'))}）"
+                                                     if app else ""]))])
         parts.append("<h2>普段（baseline）</h2>"
                      "<p class=note>v0.4 からは、顔が読めていて横を向きすぎていない（|yaw| が yaw_limit_deg 未満）コマだけを、"
                      "開いてから warmup_s 秒より後に数えています（声も同じ間だけ）。"
                      "「数えた時間」が60秒になるまでにかかった実際の時間が「かかった時間」です。</p>"
                      + f"<p>普段：{e(rec.baseline_source)}</p>"
+                     + ("<p class=note>目を細める（eye_squint）の普段は、まばたきのコマ（と前後）を外して数えています。"
+                        "記録の baseline 行（アプリ）から使うときは、その普段を集めた時間のコマから、アプリと同じ条件で eye_squint だけ数え直しています"
+                        "（アプリの値は下の表の「アプリの値」）。</p>" if blink_mask_on(c) else "")
+                     + (f"<p class=note>{e(a.blink_note)}</p>" if a.blink_note else "")
                      + table(["記録し始めた時刻", "記録し終えた時刻", "普段の長さ", "かかった時間", "数えた時間", "数えた条件"],
                              [baseline_time_row(b) for b in rec.baselines])
                      + table(["記録し終えた時刻", "指標", "", "n", "mean", "std", ""], brows))
@@ -1132,7 +1231,7 @@ def main(argv=None) -> int:
         sys.exit("この記録には顔の向きが無い（v0.3 より前）ため、アプリと同じ条件で普段を作り直せません")
     compare_rows = compare_baselines(rec, c, lengths) if lengths else None
     if args.baseline_s:
-        rec = with_baseline(rec, args.baseline_s)
+        rec = with_baseline(rec, args.baseline_s, c)
     a = analyze(rec, c)
     rows = segment_rows(a)
     weak_rows = segment_rows(a, a.weak_segments, "参考（表情の弱い方）")

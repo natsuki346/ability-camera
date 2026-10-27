@@ -680,6 +680,30 @@ def research_composite(a: "Analysis") -> Composite | None:
     return Composite(value, sm, means, closed, rows, float(rest.mean()) if len(rest) else None, len(rest), by_value)
 
 
+# 指標に使っている表情の数値（左右平均の名前）
+METRIC_PAIRS = {"mouth_smile": "mouthSmile", "brow_down": "browDown", "eye_squint": "eyeSquint", "jaw_open": "jawOpen"}
+MISSING_MAX = 0.01   # 記録全体の最大値がこれ未満なら「値が出ていない」
+
+
+def missing_values(a: "Analysis") -> list[str]:
+    """研究用の合計と指標に使っている表情の数値のうち、記録全体でいつも0に近いもの（最大値 < 0.01）。
+    MediaPipe が出していない数値に気づけるようにする。顔が映ったコマが無い記録では調べない"""
+    rec, c = a.rec, a.criteria
+    if not rec.face.any():
+        return []
+    keys = list(METRIC_PAIRS.values())
+    rc = c.get("research_composite")
+    if rc and rc.get("enabled", True):
+        keys += [k for g in rc["groups"] for k in g] + ["eyeBlink"]
+    out = []
+    for k in dict.fromkeys(keys):
+        x = rec.pairs.get(k)
+        x = x[np.isfinite(x)] if x is not None else np.array([])
+        if not len(x) or float(x.max()) < MISSING_MAX:
+            out.append(k)
+    return out
+
+
 # ---------------------------------------------------------------- 区間の数字
 
 def jst(ts: float, ms=False) -> str:
@@ -855,6 +879,8 @@ def quality(a: Analysis, calm: bool) -> dict:
         bl = based & a.fvalid & a.blinked
         q["blink_s"] = float(dt[bl].sum())
         q["blink_ratio"] = q["blink_s"] / q["judged_s"] if q["judged_s"] > 0 else None
+
+    q["missing"] = missing_values(a)
 
     yaw = rec.yaw[np.isfinite(rec.yaw)]
     if len(yaw):
@@ -1172,6 +1198,10 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     else:
         qrows.append(["yaw", "記録に顔の向きがありません（v0.3 より前）"])
     parts.append("<h2>記録の質</h2>" + table(["項目", "値"], qrows))
+    if q.get("missing"):
+        parts.append("<p class=note>この記録では値が出ていません（MediaPipe が出していない可能性）："
+                     + "、".join(e(k) for k in q["missing"])
+                     + f"。記録全体で最大値が {MISSING_MAX} 未満の、研究用の合計と指標に使っている表情の数値です。</p>")
     yimg = figure_yaw(a)
     if yimg:
         parts.append(f"<img class=small src='{yimg}' alt='yaw の分布'>")

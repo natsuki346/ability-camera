@@ -64,6 +64,7 @@ struct SettingsView: View {
     @AppStorage("deviceName") private var deviceName = ""
     @AppStorage("sendVideo") private var sendVideo = false
     @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
+    @AppStorage("baselineSeconds") private var baselineSeconds = AnalysisModel.defaultBaselineSeconds
     @State private var allowed = AllowedViewers.all()
     @Environment(\.dismiss) private var dismiss
 
@@ -94,6 +95,14 @@ struct SettingsView: View {
                         .pickerStyle(.segmented)
                     } header: { Text("カメラ") } footer: {
                         Text("初めは広角。超広角は広く映るので顔が画面から外れにくくなりますが、画角の端では顔が歪み、表情の数値が変わることがあります。使ったカメラは記録の先頭に書きます。記録中に変えると、変えたことを記録して普段を取り直します")
+                    }
+                    Section {
+                        Picker("普段の長さ", selection: $baselineSeconds) {
+                            ForEach(AnalysisModel.baselineChoices, id: \.self) { Text("\($0)秒").tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                    } header: { Text("普段の長さ") } footer: {
+                        Text("初めは60秒。顔が映っていて横を向きすぎていない時間がこの秒数になったら、普段を記録し終えます。普段を記録している途中に変えると、今の記録にすぐ使います（数えた分はそのまま）。記録し終えたあとに変えると、次に普段を記録するとき（取り直す・次のセッション）から使います。使った長さは記録の baseline 行（target_s）に書きます")
                     }
                     Section {
                         Toggle("見る側に映像も送る", isOn: $sendVideo)

@@ -36,6 +36,7 @@ final class AnalysisModel: ObservableObject {
 
     @Published var baselineSec: Int?          // 普段を記録中の経過秒（記録中でなければ nil）
     @Published var baselineReady = false
+    @Published var baselineTarget = AnalysisModel.selectedBaselineSeconds   // 今の普段の長さ（数えた時間の目標）
     @Published var baselineWait: String?      // 普段を数えていない理由（数えている間は nil）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
     @Published var differences: [String] = []
@@ -90,7 +91,13 @@ final class AnalysisModel: ObservableObject {
     private var head = HeadTurnTracker()                      // 顔を向ける・そむける（0.5秒続いたら記録）
 
     static let chartWindow = 20.0
-    static let baselineSeconds = 60.0     // 数えた時間（時計の時間ではない）
+    static let baselineChoices = [30, 60] // 普段の長さ（数えた時間。時計の時間ではない）。撮る側の設定で選ぶ
+    static let defaultBaselineSeconds = 60
+    /// 設定で選んだ普段の長さ（秒）
+    static var selectedBaselineSeconds: Double {
+        let v = UserDefaults.standard.integer(forKey: "baselineSeconds")
+        return Double(baselineChoices.contains(v) ? v : defaultBaselineSeconds)
+    }
     static let baselineYawLimit = 35.0
     static let baselineWarmup = 5.0       // 開いてから最初の5秒は数えない（ポケットに入れる間）
     static let minSamples = 30
@@ -166,7 +173,7 @@ final class AnalysisModel: ObservableObject {
         diffCount = 0
         link.headTurns = []   // 見る側の「直近の顔の向き」は、セッションごと
         sessionStartHost = CACurrentMediaTime()
-        resetBaseline()   // 普段の60秒も自動で始める
+        resetBaseline()   // 普段（設定の長さ）も自動で始める
         running = true
         sessionStartedAt = Date()
         status = "記録しています: \(logger.fileName ?? "-")" + note
@@ -305,6 +312,13 @@ final class AnalysisModel: ObservableObject {
         }
     }
 
+    /// 設定で普段の長さを変えた。普段を記録している途中なら、今の記録にすぐ使う（数えた分はそのまま）。
+    /// 記録し終えていれば、次に普段を記録するとき（取り直す・次のセッション）から使う
+    func applyBaselineLength() {
+        guard running, !baselineReady else { return }
+        baselineTarget = Self.selectedBaselineSeconds
+    }
+
     /// 普段を取り直す
     func restartBaseline() {
         guard running else { return }
@@ -373,6 +387,7 @@ final class AnalysisModel: ObservableObject {
         baselineStartMs = Self.nowMs()
         stats = [:]
         baselineValidS = 0; baselineLastT = nil; lastValidHost = -.infinity
+        baselineTarget = Self.selectedBaselineSeconds
         baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []
         lastChange = nil
         diffSince = [:]
@@ -393,7 +408,7 @@ final class AnalysisModel: ObservableObject {
                                     wallS: ((now - baselineStartHost) * 10).rounded() / 10,
                                     validS: (baselineValidS * 10).rounded() / 10,
                                     yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
-                                    minN: Self.minSamples, metrics: out))
+                                    minN: Self.minSamples, targetS: baselineTarget, metrics: out))
         insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
         baselineSec = nil; baselineWait = nil
         baselineReady = true
@@ -504,7 +519,7 @@ final class AnalysisModel: ObservableObject {
 
         if collecting {
             let sec = Int(baselineValidS)
-            if baselineValidS >= Self.baselineSeconds {
+            if baselineValidS >= baselineTarget {
                 finishBaseline(now: now)
             } else {
                 if baselineSec != sec { baselineSec = sec }
@@ -571,7 +586,7 @@ final class AnalysisModel: ObservableObject {
             values: r.face ? Dictionary(uniqueKeysWithValues: values.map { ($0.key.rawValue, ($0.value * 1000).rounded() / 1000) }) : nil,
             rmsDb: a.rmsDb.map(Double.init), f0Hz: a.f0Hz.map(Double.init),
             differences: differences,
-            baselineSec: baselineSec, baselineTotal: Int(Self.baselineSeconds), baselineReady: baselineReady,
+            baselineSec: baselineSec, baselineTotal: Int(baselineTarget), baselineReady: baselineReady,
             baselineWait: baselineWait, insufficient: insufficient.map(\.label),
             recording: running, sessionStartedMs: sessionStartedAt.map { Int64($0.timeIntervalSince1970 * 1000) },
             scene: scene?.rawValue,

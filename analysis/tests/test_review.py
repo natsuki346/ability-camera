@@ -234,6 +234,46 @@ class HeadTurnTest(unittest.TestCase):
             self.assertIn("超広角で記録しています", doc)
 
 
+class BaselineRebuildTest(unittest.TestCase):
+    """--baseline-s / --compare-baseline：普段を1コマごとの値から作り直す（アプリと同じ条件）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rec = review.load(FIXTURE)
+
+    def test_rebuild_times(self):
+        b30 = review.rebuild_baselines(self.rec, 30)
+        # 開いてから5秒は数えない → 5 + 30 = 35秒で記録し終える。90秒の取り直しの後は 20秒しかないので作れない
+        self.assertEqual(len(b30), 1)
+        self.assertAlmostEqual(b30[0]["t_ms"] / 1000 - T0, 35.0, delta=0.15)
+        self.assertEqual((b30[0]["target_s"], b30[0]["valid_s"]), (30, 30.0))
+        self.assertEqual(b30[0]["metrics"]["brow_down"]["n"], 300)   # 3コマに1コマ（30コマ/秒 → 10コマ/秒）
+        # 60秒：yaw 50° の 50–52 と、顔が映らない 60–62（と、その後の読めない時間）は数えないので、65 より遅れる
+        b60 = review.rebuild_baselines(self.rec, 60)
+        self.assertEqual(len(b60), 1)
+        self.assertTrue(69.0 < b60[0]["t_ms"] / 1000 - T0 < 70.0, b60[0]["t_ms"] / 1000 - T0)
+
+    def test_restart_starts_new_period(self):
+        b = review.rebuild_baselines(self.rec, 10)
+        self.assertEqual(len(b), 2)
+        self.assertAlmostEqual(b[1]["started_ms"] / 1000 - T0, 90.0, delta=0.01)
+        self.assertAlmostEqual(b[1]["t_ms"] / 1000 - T0, 100.0, delta=0.15)
+
+    def test_compare_and_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            review.main([str(FIXTURE), "--calm", "--compare-baseline", "30,60", "--baseline-s", "30", "--out-dir", d])
+            doc = (Path(d) / "fixture_basic.html").read_text(encoding="utf-8")
+            self.assertIn("普段の長さの比べ", doc)
+            self.assertIn("30秒で作り直し", doc)
+            self.assertIn("60秒で作り直し", doc)
+            self.assertIn("10分あたりの区間", doc)
+            self.assertIn("30秒で作り直したもの", doc)          # 本体のレポートも 30秒の普段で数えた
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        rows = review.compare_baselines(self.rec, c, [30, 60])
+        self.assertEqual([x["label"] for x in rows], ["記録の baseline 行（アプリ）", "30秒で作り直し", "60秒で作り直し"])
+        self.assertGreater(rows[1]["judged_s"], rows[2]["judged_s"])   # 短い普段ほど早く判定を始める
+
+
 class CandidateTest(unittest.TestCase):
     """作った区間を与えて、通知候補の条件 A・B・C と場面の振り分けを見る（fixture の時刻を使う）"""
 

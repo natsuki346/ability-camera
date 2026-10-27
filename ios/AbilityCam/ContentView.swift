@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var cameraLarge = false
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
     @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
+    @AppStorage("baselineSeconds") private var baselineSeconds = AnalysisModel.defaultBaselineSeconds
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
 
@@ -65,6 +66,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettings) { SettingsView(link: model.link) }
         .onChange(of: cameraLens) { model.applyLens() }   // 設定で広角／超広角を変えた
+        .onChange(of: baselineSeconds) { model.applyBaselineLength() }   // 設定で普段の長さを変えた
         .onDisappear { model.shutdown() }   // 役割を「見る側」に変えた
         .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {
@@ -139,14 +141,14 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("いつもとの違い").font(.caption).foregroundStyle(.secondary)
             if !model.running {
-                Text("記録が始まると、最初の60秒を「普段」として記録します").foregroundStyle(.secondary)
+                Text("記録が始まると、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します").foregroundStyle(.secondary)
             } else {
                 if !model.faceReadable {
                     Text("顔が読めません（映っていない・動きが大きい）").foregroundStyle(.secondary)
                 }
                 if let sec = model.baselineSec {
-                    Text("普段を記録中 \(sec)/\(Int(AnalysisModel.baselineSeconds))秒（落ち着いているときに）")
-                    ProgressView(value: Double(sec), total: AnalysisModel.baselineSeconds)
+                    Text("普段を記録中 \(sec)/\(Int(model.baselineTarget))秒（落ち着いているときに）")
+                    ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget)
                     if let wait = model.baselineWait {
                         Text(wait).foregroundStyle(.secondary)
                     } else {

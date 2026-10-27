@@ -5,6 +5,7 @@
 出力：<記録>.html（画像は埋め込み、1ファイル）と <記録>_segments.csv。外部には何も送らない。
 
 使い方：python review.py 記録.jsonl [--calm] [--criteria criteria.json] [--set brow_down.start_min_s=0.8]
+        [--baseline-s 30] [--compare-baseline 30,60]
 """
 from __future__ import annotations
 
@@ -55,6 +56,7 @@ class Recording:
     proc_ms: np.ndarray
     baselines: list[dict]
     events: list[dict]
+    baseline_source: str = "記録の baseline 行（アプリが記録したもの）"
 
     @property
     def has_pose(self) -> bool:
@@ -188,6 +190,76 @@ def baseline_index(rec: Recording) -> np.ndarray:
         if p >= 0:
             out[i] = marks[p][1]
     return out
+
+
+# アプリ（AnalysisModel）が普段に数える条件
+BASELINE_YAW_LIMIT, BASELINE_WARMUP_S, BASELINE_MIN_N = 35.0, 5.0, 30
+
+
+def rebuild_baselines(rec: Recording, target_s: float) -> list[dict]:
+    """記録の中の1コマごとの値から、普段を target_s 秒（数えた時間）で作り直す。アプリと同じ条件：
+    直近1秒で顔が映るコマが半分以上・そのコマに顔がある・|yaw|<35°・開いてから5秒より後。
+    普段は記録の始まりと「普段を取り直す」（baseline_restart）から集め始める。
+    アプリは画面の更新に合わせて3コマに1コマで数えるので、ここでも（カメラを止めた後は数え直して）3コマに1コマで数える。
+    数えた時間は、前に数えたコマからの幅（0.5秒で切る）を足していく。std は標本標準偏差。
+    声は、そのコマに書かれている値を使う（アプリは新しく計算した音だけを数えるので、n は少しずれることがある）"""
+    t = rec.t
+    start0 = rec.header.get("started_at_ms")
+    start0 = start0 / 1000 if start0 else float(t[0])
+    starts = sorted([start0] + [e["t_ms"] / 1000 for e in rec.events if e.get("kind") == "baseline_restart"])
+    cum = np.concatenate([[0], np.cumsum(rec.face)])
+    lo = np.searchsorted(t, t - 1.0, side="left")
+    idx = np.arange(len(t))
+    readable = (cum[idx + 1] - cum[lo]) * 2 >= (idx + 1 - lo)
+
+    out: list[dict] = []
+    period = -1
+    vals: dict[str, list[float]] = {}
+    valid_s, last, done = 0.0, None, False
+    k = 0                              # カメラを始めてからのコマ数（1コマ以上空いたら数え直す）
+    prev = None
+    for i in range(len(t)):
+        ti = float(t[i])
+        k = 1 if prev is None or ti - prev > 1.0 else k + 1
+        prev = ti
+        p = int(np.searchsorted(starts, ti, side="right")) - 1
+        if p != period:
+            period, vals, valid_s, last, done = p, {m: [] for m in METRICS}, 0.0, None, False
+        if done or p < 0 or k % 3 != 0:
+            continue
+        y = rec.yaw[i]
+        valid = (ti - start0 >= BASELINE_WARMUP_S and bool(readable[i]) and bool(rec.face[i])
+                 and y == y and abs(y) < BASELINE_YAW_LIMIT)
+        if valid and last is not None and ti > last:
+            valid_s += min(ti - last, 0.5)
+        last = ti
+        if valid:
+            for m in METRICS:
+                v = rec.raw[m][i]
+                if v == v:
+                    vals[m].append(float(v))
+        if valid_s >= target_s:
+            metrics = {}
+            for m in METRICS:
+                x = np.array(vals[m])
+                n = len(x)
+                metrics[m] = {"n": n, "insufficient": n < BASELINE_MIN_N}
+                if n:
+                    metrics[m]["mean"] = round(float(x.mean()), 4)
+                    metrics[m]["std"] = round(float(x.std(ddof=1)) if n > 1 else 0.0, 4)
+            out.append({"type": "baseline", "t_ms": int(round(ti * 1000)), "started_ms": int(round(starts[p] * 1000)),
+                        "wall_s": round(ti - starts[p], 1), "valid_s": round(valid_s, 1),
+                        "yaw_limit_deg": BASELINE_YAW_LIMIT, "warmup_s": BASELINE_WARMUP_S, "min_n": BASELINE_MIN_N,
+                        "target_s": target_s, "rebuilt": True, "metrics": metrics})
+            done = True
+    return out
+
+
+def with_baseline(rec: Recording, target_s: float) -> Recording:
+    r = copy.copy(rec)
+    r.baselines = rebuild_baselines(rec, target_s)
+    r.baseline_source = f"記録の中の1コマごとの値から {target_s:g}秒で作り直したもの（--baseline-s）"
+    return r
 
 
 @dataclass
@@ -625,6 +697,22 @@ def quality(a: Analysis, calm: bool) -> dict:
     return q
 
 
+def compare_baselines(rec: Recording, c: dict, lengths: list[float]) -> list[dict]:
+    """記録の baseline 行と、指定の長さで作り直した普段のそれぞれで、区間を数える"""
+    rows = []
+    for label, r in [("記録の baseline 行（アプリ）", rec)] + [(f"{L:g}秒で作り直し", with_baseline(rec, L)) for L in lengths]:
+        a = analyze(r, c)
+        dt = frame_dt(r.t)
+        judged = float(dt[a.bidx >= 0].sum())
+        total = len(a.segments)
+        rows.append({"label": label, "length_s": None if r is rec else label,
+                     "baselines": "、".join(jst(b["t_ms"] / 1000) for b in r.baselines) or "作れなかった（数えた時間が足りない）",
+                     "judged_s": judged, "total": total, "shorts": sum(len(v) for v in a.shorts.values()),
+                     "per_metric": {m: sum(1 for x in a.segments if x.metric == m) for m in METRICS},
+                     "per_10min": total / (judged / 60) * 10 if judged > 0 else None})
+    return rows
+
+
 # ---------------------------------------------------------------- グラフ
 
 def setup_matplotlib():
@@ -807,7 +895,9 @@ def baseline_time_row(b: dict) -> list:
         cond = "時計の時間で数えた（v0.3 までの記録）"
     else:
         cond = f"顔が読めていて |yaw| < {b.get('yaw_limit_deg', 35):g}°、開いてから {b.get('warmup_s', 5):g}秒より後"
-    return [started, jst(b["t_ms"] / 1000), "–" if wall is None else f"{wall:g}秒",
+    target = b.get("target_s")
+    target = f"{target:g}秒" if target is not None else ("60秒（書かれていない v0.9 より前の記録）" if valid is not None else "–")
+    return [started, jst(b["t_ms"] / 1000), target, "–" if wall is None else f"{wall:g}秒",
             "–" if valid is None else f"{valid:g}秒", cond]
 
 
@@ -879,11 +969,12 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                      "<p class=note>v0.4 からは、顔が読めていて横を向きすぎていない（|yaw| が yaw_limit_deg 未満）コマだけを、"
                      "開いてから warmup_s 秒より後に数えています（声も同じ間だけ）。"
                      "「数えた時間」が60秒になるまでにかかった実際の時間が「かかった時間」です。</p>"
-                     + table(["記録し始めた時刻", "記録し終えた時刻", "かかった時間", "数えた時間", "数えた条件"],
+                     + f"<p>普段：{e(rec.baseline_source)}</p>"
+                     + table(["記録し始めた時刻", "記録し終えた時刻", "普段の長さ", "かかった時間", "数えた時間", "数えた条件"],
                              [baseline_time_row(b) for b in rec.baselines])
                      + table(["記録し終えた時刻", "指標", "", "n", "mean", "std", ""], brows))
     else:
-        parts.append("<h2>普段（baseline）</h2><p>普段の記録（type:\"baseline\"）が無いため、区間は判定できません。</p>")
+        parts.append("<h2>普段（baseline）</h2><p>普段（" + e(rec.baseline_source) + "）が無いため、区間は判定できません。</p>")
 
     # 区間の数（--calm では、何もしていない記録で区間が多すぎないかの目安）
     r = q["rates"]
@@ -896,6 +987,21 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         verdict = "目安以内" if r["per_10min"] <= r["target"] else "目安を超えています"
         rate += f"（目安：10分に{r['target']:g}回以下 → {verdict}）"
     parts.append(head + f"<p>{e(rate)}</p>" + table(["指標", "", "区間", "短い動き"], rrows))
+
+    # 普段の長さの比べ
+    if q.get("compare"):
+        calm = r["calm"]
+        crow = []
+        for x in q["compare"]:
+            crow.append([x["label"], x["baselines"], fmt_s(x["judged_s"]), x["total"], x["shorts"]]
+                        + [x["per_metric"][m] for m in METRICS]
+                        + (["–" if x["per_10min"] is None else f"{x['per_10min']:.1f}"] if calm else []))
+        parts.append("<h2>普段の長さの比べ（--compare-baseline）</h2>"
+                     "<p class=note>同じ記録について、普段を記録の中の1コマごとの値から指定の長さで作り直し、区間を数え直したものです"
+                     "（普段に数えるコマの条件はアプリと同じ）。普段が短いほど早く判定を始めるので、判定した時間も変わります。"
+                     "基準（criteria.json）はどれも同じです。</p>"
+                     + table(["普段", "普段を記録し終えた時刻", "判定した時間", "区間", "短い動き"] + [LABEL[m] for m in METRICS]
+                             + (["10分あたりの区間"] if calm else []), crow))
 
     # 印との対応
     if q["mark_rows"]:
@@ -975,6 +1081,10 @@ def main(argv=None) -> int:
                    help="基準を変える（例 brow_down.start_min_s=0.8、all.smooth_s=0.5）。項目：" + ", ".join(CRITERIA_KEYS))
     for k in CRITERIA_KEYS:
         p.add_argument("--" + k.replace("_", "-"), type=float, help=f"すべての指標の {k} を変える")
+    p.add_argument("--baseline-s", type=float, metavar="秒",
+                   help="普段を、記録の中の1コマごとの値からこの長さ（数えた時間）で作り直して区間を数える（例 30）")
+    p.add_argument("--compare-baseline", metavar="秒,秒",
+                   help="同じ記録を、普段の長さを変えて数えた区間の数を並べる（例 30,60）")
     p.add_argument("--out-dir", type=Path, help="出力先（省略時は記録と同じ場所）")
     args = p.parse_args(argv)
 
@@ -987,9 +1097,25 @@ def main(argv=None) -> int:
     overrides = list(args.set) + [f"all.{k}={getattr(args, k)}" for k in CRITERIA_KEYS if getattr(args, k) is not None]
     c = load_criteria(args.criteria, overrides)
     rec = load(args.jsonl)
+    lengths: list[float] = []
+    if args.compare_baseline:
+        try:
+            lengths = [float(x) for x in args.compare_baseline.split(",") if x.strip()]
+        except ValueError:
+            sys.exit(f"--compare-baseline の形が違います: {args.compare_baseline}（例 30,60）")
+    if (args.baseline_s or lengths) and not rec.has_pose:
+        sys.exit("この記録には顔の向きが無い（v0.3 より前）ため、アプリと同じ条件で普段を作り直せません")
+    compare_rows = compare_baselines(rec, c, lengths) if lengths else None
+    if args.baseline_s:
+        rec = with_baseline(rec, args.baseline_s)
     a = analyze(rec, c)
     rows = segment_rows(a)
     q = quality(a, args.calm)
+    if compare_rows:
+        q["compare"] = compare_rows
+        for x in compare_rows:
+            per = "" if not args.calm or x["per_10min"] is None else f" / 10分あたり {x['per_10min']:.1f}件"
+            print(f"{x['label']}: 区間 {x['total']}件（判定した {x['judged_s'] / 60:.1f}分）{per}")
 
     out = args.out_dir or args.jsonl.parent
     out.mkdir(parents=True, exist_ok=True)

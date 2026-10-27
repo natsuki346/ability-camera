@@ -37,12 +37,12 @@ struct ViewerView: View {
                             topBar(k)
                             if wide {
                                 HStack(alignment: .top, spacing: 14 * k) {
-                                    left(s, size: sketch, video: video, stacked: true, k).frame(width: sideW)
+                                    left(s, size: sketch, video: video, stacked: true, now: ctx.date, k).frame(width: sideW)
                                     now(s, live: live, k).frame(maxWidth: .infinity)
                                     right(s, now: ctx.date, k).frame(width: sideW)
                                 }
                             } else {
-                                left(s, size: sketch, video: video, stacked: false, k)
+                                left(s, size: sketch, video: video, stacked: false, now: ctx.date, k)
                                 now(s, live: live, k)
                                 right(s, now: ctx.date, k)
                             }
@@ -137,7 +137,7 @@ struct ViewerView: View {
 
     // MARK: 左：顔の絵・映像・顔の向き
 
-    private func left(_ s: LiveState?, size: CGFloat, video: UIImage?, stacked: Bool, _ k: CGFloat) -> some View {
+    private func left(_ s: LiveState?, size: CGFloat, video: UIImage?, stacked: Bool, now: Date, _ k: CGFloat) -> some View {
         VStack(spacing: 10 * k) {
             if stacked {
                 sketch(s, size: size)
@@ -160,8 +160,60 @@ struct ViewerView: View {
                 }
             }
             .multilineTextAlignment(.center)
+            card(k) { headTurns(now: now, k) }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    /// 撮る側の時計での「今」（届かなくなっても進める。時間の流れの右端と同じ）
+    private func cameraNow(_ now: Date) -> Double {
+        guard let last = link.state?.captureMs, let rec = link.lastReceived else { return now.timeIntervalSince1970 }
+        return Double(last) / 1000 + now.timeIntervalSince(rec)
+    }
+
+    /// 直近の head_turn を、次の head_turn が来るまで大きく出す（特に「見えなくなった（直前は右 40°）」）。その下に直近5件。
+    /// 向きの事実だけを出し、意味は付けない
+    private func headTurns(now: Date, _ k: CGFloat) -> some View {
+        let list = link.headTurns
+        return VStack(alignment: .leading, spacing: 8 * k) {
+            caption("顔の向きの記録（0.5秒以上続いたもの）", k)
+            if let last = list.last {
+                let h = last.head.flatMap(HeadState.init(rawValue:))
+                HStack(alignment: .top, spacing: 10 * k) {
+                    RoundedRectangle(cornerRadius: 3).fill(h?.color ?? .secondary.opacity(0.3))
+                        .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.secondary.opacity(0.4)))
+                        .frame(width: 10 * k)
+                    VStack(alignment: .leading, spacing: 4 * k) {
+                        Text(last.value)
+                            .font(.system(size: (h == .hidden ? 30 : 26) * k, weight: .bold))
+                            .foregroundStyle(Self.navy)
+                            .fixedSize(horizontal: false, vertical: true)
+                        let since = max(cameraNow(now) - Double(last.tMs) / 1000, 0)
+                        Text("\(Self.time(ms: last.tMs)) から（\(ContentView.duration(since))）")
+                            .font(.system(size: 16 * k).monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                if list.count > 1 {
+                    Divider()
+                    caption("直近\(CameraLink.headTurnKeep)件", k)
+                }
+                ForEach(list.count > 1 ? Array(list.reversed()) : []) { e in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Circle().fill(e.head.flatMap(HeadState.init(rawValue:))?.color ?? .secondary)
+                            .overlay(Circle().stroke(Color.secondary.opacity(0.4)))
+                            .frame(width: 9 * k, height: 9 * k)
+                        Text(Self.time(ms: e.tMs)).monospacedDigit().foregroundStyle(.secondary)
+                        Text(e.value).lineLimit(2)
+                    }
+                    .font(.system(size: 15 * k))
+                }
+            } else {
+                Text("まだありません（このセッションで向きが変わると出ます）")
+                    .font(.system(size: 15 * k)).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func sketch(_ s: LiveState?, size: CGFloat) -> some View {

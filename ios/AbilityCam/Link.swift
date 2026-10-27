@@ -49,14 +49,15 @@ struct LiveBaseline: Codable {
 struct LiveEvent: Codable, Identifiable {
     var id = UUID()
     let tMs: Int64
-    let kind: String                  // mark / scene
+    let kind: String                  // mark / scene / head_turn
     let value: String
     var by: String?                   // 見る側で押したときは、その端末の名前
+    var head: String?                 // head_turn：新しい向き（HeadState）
 }
 
 /// 1通の中身（JSON）。映像だけは JSON にせず、先頭 1 バイト 0xFF の後ろに JPEG を付けて送る
 struct Wire: Codable {
-    var kind: String                  // state / event / baseline / viewer_event / ping / pong / grant / bye / revoked
+    var kind: String                  // state / event / baseline / head_turns / viewer_event / ping / pong / grant / bye / revoked
     var state: LiveState?
     var baseline: LiveBaseline?       // baseline：nil なら「普段はまだ無い（記録中）」
     var event: LiveEvent?
@@ -65,6 +66,7 @@ struct Wire: Codable {
     var token: String?                // grant：次から確認なしでつなぐための合言葉
     var cameraID: String?
     var clockCorrected: Bool?         // viewer_event：時計のずれを直した時刻か
+    var headTurns: [LiveEvent]?       // head_turns：このセッションの直近5件の head_turn（古い順。v0.8.1〜）
 }
 
 /// 見る側から申し込むときに付けるもの
@@ -151,6 +153,17 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
     /// 今の普段（main で触る）。変わったら、見ている端末みんなに1回送る。つながったときにも送る
     var baseline: LiveBaseline? {
         didSet { sendBaseline(to: Array(sessions.values)) }
+    }
+
+    /// このセッションの直近5件の head_turn（main で触る）。変わったら、見ている端末みんなに一覧ごと送る。つながったときにも送る
+    /// （一覧ごと送るので、つなぎ直した見る側も、次の head_turn を待たずに直近のものを出せる）
+    static let headTurnKeep = 5
+    var headTurns: [LiveEvent] = [] {
+        didSet { sendHeadTurns(to: Array(sessions.values)) }
+    }
+
+    func addHeadTurn(_ e: LiveEvent) {
+        headTurns = Array((headTurns + [e]).suffix(Self.headTurnKeep))
     }
 
     /// 見る側で付けた印・場面（main で呼ぶ）。名前は撮る側から見えている、その端末の名前
@@ -252,6 +265,13 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
         }
     }
 
+    private func sendHeadTurns(to targets: [MCSession]) {
+        guard !targets.isEmpty, let d = try? JSONEncoder().encode(Wire(kind: "head_turns", headTurns: headTurns)) else { return }
+        sendQueue.async {
+            for s in targets where !s.connectedPeers.isEmpty { try? s.send(d, toPeers: s.connectedPeers, with: .reliable) }
+        }
+    }
+
     /// 映像（JPEG）。どのスレッドから呼んでもよい
     func sendVideo(_ jpeg: Data) {
         lock.lock(); let targets = self.targets; lock.unlock()
@@ -317,6 +337,7 @@ final class CameraLink: NSObject, ObservableObject, MCNearbyServiceAdvertiserDel
                     try? session.send(d, toPeers: [peerID], with: .reliable)
                 }
                 self.sendBaseline(to: [session])
+                self.sendHeadTurns(to: [session])
             case .notConnected:
                 if self.noticeSessions[peerID] === session { self.noticeSessions[peerID] = nil; return }
                 if self.sessions[peerID] === session { self.sessions[peerID] = nil; self.viewerIDs[peerID] = nil }
@@ -384,6 +405,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     @Published private(set) var lastReceived: Date?
     @Published private(set) var latencyMs: Double?
     @Published private(set) var events: [LiveEvent] = []   // 直近15分の家族の印・場面（画面に出すだけ）
+    @Published private(set) var headTurns: [LiveEvent] = []   // 撮る側のこのセッションの直近5件の head_turn（古い順）。次が来るまで消さない
     @Published private(set) var bands: [Metric: [Run<Band>]] = [:]   // 直近15分の時間の流れ（メモリだけ）
     @Published private(set) var scenes: [Run<String>] = []
     @Published private(set) var heads: [Run<HeadState>] = []   // 顔の向きの段（撮る側で0.5秒続いて決まった向き）
@@ -598,7 +620,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
                 let id = self.cameraIDs[peerID] ?? self.currentCameraID
                 if id != self.historyCameraID {
                     self.historyCameraID = id
-                    self.bands = [:]; self.scenes = []; self.heads = []; self.events = []   // 普段は、撮る側がつながったときに必ず送ってくる
+                    self.bands = [:]; self.scenes = []; self.heads = []; self.events = []; self.headTurns = []   // 普段は、撮る側がつながったときに必ず送ってくる
                 }
                 self.ping()
             case .notConnected:
@@ -649,6 +671,8 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
                 self.baseline = w.baseline
             case "event":
                 if let e = w.event { self.events.append(e) }
+            case "head_turns":
+                self.headTurns = w.headTurns ?? []
             case "pong":
                 guard let t0 = w.t0, let tc = w.tc, t1 >= t0 else { return }
                 self.clock.append((t1 - t0, Double(tc) - Double(t0 + t1) / 2))

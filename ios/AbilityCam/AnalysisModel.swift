@@ -164,6 +164,7 @@ final class AnalysisModel: ObservableObject {
         resetLive()
         scene = nil; markMessage = nil
         diffCount = 0
+        link.headTurns = []   // 見る側の「直近の顔の向き」は、セッションごと
         sessionStartHost = CACurrentMediaTime()
         resetBaseline()   // 普段の60秒も自動で始める
         running = true
@@ -185,7 +186,7 @@ final class AnalysisModel: ObservableObject {
             running = false
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
-            liveZ = [:]; liveDiffs = []; link.baseline = nil
+            liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
             if let s = logger.finish() {
                 do {
@@ -407,6 +408,8 @@ final class AnalysisModel: ObservableObject {
             e.head = c.to.rawValue; e.from = c.from.rawValue
             e.yawDeg = c.yawDeg.map { ($0 * 10).rounded() / 10 }
             logger.write(e)
+            // 見る側へも（記録に書くのと同じもの。記録していないときは書かないので送らない）
+            if running { link.addHeadTurn(LiveEvent(tMs: c.tMs, kind: "head_turn", value: c.value, head: c.to.rawValue)) }
         }
         frames += 1
         if r.face { faceFrames += 1 }

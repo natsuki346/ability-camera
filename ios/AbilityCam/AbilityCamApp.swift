@@ -23,7 +23,7 @@ struct RootView: View {
 
     var body: some View {
         switch Role(rawValue: role) {
-        case .camera: ContentView()
+        case .camera: CameraShell()
         case .viewer: ViewerView()
         case nil: RoleSelectView { role = $0.rawValue }
         }
@@ -60,6 +60,8 @@ struct RoleSelectView: View {
 /// 設定：役割と、相手の画面に出るこの端末の名前
 struct SettingsView: View {
     var link: CameraLink? = nil   // 撮る側のときだけ
+    var inSidebar = false         // サイドバーの「設定」として出す（閉じるボタンは出さない）
+    var openMenu: (() -> Void)? = nil
     @AppStorage("role") private var role = ""
     @AppStorage("deviceName") private var deviceName = ""
     @AppStorage("sendVideo") private var sendVideo = false
@@ -135,7 +137,13 @@ struct SettingsView: View {
             }
             .navigationTitle("設定")
             .onAppear { allowed = AllowedViewers.all() }
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { dismiss() } } }
+            .toolbar {
+                if inSidebar {
+                    MenuToolbar(openMenu: openMenu)
+                } else {
+                    ToolbarItem(placement: .confirmationAction) { Button("閉じる") { dismiss() } }
+                }
+            }
         }
     }
 

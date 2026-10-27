@@ -1,0 +1,150 @@
+import SwiftUI
+
+/// サイドバーの項目
+enum SidebarPage: String, Hashable, Identifiable {
+    case now, history, numbers, settings
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .now: "いま"
+        case .history: "これまでの記録"
+        case .numbers: "詳しい数字"
+        case .settings: "設定"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .now: "dot.radiowaves.left.and.right"
+        case .history: "clock.arrow.circlepath"
+        case .numbers: "chart.xyaxis.line"
+        case .settings: "gearshape"
+        }
+    }
+}
+
+/// iPhone（幅が狭いとき）は左から出る引き出し、iPad・Mac（幅が広いとき）は NavigationSplitView のサイドバー。
+/// content には、引き出しを開く操作を渡す（サイドバーが見えているときは nil）
+struct SidebarShell<Content: View>: View {
+    let pages: [SidebarPage]
+    @Binding var page: SidebarPage
+    @ViewBuilder let content: (SidebarPage, (() -> Void)?) -> Content
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var drawer = false
+
+    static var drawerWidth: CGFloat { 280 }
+
+    var body: some View {
+        if sizeClass == .regular {
+            NavigationSplitView {
+                List(pages, selection: Binding<SidebarPage?>(get: { page }, set: { if let p = $0 { page = p } })) { p in
+                    Label(p.title, systemImage: p.icon).tag(p)
+                }
+                .navigationTitle("Ability Cam")
+            } detail: {
+                content(page, nil)
+            }
+        } else {
+            ZStack(alignment: .leading) {
+                content(page) { withAnimation(.easeOut(duration: 0.2)) { drawer = true } }
+                if drawer {
+                    Color.black.opacity(0.25)
+                        .ignoresSafeArea()
+                        .onTapGesture { close() }
+                        .transition(.opacity)
+                        .accessibilityLabel("メニューを閉じる")
+                    drawerPanel
+                        .transition(.move(edge: .leading))
+                }
+            }
+        }
+    }
+
+    private var drawerPanel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Ability Cam").font(.headline).padding(.horizontal, 16).padding(.vertical, 12)
+            ForEach(pages) { p in
+                Button {
+                    page = p
+                    close()
+                } label: {
+                    Label(p.title, systemImage: p.icon)
+                        .font(.body.weight(page == p ? .semibold : .regular))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16).padding(.vertical, 12)
+                        .background(page == p ? ContentView.paleSlate : .clear, in: RoundedRectangle(cornerRadius: 8))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(ContentView.navy)
+                .padding(.horizontal, 8)
+            }
+            Spacer()
+        }
+        .frame(width: Self.drawerWidth)
+        .frame(maxHeight: .infinity)
+        .background(Color(.systemBackground).ignoresSafeArea())
+        .shadow(color: .black.opacity(0.15), radius: 8, x: 2)
+        .gesture(DragGesture().onEnded { if $0.translation.width < -40 { close() } })
+    }
+
+    private func close() { withAnimation(.easeOut(duration: 0.2)) { drawer = false } }
+}
+
+/// 「いま」以外の画面の枠：題と、引き出しを開く ≡
+struct PageFrame<Content: View>: View {
+    let title: String
+    let openMenu: (() -> Void)?
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        NavigationStack {
+            content()
+                .navigationTitle(title)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { MenuToolbar(openMenu: openMenu) }
+        }
+    }
+}
+
+struct MenuToolbar: ToolbarContent {
+    let openMenu: (() -> Void)?
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            if let openMenu {
+                Button(action: openMenu) { Image(systemName: "line.3.horizontal") }
+                    .accessibilityLabel("メニュー")
+            }
+        }
+    }
+}
+
+/// 撮る側：記録は「いま」の画面がどこにあっても続ける（開いている間は記録する）
+struct CameraShell: View {
+    @StateObject private var model = AnalysisModel()
+    @State private var page = SidebarPage.now
+    @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
+    @AppStorage("baselineSeconds") private var baselineSeconds = AnalysisModel.defaultBaselineSeconds
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        SidebarShell(pages: [.now, .numbers, .settings], page: $page) { p, menu in
+            switch p {
+            case .now: ContentView(model: model, openMenu: menu)
+            case .numbers: PageFrame(title: p.title, openMenu: menu) { DetailNumbersView(model: model) }
+            case .settings, .history: SettingsView(link: model.link, inSidebar: true, openMenu: menu)
+            }
+        }
+        .onChange(of: cameraLens) { model.applyLens() }   // 設定で広角／超広角を変えた
+        .onChange(of: baselineSeconds) { model.applyBaselineLength() }   // 設定で普段の長さを変えた
+        .onDisappear { model.shutdown() }   // 役割を「見る側」に変えた
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            switch phase {
+            case .active: Task { await model.appBecameActive() }   // 開いたら記録（新しいセッション、5秒以内なら同じセッション）
+            case .background: model.appEnteredBackground()          // 裏に回ったら止めて、整理する
+            default: break
+            }
+        }
+    }
+}

@@ -24,7 +24,7 @@ struct RootView: View {
     var body: some View {
         switch Role(rawValue: role) {
         case .camera: CameraShell()
-        case .viewer: ViewerView()
+        case .viewer: ViewerShell()
         case nil: RoleSelectView { role = $0.rawValue }
         }
     }

@@ -3,8 +3,8 @@ import SwiftUI
 /// 見る側（Mac の全画面 / iPad）の1画面。「今の値が、いつもの範囲のどこにあるか」と「何が・どちらに・どれだけ続いているか」を出す。
 /// 状態の名前や点数は出さない。撮る側から届いたものを出すだけで、何も保存しない（時間の流れもこの端末のメモリだけ）
 struct ViewerView: View {
-    @StateObject private var link = ViewerLink()
-    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject var link: ViewerLink     // つなぐのは ViewerShell（サイドバーで別の画面にしても切らない）
+    var openMenu: (() -> Void)?              // サイドバーを開く（iPad・Mac のサイドバーがあるときは nil）
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
     @State private var showSettings = false
     @State private var span = 5 * 60.0      // 時間の流れに出す長さ（1分・5分・15分）
@@ -63,20 +63,16 @@ struct ViewerView: View {
             }
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
-        .onChange(of: scenePhase, initial: true) { _, phase in
-            switch phase {
-            case .active: link.start()       // 起動したら自動で探してつなぐ
-            case .background: link.stop()
-            default: break
-            }
-        }
-        .onDisappear { link.stop() }
     }
 
     // MARK: 上
 
     private func topBar(_ k: CGFloat) -> some View {
         HStack {
+            if let openMenu {
+                Button(action: openMenu) { Image(systemName: "line.3.horizontal") }
+                    .accessibilityLabel("メニュー")
+            }
             Text("見る側").font(.system(size: 17 * k, weight: .semibold))
             Text(statusText).font(.system(size: 15 * k)).foregroundStyle(.secondary)
             Spacer()

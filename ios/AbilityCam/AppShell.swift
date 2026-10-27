@@ -129,11 +129,12 @@ struct CameraShell: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        SidebarShell(pages: [.now, .numbers, .settings], page: $page) { p, menu in
+        SidebarShell(pages: [.now, .history, .numbers, .settings], page: $page) { p, menu in
             switch p {
             case .now: ContentView(model: model, openMenu: menu)
+            case .history: CameraHistoryView(sessions: model.sessions, openMenu: menu)
             case .numbers: PageFrame(title: p.title, openMenu: menu) { DetailNumbersView(model: model) }
-            case .settings, .history: SettingsView(link: model.link, inSidebar: true, openMenu: menu)
+            case .settings: SettingsView(link: model.link, inSidebar: true, openMenu: menu)
             }
         }
         .onChange(of: cameraLens) { model.applyLens() }   // 設定で広角／超広角を変えた
@@ -146,5 +147,31 @@ struct CameraShell: View {
             default: break
             }
         }
+    }
+}
+
+/// 見る側：つながりは「いま」以外の画面にしても切らない。開いた記録はメモリにだけ置く（アプリを閉じたら消える）
+struct ViewerShell: View {
+    @StateObject private var link = ViewerLink()
+    @State private var page = SidebarPage.now
+    @State private var opened: [ReplayData] = []
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        SidebarShell(pages: [.now, .history, .settings], page: $page) { p, menu in
+            switch p {
+            case .now: ViewerView(link: link, openMenu: menu)
+            case .history: OpenedRecordsView(opened: $opened, openMenu: menu)
+            case .settings, .numbers: SettingsView(inSidebar: true, openMenu: menu)
+            }
+        }
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            switch phase {
+            case .active: link.start()       // 起動したら自動で探してつなぐ
+            case .background: link.stop()
+            default: break
+            }
+        }
+        .onDisappear { link.stop() }
     }
 }

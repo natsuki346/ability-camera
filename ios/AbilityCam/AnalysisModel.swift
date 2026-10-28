@@ -43,6 +43,7 @@ final class AnalysisModel: ObservableObject {
     @Published var analyzedRatio: Double?     // 直近10秒で、カメラから解析に渡したコマのうち解析できた割合
     @Published var baselineTarget = AnalysisModel.selectedBaselineSeconds   // 今の普段の長さ（数えた時間の目標）
     @Published var baselineWait: String?      // 普段を数えていない理由（数えている間は nil）
+    @Published var baselineEyesClosedLong = false   // 普段の間に目を閉じていた時間が、数えた時間の2割を超えた（v1.4〜）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
     @Published var differences: [String] = []
     @Published var faceReadable = true
@@ -97,6 +98,9 @@ final class AnalysisModel: ObservableObject {
     private var diffCount = 0                                 // このセッションで違いが出た回数（segments と同じ数え方）
     private var head = HeadTurnTracker()                      // 顔を向ける・そむける（0.5秒続いたら記録）
     private var boxStats = (cx: Welford(), cy: Welford(), w: Welford())   // 普段の間の顔の位置と大きさ
+    private var baselineClosed = DiffEngine.ClosedDetector()  // 普段の間に目を閉じていたか（判定と同じ決まり）
+    private var baselineClosedS = 0.0                         // 普段の間に目を閉じていた秒数（終わったものの合計）
+    static let baselineEyesClosedRatio = 0.2                  // 目を閉じていた時間がこれを超えたら「取り直せます」と出す
     private var todayBaseline: SavedBaseline?                 // このセッションで記録し終えた今日の普段（保存・保存し直し用）
     private var todayShown = false                            // 今日の普段を画面に出して取った（保存した普段で比べながら、うしろで黙って取ったのではない）
     private var faceCount: Int?                               // 映っている顔の数（0.5秒続いたもの）
@@ -424,6 +428,12 @@ final class AnalysisModel: ObservableObject {
         meterZ = [:]; diffMetrics = [:]; baselineStats = nil
         comparing = nil; savedFromMs = nil; askResave = false
         boxStats = (Welford(), Welford(), Welford())
+        baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
+    }
+
+    /// 普段の間に目を閉じていた秒数（続いている分も入れる）
+    private var baselineEyesClosedS: Double {
+        baselineClosedS + (baselineClosed.seg.map { $0.end - $0.start } ?? 0)
     }
 
     /// 選んだ人の保存した普段があり、カメラが同じなら、セッションの始めに source: "saved" の baseline 行（compared: true）を書き、
@@ -510,6 +520,7 @@ final class AnalysisModel: ObservableObject {
                                  yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                  minN: Self.minSamples, targetS: baselineTarget, blinkMasked: true, metrics: out)
         row.source = BaselineSource.today.rawValue; row.compared = useToday; row.faceBox = faceBox
+        row.eyesClosedS = (baselineEyesClosedS * 10).rounded() / 10
         row.camera = (lensInUse ?? camera.lens).rawValue
         logger.write(row)
         if useToday {
@@ -635,6 +646,13 @@ final class AnalysisModel: ObservableObject {
             if valid, let last = baselineLastT, captureT > last { baselineValidS += min(captureT - last, 0.5) }
             baselineLastT = captureT
             if valid { lastValidHost = now }
+            // 目を閉じていた時間：普段に数えるのと同じコマで、判定と同じ決まり（顔の無いコマは何も変えない）
+            let judgeable = !warmingUp && readable && (r.face ? facing : true)
+            let (_, ended) = baselineClosed.step(t: captureT, judgeable: judgeable,
+                                                 closed: blink.map { $0 >= DiffCriteria.eyesClosedThreshold })
+            if let e = ended { baselineClosedS += e.end - e.start }
+            let long = baselineValidS > 0 && baselineEyesClosedS > baselineValidS * Self.baselineEyesClosedRatio
+            if baselineEyesClosedLong != long { baselineEyesClosedLong = long }
         }
         if valid {
             for (m, x) in faceValues {
@@ -725,7 +743,8 @@ final class AnalysisModel: ObservableObject {
             scene: scene?.rawValue,
             faceRatio: faceRatio, fps: fps,
             z: comparing != nil ? liveZ : nil, diffs: comparing != nil ? liveDiffs : nil, diffCount: running ? diffCount : nil,
-            head: head.state?.rawValue))
+            head: head.state?.rawValue,
+            eyesClosed: comparing != nil && engine.eyesJudgeable ? engine.active[.eyesClosed] != nil : nil))
     }
 
     /// 映っている顔の数が変わって0.5秒続いたら、event（kind: "faces"、count）を書く。最初に決まった数は書かない
@@ -778,16 +797,19 @@ final class AnalysisModel: ObservableObject {
     /// DiffEngine が判定した違いを、画面・見る側・記録の change に出す。
     /// z =（0.3秒でならした今の値 − 普段の平均）÷ max(普段の標準偏差, 下限)。|z| ≥ 2 が 0.5秒続いたら違い、|z| < 1.5 が 0.5秒で終わり
     private func updateDifferences(latestT: Double, faceReadable: Bool) {
+        // グラフの「目を閉じていた時間」の薄い帯（終わったものと、続いているもの）
+        for s in engine.finished where s.target == .eyesClosed { graph.setClosed(s) }
+        if let s = engine.active[.eyesClosed] { graph.setClosed(s) }
         engine.finished.removeAll()
-        let shown = Metric.allCases.compactMap { engine.active[$0] }.filter(\.shown)
+        let shown = DiffTarget.all.compactMap { engine.active[$0] }.filter(\.shown)
         let messages = shown.map { "\($0.message)（\(Int(max(0, latestT - $0.startT)))秒）" }
         let keys = shown.map(\.key)
         if differences != messages { differences = messages }
         if meterZ != engine.z { meterZ = engine.z }
-        let dm = Dictionary(uniqueKeysWithValues: shown.map { ($0.metric, $0.above) })
+        let dm = Dictionary(uniqueKeysWithValues: shown.compactMap { s in s.metric.map { ($0, s.above) } })
         if diffMetrics != dm { diffMetrics = dm }
         liveZ = Dictionary(uniqueKeysWithValues: engine.z.map { ($0.key.rawValue, ($0.value * 100).rounded() / 100) })
-        liveDiffs = shown.map { LiveDiff(metric: $0.metric.rawValue, above: $0.above, seconds: Int(max(0, latestT - $0.startT))) }
+        liveDiffs = shown.map { LiveDiff(metric: $0.target.key, above: $0.above, seconds: Int(max(0, latestT - $0.startT))) }
 
         if lastChange == nil || lastChange!.diffs != keys || lastChange!.faceReadable != faceReadable {
             diffCount += Set(keys).subtracting(lastChange?.diffs ?? []).count

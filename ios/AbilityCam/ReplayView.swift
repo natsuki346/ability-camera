@@ -195,7 +195,7 @@ struct ReplayTimeline: View {
     private static let diffRowH: CGFloat = 8
     private static let gap: CGFloat = 4
     private static let labels = ["場面", "家族の印", "いつもとの違い", "顔の向き"]
-    private var heights: [CGFloat] { [Self.laneH, Self.laneH, Self.diffRowH * CGFloat(Metric.allCases.count), Self.laneH] }
+    private var heights: [CGFloat] { [Self.laneH, Self.laneH, Self.diffRowH * CGFloat(DiffTarget.all.count), Self.laneH] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -211,7 +211,7 @@ struct ReplayTimeline: View {
                     .frame(height: 18 + heights.reduce(0, +) + Self.gap * 3 + 16)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
-            Text("いつもとの違いの段は、上から \(Metric.allCases.map(\.label).joined(separator: "・"))。アンバー＝いつもより強い・大きい・高い、青灰＝いつもより小さい・低い。斜線は普段が無く比べていない時間")
+            Text("いつもとの違いの段は、上から \(DiffTarget.all.map(\.label).joined(separator: "・"))。アンバー＝いつもより強い・大きい・高い、青灰＝いつもより小さい・低い、墨紫＝目を閉じていた。斜線は普段が無く比べていない時間")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .ignore)
@@ -262,10 +262,10 @@ struct ReplayTimeline: View {
             hatch(ctx, rr)
         }
         for s in data.segments {
-            guard var rr = visible(s.startT, s.endT), let i = Metric.allCases.firstIndex(of: s.metric) else { continue }
+            guard var rr = visible(s.startT, s.endT), let i = DiffTarget.all.firstIndex(of: s.target) else { continue }
             rr.origin.y = ys[2] + CGFloat(i) * Self.diffRowH + 1; rr.size.height = Self.diffRowH - 2
-            ctx.fill(Path(roundedRect: rr, cornerRadius: 2),
-                     with: .color((s.above ? ViewerView.amber : ViewerView.slate).opacity(TimelineChart.fillOpacity)))
+            let color = s.target == .eyesClosed ? DiffTarget.eyesClosedColor : s.above ? ViewerView.amber : ViewerView.slate
+            ctx.fill(Path(roundedRect: rr, cornerRadius: 2), with: .color(color.opacity(TimelineChart.fillOpacity)))
         }
 
         // 顔の向き

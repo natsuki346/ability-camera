@@ -246,6 +246,7 @@ struct ViewerView: View {
                     ForEach(Metric.allCases.filter(\.isFace), id: \.self) { m in
                         meterRow(m, s, faded: faceReason(s) != nil, k)
                     }
+                    eyesRow(s, faded: faceReason(s) != nil, k)
                     groupHeader("声", reason: voiceReason(s), k).padding(.top, 4 * k)
                     ForEach(Metric.allCases.filter { !$0.isFace }, id: \.self) { m in
                         meterRow(m, s, faded: false, k)
@@ -332,6 +333,30 @@ struct ViewerView: View {
                 .font(.system(size: (strong ? 19 : 15) * k, weight: strong ? .bold : .regular).monospacedDigit())
                 .foregroundStyle(strong ? Self.navy : .secondary)
                 .lineLimit(2).minimumScaleFactor(0.7)
+                .frame(width: 210 * k, alignment: .leading)
+        }
+        .opacity(faded ? 0.35 : 1)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// 目を閉じている：メーターは作らず、閉じているかどうかと続いている秒数だけ（普段とは比べない）
+    private func eyesRow(_ s: LiveState?, faded: Bool, _ k: CGFloat) -> some View {
+        let closed = faded ? nil : s?.eyesClosed
+        let sec = s?.diffs?.first { $0.metric == DiffTarget.eyesClosedKey }?.seconds
+        let status = closed == true ? "閉じている（\(sec ?? 0)秒）" : closed == false ? "閉じていない" : ""
+        return HStack(alignment: .center, spacing: 12 * k) {
+            HStack(spacing: 6) {
+                Circle().fill(DiffTarget.eyesClosedColor).frame(width: 10 * k, height: 10 * k)
+                Text(DiffTarget.eyesClosedLabel).font(.system(size: 19 * k, weight: .medium)).lineLimit(1).minimumScaleFactor(0.7)
+            }
+            .frame(width: 140 * k, alignment: .leading)
+            Text("普段とは比べず、閉じているかどうかだけ（0.5秒以上）")
+                .font(.system(size: 12 * k)).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(status)
+                .font(.system(size: (closed == true ? 19 : 15) * k, weight: closed == true ? .bold : .regular).monospacedDigit())
+                .foregroundStyle(closed == true ? Self.navy : .secondary)
+                .lineLimit(1).minimumScaleFactor(0.7)
                 .frame(width: 210 * k, alignment: .leading)
         }
         .opacity(faded ? 0.35 : 1)
@@ -489,7 +514,7 @@ struct ViewerView: View {
                     Spacer()
                     if !live { Text(lastReceivedText).font(.system(size: 14 * k)).foregroundStyle(.secondary) }
                 }
-                TimelineChart(bands: link.bands, scenes: link.scenes, heads: link.heads,
+                TimelineChart(bands: link.bands, eyes: link.eyesBand, scenes: link.scenes, heads: link.heads,
                               marks: link.events.filter { $0.kind == "mark" },
                               start: end - span, end: end, k: k)
                 timelineLegend(k)
@@ -504,6 +529,7 @@ struct ViewerView: View {
             HStack(spacing: 4) { sw(Self.amber.opacity(TimelineChart.fillOpacity)); Text("いつもより上（強い・大きい・高い）") }
             HStack(spacing: 4) { sw(Self.slate.opacity(TimelineChart.fillOpacity)); Text("いつもより下（小さい・低い）") }
             HStack(spacing: 4) { sw(Self.usualBand); Text("いつもの範囲") }
+            HStack(spacing: 4) { sw(DiffTarget.eyesClosedColor.opacity(TimelineChart.fillOpacity)); Text("目を閉じていた") }
             HStack(spacing: 4) {
                 Canvas { ctx, size in
                     ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.secondary.opacity(0.08)))
@@ -652,9 +678,10 @@ extension HeadState {
     }
 }
 
-/// 時間の流れ：上から 家族の印・場面・顔の向き・指標6段。範囲の外に出ていた時間を塗る。家族の印は縦線
+/// 時間の流れ：上から 家族の印・場面・顔の向き・表情4段・目を閉じている・声2段。範囲の外に出ていた時間（目を閉じていた時間）を塗る。家族の印は縦線
 struct TimelineChart: View {
     let bands: [Metric: [ViewerLink.Run<ViewerLink.Band>]]
+    let eyes: [ViewerLink.Run<ViewerLink.Band>]
     let scenes: [ViewerLink.Run<String>]
     let heads: [ViewerLink.Run<HeadState>]
     let marks: [LiveEvent]
@@ -666,13 +693,13 @@ struct TimelineChart: View {
 
     var body: some View {
         let rowH = 22 * k, gap = 4 * k, markH = 20 * k, axisH = 18 * k
-        let labels = ["家族の印", "場面", "顔の向き"] + Metric.allCases.map(\.label)
-        let heights = [markH, rowH, rowH] + Array(repeating: rowH, count: Metric.allCases.count)
+        let labels = ["家族の印", "場面", "顔の向き"] + DiffTarget.all.map(\.label)
+        let heights = [markH, rowH, rowH] + Array(repeating: rowH, count: DiffTarget.all.count)
         HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .trailing, spacing: gap) {
                 ForEach(Array(labels.enumerated()), id: \.offset) { i, l in
                     HStack(spacing: 4) {
-                        if i >= 3 { Circle().fill(Metric.allCases[i - 3].color).frame(width: 8 * k, height: 8 * k) }
+                        if i >= 3 { Circle().fill(Self.color(DiffTarget.all[i - 3])).frame(width: 8 * k, height: 8 * k) }
                         Text(l).font(.system(size: 13 * k)).lineLimit(1)
                     }
                     .frame(height: heights[i])
@@ -684,6 +711,10 @@ struct TimelineChart: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("時間の流れ")
+    }
+
+    static func color(_ d: DiffTarget) -> Color {
+        if case .metric(let m) = d { m.color } else { DiffTarget.eyesClosedColor }
     }
 
     /// 「比べていない・届いていない」の斜線（いつもの範囲の青灰と見分けやすくする）
@@ -706,7 +737,7 @@ struct TimelineChart: View {
         let sceneY = markH + gap
         let headY = sceneY + rowH + gap
         let rowY = { (i: Int) in headY + rowH + gap + CGFloat(i) * (rowH + gap) }
-        let bottom = rowY(Metric.allCases.count) - gap
+        let bottom = rowY(DiffTarget.all.count) - gap
 
         func rect(_ r: ViewerLink.Run<some Equatable>, y: CGFloat) -> CGRect? {
             guard r.end >= start, r.start <= end else { return nil }
@@ -743,15 +774,22 @@ struct TimelineChart: View {
         }
 
         // 指標の段：下地は「比べていない・届いていない」の灰色。その上に、いつもの範囲・上・下を塗る
-        for (i, m) in Metric.allCases.enumerated() {
+        // 目を閉じているの段は、閉じていた時間を墨紫、閉じていない時間をいつもの範囲と同じ薄い青灰で塗る
+        for (i, d) in DiffTarget.all.enumerated() {
             let y = rowY(i)
             ctx.fill(Path(CGRect(x: 0, y: y, width: w, height: rowH)), with: .color(.secondary.opacity(0.08)))
             hatch(ctx, CGRect(x: 0, y: y, width: w, height: rowH))
-            for r in bands[m] ?? [] {
+            let runs: [ViewerLink.Run<ViewerLink.Band>]
+            switch d {
+            case .metric(let m): runs = bands[m] ?? []
+            case .eyesClosed: runs = eyes
+            }
+            let aboveColor = d == .eyesClosed ? DiffTarget.eyesClosedColor : ViewerView.amber
+            for r in runs {
                 guard let rr = rect(r, y: y) else { continue }
                 switch r.value {
                 case .usual: ctx.fill(Path(rr), with: .color(ViewerView.usualBand))
-                case .above: ctx.fill(Path(rr), with: .color(ViewerView.amber.opacity(Self.fillOpacity)))
+                case .above: ctx.fill(Path(rr), with: .color(aboveColor.opacity(Self.fillOpacity)))
                 case .below: ctx.fill(Path(rr), with: .color(ViewerView.slate.opacity(Self.fillOpacity)))
                 case .notCompared: break
                 }

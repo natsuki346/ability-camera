@@ -607,3 +607,107 @@ class SavedOffTest(unittest.TestCase):
             self.assertNotIn("missing", cs)
             self.assertIn("saved", cs["runs"])
             self.assertAlmostEqual(cs["shift"]["brow_down"]["shift"], (0.20 - 0.05) / 0.03, places=3)
+
+
+EYES_FIXTURE = HERE / "fixture_eyes.jsonl"
+
+
+class EyesClosedTest(unittest.TestCase):
+    """目を閉じている（v1.4〜）：eyeBlink ≥ 0.5 が 0.5秒以上で区間、0.5 未満が 0.2秒で終わり。普段とは比べない"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = review.load_criteria(review.HERE / "criteria.json", [])
+        cls.rec = review.load(EYES_FIXTURE)
+        cls.a = review.analyze(cls.rec, cls.c)
+        cls.segs = [s for s in cls.a.segments if s.metric == review.EYES]
+
+    def sec(self, i):
+        return round(float(self.rec.t[i]) - T0, 3)
+
+    def test_criteria(self):
+        self.assertEqual(self.c["eyes_closed"], {**self.c["eyes_closed"], "threshold": 0.5, "start_min_s": 0.5, "end_open_s": 0.2})
+        self.assertNotIn("eye_closed", self.c["research_composite"])   # 区間と同じ決まりに揃えた
+
+    def test_fixture_segments(self):
+        got = [(self.sec(s.i0), self.sec(s.i1), s.truncated) for s in self.segs]
+        self.assertEqual(got, [(20.0, 24.0, ""),                           # 4秒
+                               (30.0, 34.0, ""),                           # ちょうど 0.5、0.1秒だけ開いてもつながる
+                               (40.0, 40.967, "判定できない時間で打ち切り"),  # 横を向いた
+                               (50.0, 51.0, ""),                           # 顔の無いコマは何も変えない
+                               (85.0, 89.967, "記録の終わりで打ち切り")])
+        self.assertEqual(len(self.a.segments), len(self.segs))             # ほかの指標の区間は出ない（eye_squint はまばたきで外れる）
+        self.assertTrue(all(s.sign > 0 and np.isnan(s.peak_z) for s in self.segs))
+
+    def test_detect_direct(self):
+        t = np.arange(0, 3, 0.1)
+        ok = np.ones(len(t), bool)
+        ec = self.c["eyes_closed"]
+        def run(b):
+            return [(round(t[s.i0], 1), round(t[s.i1], 1)) for s in review.detect_eyes_closed(t, np.array(b, float), ok, ec)]
+        self.assertEqual(run([0.9] * 4 + [0.0] * 26), [])                         # 0.4秒はまばたき
+        self.assertEqual(run([0.9] * 6 + [0.0] * 24), [(0.0, 0.6)])               # 0.5秒で始まり、開いた最初のコマで終わり
+        self.assertEqual(run([0.49] * 30), [])                                    # 0.5 未満は閉じていない
+        self.assertEqual(run([0.9] * 6 + [0.0] * 2 + [0.9] * 6 + [0.0] * 16), [(0.0, 1.4)])   # 0.2秒より短く開いた
+        self.assertEqual(run([0.9] * 6 + [0.0] * 3 + [0.9] * 6 + [0.0] * 15), [(0.0, 0.6), (0.9, 1.5)])
+        b = [0.9] * 30
+        b[10] = float("nan")                                                      # 顔の無いコマ
+        self.assertEqual(run(b), [(0.0, 2.9)])
+
+    def test_no_baseline_and_excluded(self):
+        self.assertFalse(any(70 <= self.sec(s.i0) < 80 for s in self.segs))        # 普段を取り直している間は判定しない
+        self.assertFalse(any(41 <= self.sec(s.i0) < 42 for s in self.segs))        # 横を向いたあと 0.5秒に届かない
+
+    def test_rows_counts_and_candidates(self):
+        rows = review.segment_rows(self.a)
+        self.assertEqual({r["指標名"] for r in rows}, {"目を閉じている"})
+        self.assertEqual({r["向き"] for r in rows}, {"閉じている"})
+        self.assertEqual(rows[0]["長さ_秒"], 4.0)
+        self.assertEqual(rows[0]["普段の平均"], "")
+        q = review.quality(self.a, True)
+        self.assertEqual(q["rates"]["per_metric"][review.EYES], (5, 0, 0))
+        self.assertEqual(q["rates"]["total"], 5)                                  # --calm の10分あたりにも入る
+        self.assertEqual(review.candidates(self.a), [])                           # 通知候補には入れない
+
+    def test_composite_uses_same_rule(self):
+        comp = review.research_composite(self.a)
+        np.testing.assert_array_equal(comp.closed, self.a.closed)
+        self.assertTrue(comp.closed[int(np.searchsorted(self.rec.t, T0 + 32.05))])   # 0.1秒開いた間も閉じている
+        self.assertFalse(comp.closed[int(np.searchsorted(self.rec.t, T0 + 73))])     # 普段が無い間は入れない
+
+    def test_report(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            # baseline 行に eyes_closed_s（v1.4〜）を書いた記録
+            lines = EYES_FIXTURE.read_text(encoding="utf-8").splitlines()
+            out = []
+            for line in lines:
+                o = json.loads(line)
+                if o.get("type") == "baseline":
+                    o.update({"valid_s": 10.0, "eyes_closed_s": 2.5})
+                out.append(json.dumps(o, ensure_ascii=False))
+            p = Path(d) / "eyes.jsonl"
+            p.write_text("\n".join(out) + "\n", encoding="utf-8")
+            review.main([str(p), "--calm", "--out-dir", d])
+            doc = (Path(d) / "eyes.html").read_text(encoding="utf-8")
+            csv_text = (Path(d) / "eyes_segments.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("目を閉じている（eyes_closed、普段とは比べない）", doc)
+        self.assertIn("2.5秒（25%）", doc)
+        self.assertIn("区間の一覧（5件）", doc)
+        self.assertEqual(csv_text.count(",eyes_closed,目を閉じている,閉じている,"), 5)
+        for word in ("眠", "痛", "意識"):
+            self.assertNotIn(word, doc)
+
+
+@unittest.skipUnless(sys.platform == "darwin" and __import__("shutil").which("swiftc"), "Mac の swiftc が必要")
+class AppMatchTest(unittest.TestCase):
+    """アプリ（DiffEngine、リプレイと同じ）と review.py で、作り物の記録の区間が一致する（check_app.py）"""
+
+    def test_fixtures(self):
+        import check_app
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        exe = check_app.build()
+        for p, n in ((FIXTURE, 5), (EYES_FIXTURE, 5)):
+            diffs, count = check_app.compare(p, exe, c)
+            self.assertEqual(diffs, [], p.name)
+            self.assertEqual(count, n)

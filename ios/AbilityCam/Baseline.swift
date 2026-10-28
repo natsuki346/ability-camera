@@ -69,6 +69,11 @@ enum Metric: String, CaseIterable {
     }
 }
 
+extension DiffTarget {
+    /// 「目を閉じている」の色（docs/wording-guide.md：墨紫。目を細めるの薄紫より濃く、赤・黄・緑は使わない）
+    static let eyesClosedColor = Color(red: 0x5E / 255, green: 0x4B / 255, blue: 0x8B / 255)
+}
+
 /// 平均と標準偏差を1つずつ足しながら求める（Welford 法）
 struct Welford {
     private(set) var n = 0

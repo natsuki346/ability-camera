@@ -15,6 +15,16 @@
   （50–52 の直後に z が2を超えて残るが、始まりが見えていないので短い動きには数えない）
 場面：15 食事 → 25 なし。印：20.8 不快（区間の中）、21.5 分からない（区間の終わりの直後）、75 快
 顔の向き（head_turn、アプリが書くのと同じもの）：50 右へ → 52 正面に戻った → 60 見えなくなった（直前は正面） → 62 正面に戻った
+
+fixture_eyes.jsonl（目を閉じている、v1.4〜）：同じ普段（10秒）で、eyeBlink だけを変える
+  15–15.3 閉じる（0.9）                      → まばたき（区間なし）
+  20–24  閉じる                              → 区間 1件（20〜24、4秒）
+  30–34  閉じる（ちょうど 0.5）、32–32.1 だけ開く → 0.2秒より短いので 区間 1件のまま（30〜34）
+  40–42  閉じる、41–41.5 だけ yaw 50°         → 41 の手前で打ち切り（区間 1件）、41.5–42 は 0.5秒に届かず区間なし
+  50–51  閉じる、50.4–50.5 は顔が映らない      → 顔の無いコマは何も変えない（区間 1件、50〜51）
+  60–60.45 閉じる                            → 0.5秒に届かず区間なし
+  70     普段を取り直す。72–75 閉じても普段が無いので区間なし。80 で baseline 行
+  85–90  閉じたまま記録の終わり               → 区間 1件（記録の終わりで打ち切り）
 """
 import json
 import math
@@ -44,6 +54,14 @@ def baseline_line(t):
             "duration_s": 10.0, "min_n": 30, "metrics": m}
 
 
+def eyes_blink(t):
+    """fixture_eyes の eyeBlink（左右とも同じ値）と、yaw・顔を変える時間"""
+    closed = (15 <= t < 15.3 or 20 <= t < 24 or (30 <= t < 34 and not 32 <= t < 32.1) or 40 <= t < 42
+              or 50 <= t < 51 or 60 <= t < 60.45 or 72 <= t < 75 or t >= 85)
+    blink = 0.5 if 30 <= t < 34 else 0.9
+    return (blink if closed else 0.05), (50.0 if 41 <= t < 41.5 else 2.0), not (50.4 <= t < 50.5)
+
+
 def frame(t):
     v = {k: mu for k, (mu, _) in BASE.items()}
     face, yaw, f0 = True, 2.0, (200.0 if int(t) % 3 == 0 else None)
@@ -62,10 +80,15 @@ def frame(t):
         v["rms_db"] = -65.0
     if 105 <= t < 106:
         v["jaw_open"] = 0.5
+    return frame_obj(t, v, face, yaw, f0)
+
+
+def frame_obj(t, v, face, yaw, f0, blink=0.05):
     o = {"type": "frame", "t_ms": T0_MS + int(round(t * 1000)), "face": face,
          "rms_db": v["rms_db"], "proc_ms": 12.0, "lat_ms": 60.0 + 10 * math.sin(t)}
     if face:
         o["bs"] = bs_from(v)
+        o["bs"]["eyeBlinkLeft"] = o["bs"]["eyeBlinkRight"] = blink
         o["pts"] = []
         o["yaw_deg"], o["pitch_deg"], o["roll_deg"] = yaw, -3.0, 1.0
     if f0 is not None:
@@ -101,7 +124,30 @@ def build():
     return lines + [r[1] for r in rows]
 
 
-if __name__ == "__main__":
-    out = Path(__file__).with_name("fixture_basic.jsonl")
-    out.write_text("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in build()), encoding="utf-8")
+EYES_END = 90.0
+
+
+def build_eyes():
+    lines = [{"schema": "ability-cam.ios.v0.2", "started_at_ms": T0_MS, "camera": "wide", "camera_label": "広角",
+              "note": "テスト用の作り物（目を閉じている）"}]
+    extra = [(10.0, baseline_line(10.0)), (70.0, event(70.0, "baseline_restart")), (80.0, baseline_line(80.0))]
+    rows = []
+    for i in range(int(EYES_END * FPS)):
+        t = i / FPS
+        blink, yaw, face = eyes_blink(t)
+        v = {k: mu for k, (mu, _) in BASE.items()}
+        rows.append((t, frame_obj(t, v, face, yaw, 200.0 if int(t) % 3 == 0 else None, blink)))
+    rows += extra
+    rows.sort(key=lambda r: r[0])
+    return lines + [r[1] for r in rows]
+
+
+def write(name, objs):
+    out = Path(__file__).with_name(name)
+    out.write_text("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in objs), encoding="utf-8")
     print(out)
+
+
+if __name__ == "__main__":
+    write("fixture_basic.jsonl", build())
+    write("fixture_eyes.jsonl", build_eyes())

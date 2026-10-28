@@ -32,13 +32,25 @@ FACE_METRICS = {"mouth_smile", "brow_down", "eye_squint", "jaw_open"}
 LABEL = {"mouth_smile": "口角を上げる", "brow_down": "眉を寄せる", "eye_squint": "目を細める",
          "jaw_open": "口を開ける", "rms_db": "声の大きさ", "f0_hz": "声の高さ"}
 UNIT = {"rms_db": " dB", "f0_hz": " Hz"}
+# 目を閉じている（v1.4〜）：普段とは比べず、閉じているかどうかの事実だけ（criteria.json の eyes_closed）
+EYES = "eyes_closed"
+LABEL[EYES] = "目を閉じている"
+EYES_COLOR = "#5E4B8B"   # 墨紫（docs/wording-guide.md）
+# 区間の種類の並び（アプリの画面と同じ：表情4つ・目を閉じている・声2つ）
+SEG_KINDS = ["mouth_smile", "brow_down", "eye_squint", "jaw_open", EYES, "rms_db", "f0_hz"]
 # 向きの言い方（docs/wording-guide.md）
-DIRECTION = {"rms_db": ("いつもより大きい", "いつもより小さい"), "f0_hz": ("いつもより高い", "いつもより低い")}
+DIRECTION = {"rms_db": ("いつもより大きい", "いつもより小さい"), "f0_hz": ("いつもより高い", "いつもより低い"),
+             EYES: ("閉じている", "閉じている")}
 
 
 def direction(m: str, sign: int) -> str:
     up, down = DIRECTION.get(m, ("いつもより強い", "いつもより弱い"))
     return up if sign > 0 else down
+
+
+def seg_text(m: str, sign: int) -> str:
+    """区間を短く言う（「眉を寄せるがいつもより強い」「目を閉じている」）"""
+    return LABEL[EYES] if m == EYES else f"{LABEL[m]}が{direction(m, sign)}"
 CRITERIA_KEYS = ["smooth_s", "start_z", "start_min_s", "end_z", "end_min_s"]
 
 
@@ -416,6 +428,61 @@ def detect(t: np.ndarray, z: np.ndarray, ok: np.ndarray, c: dict) -> tuple[list[
     return segs, shorts
 
 
+def detect_eyes_closed(t: np.ndarray, blink: np.ndarray, ok: np.ndarray, ec: dict) -> list[Segment]:
+    """目を閉じている（アプリの DiffEngine.ClosedDetector と同じ決まり）。普段とは比べない。
+    閉じている（eyeBlink 左右平均 ≥ threshold）が start_min_s 以上続いたら始まり（閉じ始めたコマから）、
+    閉じていない（< threshold）が end_open_s 続いたら、その最初のコマで終わり。
+    判定できないコマ（ok=False：普段が無い・表情の判定対象外）が来たら、前のコマで打ち切る。顔の無いコマ（blink が NaN）は何も変えない。
+    記録の終わりまで続いたものは、最後に閉じていたコマまで"""
+    thr, min_s, end_s = ec["threshold"], ec["start_min_s"], ec["end_open_s"]
+    segs: list[Segment] = []
+    run0 = open0 = None
+    seg: Segment | None = None
+    for i in range(len(t)):
+        if not ok[i]:
+            run0 = open0 = None
+            if seg is not None:
+                seg.i1 = max(i - 1, seg.i0)
+                seg.truncated = "判定できない時間で打ち切り"
+                segs.append(seg); seg = None
+            continue
+        b = blink[i]
+        if b != b:
+            continue
+        closed = b >= thr
+        if seg is not None:
+            if closed:
+                open0 = None
+                seg.i1 = i
+            else:
+                if open0 is None:
+                    open0 = i
+                if t[i] - t[open0] >= end_s - 1e-9:
+                    seg.i1 = open0
+                    segs.append(seg); seg = None; open0 = None
+            continue
+        if not closed:
+            run0 = None
+            continue
+        if run0 is None:
+            run0 = i
+        if t[i] - t[run0] >= min_s - 1e-9:
+            seg = Segment(EYES, 1, run0, i, run0, float("nan"))
+            run0 = open0 = None
+    if seg is not None:
+        seg.truncated = "記録の終わりで打ち切り"
+        segs.append(seg)
+    return segs
+
+
+def closed_mask(n: int, segs: list[Segment]) -> np.ndarray:
+    out = np.zeros(n, bool)
+    for s in segs:
+        if s.metric == EYES:
+            out[s.i0:s.i1 + 1] = True
+    return out
+
+
 @dataclass
 class Analysis:
     rec: Recording
@@ -431,6 +498,7 @@ class Analysis:
     usable: dict[str, bool] = field(default_factory=dict)        # 普段にデータがあったか（insufficient でない）
     blinked: np.ndarray | None = None                            # 目を細めるを判定対象外にした、まばたきのコマ
     blink_note: str | None = None
+    closed: np.ndarray | None = None                             # 目を閉じていたコマ（eyes_closed の区間）
 
 
 def analyze(rec: Recording, c: dict) -> Analysis:
@@ -474,8 +542,17 @@ def analyze(rec: Recording, c: dict) -> Analysis:
             segs = [x for x in segs if x.sign > 0]
         a.segments += segs
         a.shorts[m] = shorts
-    a.segments.sort(key=lambda s: (t[s.i0], METRICS.index(s.metric)))
-    a.weak_segments.sort(key=lambda s: (t[s.i0], METRICS.index(s.metric)))
+    # 目を閉じている：ほかの違いと同じく、普段がある間の、表情を判定できるコマ（顔が読めて |yaw| < 35°）だけ
+    a.closed = np.zeros(len(t), bool)
+    a.shorts[EYES] = []
+    if c.get("eyes_closed"):
+        ok = a.fvalid & (a.bidx >= 0)
+        a.judge[EYES] = ok
+        segs = detect_eyes_closed(t, rec.blink, ok, c["eyes_closed"])
+        a.segments += segs
+        a.closed = closed_mask(len(t), segs)
+    a.segments.sort(key=lambda s: (t[s.i0], SEG_KINDS.index(s.metric)))
+    a.weak_segments.sort(key=lambda s: (t[s.i0], SEG_KINDS.index(s.metric)))
     return a
 
 
@@ -589,24 +666,12 @@ def uses_ultra_wide(rec: Recording) -> bool:
 RC_NAME = "上半分の顔の動きの合計（PSPI 型・研究用）"
 
 
-def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    out, start = [], None
-    for i, v in enumerate(mask):
-        if v and start is None:
-            start = i
-        elif not v and start is not None:
-            out.append((start, i - 1)); start = None
-    if start is not None:
-        out.append((start, len(mask) - 1))
-    return out
-
-
 @dataclass
 class Composite:
     value: np.ndarray                 # 1コマごとの合計（判定対象外・普段が無いコマは NaN）
     smooth: np.ndarray                # グラフ用にならしたもの
     means: list[dict]                 # baseline 行ごとの、各値の普段の平均（数え直したもの）
-    closed: np.ndarray                # 目を閉じている（eyeBlink ≥ threshold が min_s 秒以上続いた）コマ
+    closed: np.ndarray                # 目を閉じていたコマ（区間の eyes_closed と同じ決まり、v1.4〜）
     mark_rows: list[dict]             # 家族の印ごとの前後の平均
     no_mark_mean: float | None
     no_mark_n: int
@@ -623,7 +688,6 @@ def research_composite(a: "Analysis") -> Composite | None:
     if not rc or not rc.get("enabled", True) or not rec.pairs or not rec.has_pose:
         return None
     groups: list[list[str]] = rc["groups"]
-    ec = rc["eye_closed"]
     keys = sorted({k for g in groups for k in g} | {"eyeBlink"})
     vals = {k: rec.pairs.get(k, np.full(len(t), np.nan)).copy() for k in keys}
     if "eyeSquint" in vals and a.blinked is not None:
@@ -653,11 +717,8 @@ def research_composite(a: "Analysis") -> Composite | None:
         with np.errstate(all="ignore"):
             gv = np.fmax.reduce(stack, axis=0)          # 片方が NaN（まばたき）なら、もう片方
         total = total + gv                              # どれも NaN なら NaN
-    blinkv = rec.pairs.get("eyeBlink", np.full(len(t), np.nan))
-    closed = np.zeros(len(t), bool)
-    for i0, i1 in _runs(np.nan_to_num(blinkv, nan=0.0) >= ec["threshold"]):
-        if t[i1] - t[i0] >= ec["min_s"]:
-            closed[i0:i1 + 1] = True                    # 短いまばたきは入れない
+    # 目を閉じている：区間の eyes_closed と同じ決まり（v1.4〜。前は eyeBlink ≥ 0.5 が 0.5秒以上続いたコマだけで、終わりの 0.2秒が無かった）
+    closed = a.closed if a.closed is not None else np.zeros(len(t), bool)
     total = total + np.where(closed, np.nan_to_num(diff["eyeBlink"], nan=0.0), 0.0)
     ok = a.fvalid & (a.bidx >= 0)
     value = np.where(ok, total, np.nan)
@@ -753,7 +814,8 @@ def segment_rows(a: Analysis, segs: list[Segment] | None = None, kind: str = "�
     rows = []
     for s in (a.segments if segs is None else segs):
         t0, t1 = t[s.i0], t[s.i1]
-        b = rec.baselines[a.bidx[s.i0]]["metrics"][s.metric]
+        eyes = s.metric == EYES
+        b = None if eyes else rec.baselines[a.bidx[s.i0]]["metrics"][s.metric]
         sl = slice(s.i0, s.i1 + 1)
         sc = [name for (a0, a1, name) in scenes if a0 <= t1 and a1 >= t0]
         near = [f"{v}（{m_t - t0:+.1f}秒）" for (m_t, v) in mk if t0 - w <= m_t <= t1 + w]
@@ -761,8 +823,9 @@ def segment_rows(a: Analysis, segs: list[Segment] | None = None, kind: str = "�
         rows.append({
             "開始": jst(t0, ms=True), "終了": jst(t1, ms=True), "長さ_秒": round(t1 - t0, 2),
             "指標": s.metric, "指標名": LABEL[s.metric], "向き": direction(s.metric, s.sign),
-            "ピークのz": round(s.peak_z, 2),
-            "普段の平均": round(b["mean"], 4), "ピークの値": round(float(a.sm[s.metric][s.peak_i]), 4),
+            "ピークのz": "" if eyes else round(s.peak_z, 2),
+            "普段の平均": "" if eyes else round(b["mean"], 4),
+            "ピークの値": "" if eyes else round(float(a.sm[s.metric][s.peak_i]), 4),
             "場面": "→".join(dict.fromkeys(sc)) or "なし",
             "前後の家族の印": "、".join(near) or "なし",
             "顔が映っていた割合": round(float(rec.face[sl].mean()), 2),
@@ -782,6 +845,11 @@ def criteria_lines(c: dict) -> list[str]:
                    f"終了 |z|<{mc['end_z']} が {mc['end_min_s']}秒 / std下限 {c['std_floor'][m]}")
     out.append("表情の「いつもより弱い」区間：" + ("区間に数える" if c.get("face_below_counts", False)
                else "区間・通知候補・10分あたりには数えず、「表情の弱い方への変化（参考）」として別に出す（アプリと同じ。face_below_counts=false）"))
+    ec = c.get("eyes_closed")
+    if ec:
+        out.append(f"目を閉じている（eyes_closed、普段とは比べない）：eyeBlink 左右平均が {ec['threshold']:g} 以上が {ec['start_min_s']:g}秒以上続いたら"
+                   f"（それより短いのはまばたき）、{ec['threshold']:g} 未満が {ec['end_open_s']:g}秒続いたら終わり。秒数は閉じ始めた時刻から。"
+                   "普段がある間の、表情を判定できるコマだけ。通知候補には入れない")
     bm = c["metrics"]["eye_squint"].get("blink_mask")
     if bm:
         out.append(f"目を細める（eye_squint）：まばたき（eyeBlinkLeft/Right の平均）が {bm['threshold']:g} 以上のコマと前後 {bm['pad_s']:g}秒は"
@@ -836,16 +904,17 @@ def candidates(a: Analysis) -> list[Candidate]:
         return Candidate(ts, rule, detail, sc or "なし", sc in n["scene_separate"])
 
     out = []
+    segs = [s for s in a.segments if s.metric != EYES]   # 目を閉じているは通知候補に入れない（v1.4〜、まだ決めていない）
     face_on, voice_on = np.zeros(len(t), bool), np.zeros(len(t), bool)
-    for s in a.segments:
+    for s in segs:
         (face_on if s.metric in FACE_METRICS else voice_on)[s.i0:s.i1 + 1] = True
     for t0, t1 in spans(face_on & voice_on, t):
         if t1 - t0 >= n["cross_modal_s"]:
-            which = [f"{LABEL[s.metric]}が{direction(s.metric, s.sign)}" for s in a.segments
+            which = [seg_text(s.metric, s.sign) for s in segs
                      if t[s.i0] <= t1 and t[s.i1] >= t0]
             out.append(make(t0 + n["cross_modal_s"], "A",
                             f"表情と声の変化が同時に {t1 - t0:.0f}秒（{'、'.join(dict.fromkeys(which))}）"))
-    for s in a.segments:
+    for s in segs:
         dur = t[s.i1] - t[s.i0]
         if dur >= n["long_s"]:
             out.append(make(t[s.i0] + n["long_s"], "B",
@@ -853,7 +922,7 @@ def candidates(a: Analysis) -> list[Candidate]:
     win = n["repeat_window_min"] * 60
     for m in METRICS:
         recent: list[float] = []
-        for ts in sorted(t[s.i0] for s in a.segments if s.metric == m):
+        for ts in sorted(t[s.i0] for s in segs if s.metric == m):
             recent = [x for x in recent if ts - x <= win] + [ts]
             if len(recent) >= n["repeat_count"]:
                 out.append(make(ts, "C", f"{LABEL[m]}の区間が {(ts - recent[0]) / 60:.0f}分の間に {len(recent)}回"))
@@ -904,9 +973,9 @@ def quality(a: Analysis, calm: bool) -> dict:
     # 区間の数：普段がある時間（判定した時間）あたり。--calm（何もしていない記録）では10分あたりも出す（比べる目安は置かない）
     minutes = q["judged_s"] / 60
     per = {}
-    for m in METRICS:
+    for m in SEG_KINDS:
         n = sum(1 for s in a.segments if s.metric == m)
-        ns = len(a.shorts[m])
+        ns = len(a.shorts.get(m, []))
         per[m] = (n, ns, sum(1 for s in a.weak_segments if s.metric == m))
     total = sum(v[0] for v in per.values())
     q["rates"] = {"minutes": minutes, "per_metric": per, "total": total,
@@ -946,7 +1015,7 @@ def compare_baselines(rec: Recording, c: dict, lengths: list[float]) -> list[dic
         rows.append({"label": label, "length_s": None if r is rec else label,
                      "baselines": "、".join(jst(b["t_ms"] / 1000) for b in r.baselines) or "作れなかった（数えた時間が足りない）",
                      "judged_s": judged, "total": total, "shorts": sum(len(v) for v in a.shorts.values()),
-                     "per_metric": {m: sum(1 for x in a.segments if x.metric == m) for m in METRICS},
+                     "per_metric": {m: sum(1 for x in a.segments if x.metric == m) for m in SEG_KINDS},
                      "weak": len(a.weak_segments),
                      "per_10min": total / (judged / 60) * 10 if judged > 0 else None})
     return rows
@@ -981,7 +1050,7 @@ def compare_saved(rec: Recording, c: dict) -> dict:
         an = analyze(r, c)
         judged = float(frame_dt(r.t)[an.bidx >= 0].sum())
         out["runs"][k] = {"total": len(an.segments), "judged_s": judged,
-                          "per_metric": {m: sum(1 for x in an.segments if x.metric == m) for m in METRICS},
+                          "per_metric": {m: sum(1 for x in an.segments if x.metric == m) for m in SEG_KINDS},
                           "from": rows[k][0]["t_ms"] / 1000}
     return out
 
@@ -1080,6 +1149,33 @@ def metric_track(a: Analysis, m: str, scene_color: dict) -> Track:
     return Track(LABEL[m], draw)
 
 
+def eyes_track(a: Analysis, scene_color: dict) -> Track:
+    """目を閉じている：z ではなく eyeBlink（左右平均）の線と、閉じていた区間（墨紫の塗り）"""
+    rec, t, c = a.rec, a.rec.t, a.criteria
+
+    def draw(ax):
+        for t0, t1 in spans(a.bidx < 0, t):
+            ax.axvspan(to_num(t0), to_num(t1), color="#e6e6e6", lw=0)
+        for t0, t1 in spans((a.bidx >= 0) & ~a.fvalid, t):
+            ax.axvspan(to_num(t0), to_num(t1), color="#9e9e9e", alpha=0.45, lw=0)
+        for s in a.segments:
+            if s.metric == EYES:
+                ax.axvspan(to_num(t[s.i0]), to_num(t[s.i1]), color=EYES_COLOR, alpha=0.35, lw=0)
+        for t0, t1, name in scene_intervals(rec, t[-1]):
+            ax.axvspan(to_num(t0), to_num(t1), ymin=0.93, ymax=1.0, color=scene_color[name], lw=0)
+        ax.axhline(c["eyes_closed"]["threshold"], lw=0.8, ls="--", color="#b8c2cc")
+        step = max(1, len(t) // 20000)
+        ax.plot(to_num(t)[::step], rec.blink[::step], lw=0.8, color=LINE)
+        for m_t, v in marks(rec):
+            ax.axvline(to_num(m_t), color="#7570b3", lw=1)
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("eyeBlink")
+        n = sum(1 for s in a.segments if s.metric == EYES)
+        ax.set_title(f"{LABEL[EYES]}（{EYES}、普段とは比べない。点線 = {c['eyes_closed']['threshold']:g}）：{n}件", loc="left", fontsize=10)
+
+    return Track(LABEL[EYES], draw, height=1.2)
+
+
 def head_track(a: Analysis, states: np.ndarray) -> Track:
     t = a.rec.t
 
@@ -1116,11 +1212,12 @@ def figure_tracks(a: Analysis, tracks: list[Track]) -> str:
     handles = [Patch(color=RANGE, label="いつもの範囲（|z|<開始値）"),
                Patch(color=UP, alpha=0.3, label="区間（いつもより上）"),
                Patch(color=DOWN, alpha=0.3, label="区間（いつもより下）"),
+               Patch(color=EYES_COLOR, alpha=0.35, label="目を閉じていた"),
                Patch(color="#9e9e9e", alpha=0.45, label="判定対象外（表情）"),
                Patch(color="#e6e6e6", label="普段が無い時間"),
                Line2D([], [], color="#7570b3", label="家族の印"),
                Line2D([], [], color=LINE, label="z（ならした今の値）")]
-    fig.legend(handles=handles, loc="lower center", ncol=7, fontsize=8, frameon=False)
+    fig.legend(handles=handles, loc="lower center", ncol=8, fontsize=8, frameon=False)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     return fig_to_data(fig, plt)
 
@@ -1200,8 +1297,18 @@ def baseline_time_row(b: dict) -> list:
         cond = f"顔が読めていて |yaw| < {b.get('yaw_limit_deg', 35):g}°、開いてから {b.get('warmup_s', 5):g}秒より後"
     target = b.get("target_s")
     target = f"{target:g}秒" if target is not None else ("60秒（書かれていない v0.9 より前の記録）" if valid is not None else "–")
+    closed = b.get("eyes_closed_s")
+    closed = "–" if closed is None else f"{closed:g}秒" + (f"（{closed / valid:.0%}）" if valid else "")
     return [started, jst(b["t_ms"] / 1000), target, "–" if wall is None else f"{wall:g}秒",
-            "–" if valid is None else f"{valid:g}秒", cond]
+            "–" if valid is None else f"{valid:g}秒", closed, cond]
+
+
+def peak_text(rw: dict) -> str:
+    """「普段の平均 → ピークの値」（目を閉じているは普段と比べないので「–」）"""
+    if rw["普段の平均"] == "":
+        return "–"
+    u = UNIT.get(rw["指標"], "")
+    return f"{rw['普段の平均']:g}{u} → {rw['ピークの値']:g}{u}"
 
 
 def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str) -> None:
@@ -1286,7 +1393,8 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                         "記録の baseline 行（アプリ）から使うときは、その普段を集めた時間のコマから、アプリと同じ条件で eye_squint だけ数え直しています"
                         "（アプリの値は下の表の「アプリの値」）。</p>" if blink_mask_on(c) else "")
                      + (f"<p class=note>{e(a.blink_note)}</p>" if a.blink_note else "")
-                     + table(["記録し始めた時刻", "記録し終えた時刻", "普段の長さ", "かかった時間", "数えた時間", "数えた条件"],
+                     + table(["記録し始めた時刻", "記録し終えた時刻", "普段の長さ", "かかった時間", "数えた時間",
+                              "目を閉じていた時間（v1.4〜）", "数えた条件"],
                              [baseline_time_row(b) for b in rec.baselines])
                      + (table(["時刻", "どの普段", "比べるのに使った"],
                               [[jst(b["t_ms"] / 1000), "保存した普段" + (f"（{jst(b['saved_ms'] / 1000)} に保存）" if b.get("saved_ms") else "")
@@ -1300,8 +1408,8 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     # 区間の数（--calm では、何もしていない記録として10分あたりも出す）
     r = q["rates"]
     weak_on = not c.get("face_below_counts", False)
-    rrows = [[m, LABEL[m], r["per_metric"][m][0], r["per_metric"][m][1]]
-             + ([r["per_metric"][m][2] if m in FACE_METRICS else "–"] if weak_on else []) for m in METRICS]
+    rrows = [[m, LABEL[m], r["per_metric"][m][0], "–" if m == EYES else r["per_metric"][m][1]]
+             + ([r["per_metric"][m][2] if m in FACE_METRICS else "–"] if weak_on else []) for m in SEG_KINDS]
     rrows.append(["合計", "", r["total"], sum(v[1] for v in r["per_metric"].values())]
                  + ([sum(v[2] for v in r["per_metric"].values())] if weak_on else []))
     head = "<h2>区間の数" + ("（何もしていない記録）" if r["calm"] else "") + "</h2>"
@@ -1316,14 +1424,14 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         crow = []
         for x in q["compare"]:
             crow.append([x["label"], x["baselines"], fmt_s(x["judged_s"]), x["total"], x["shorts"]]
-                        + [x["per_metric"][m] for m in METRICS]
+                        + [x["per_metric"][m] for m in SEG_KINDS]
                         + ([x["weak"]] if weak_on else [])
                         + (["–" if x["per_10min"] is None else f"{x['per_10min']:.1f}"] if calm else []))
         parts.append("<h2>普段の長さの比べ（--compare-baseline）</h2>"
                      "<p class=note>同じ記録について、普段を記録の中の1コマごとの値から指定の長さで作り直し、区間を数え直したものです"
                      "（普段に数えるコマの条件はアプリと同じ）。普段が短いほど早く判定を始めるので、判定した時間も変わります。"
                      "基準（criteria.json）はどれも同じです。</p>"
-                     + table(["普段", "普段を記録し終えた時刻", "判定した時間", "区間", "短い動き"] + [LABEL[m] for m in METRICS]
+                     + table(["普段", "普段を記録し終えた時刻", "判定した時間", "区間", "短い動き"] + [LABEL[m] for m in SEG_KINDS]
                              + (["表情の弱い方への変化（参考）"] if weak_on else [])
                              + (["10分あたりの区間"] if calm else []), crow))
 
@@ -1335,7 +1443,7 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                   "–" if x["shift"] is None else f"{x['shift']:+.2f}"] for m, x in cs["shift"].items()]
         rr = cs["runs"]
         cnt = lambda k, m=None: "–" if k not in rr else (rr[k]["total"] if m is None else rr[k]["per_metric"][m])
-        crows = [[LABEL[m], cnt("saved", m), cnt("today", m)] for m in METRICS] + [["合計", cnt("saved"), cnt("today")]]
+        crows = [[LABEL[m], cnt("saved", m), cnt("today", m)] for m in SEG_KINDS] + [["合計", cnt("saved"), cnt("today")]]
         saved_at = "、".join(jst(b["saved_ms"] / 1000) for b in cs["saved_rows"] if b.get("saved_ms")) or "–"
         parts.append("<h2>保存した普段と今日の普段（--compare-saved）</h2>"
                      + (f"<p>{e(cs['missing'])}</p>" if cs.get("missing") else "")
@@ -1354,7 +1462,7 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
             else:
                 d, s = best
                 where = "区間の中" if d == 0 else (f"区間の終わりの {d:.1f}秒後" if d > 0 else f"区間の始まりの {-d:.1f}秒前")
-                mrows.append([jst(m_t), v, f"{LABEL[s.metric]}が{direction(s.metric, s.sign)}（{jst(rec.t[s.i0])}〜）", where])
+                mrows.append([jst(m_t), v, f"{seg_text(s.metric, s.sign)}（{jst(rec.t[s.i0])}〜）", where])
         parts.append("<h2>家族の印と区間（一番近い区間）</h2>" + table(["時刻", "家族の印", "区間", "時間差"], mrows))
 
     # 通知候補
@@ -1378,7 +1486,9 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     # グラフ
     scene_names = list(dict.fromkeys(n for _, _, n in scene_intervals(rec, rec.t[-1])))
     scene_color = {n: SCENE_COLORS[i % len(SCENE_COLORS)] for i, n in enumerate(scene_names)}
-    tracks = ([head_track(a, q["head_states"])] if "head_states" in q else []) + [metric_track(a, m, scene_color) for m in METRICS]
+    tracks = ([head_track(a, q["head_states"])] if "head_states" in q else []) + [
+        (eyes_track(a, scene_color) if m == EYES else metric_track(a, m, scene_color))
+        for m in SEG_KINDS if m != EYES or c.get("eyes_closed")]
     # ここに手首の記録の Track を足せば、同じ時間軸に並ぶ（今は未実装）
     img = figure_tracks(a, tracks)
     legend = "".join(f"<span class=chip style='background:{col}'>{e(n)}</span>" for n, col in scene_color.items())
@@ -1388,15 +1498,13 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     # 区間の表
     cols = ["開始", "終了", "長さ_秒", "指標名", "向き", "ピークのz", "普段の平均", "ピークの値", "場面", "前後の家族の印",
             "顔が映っていた割合", "yawの平均", "備考"]
-    body = [[rw[k] if k != "普段の平均" else f"{rw['普段の平均']:g}{UNIT.get(rw['指標'], '')} → {rw['ピークの値']:g}{UNIT.get(rw['指標'], '')}"
-             for k in cols if k != "ピークの値"] for rw in rows]
+    body = [[rw[k] if k != "普段の平均" else peak_text(rw) for k in cols if k != "ピークの値"] for rw in rows]
     parts.append(f"<h2>区間の一覧（{len(rows)}件）</h2><p class=sub>CSV：{e(csv_name)}</p>"
                  + (table([k if k != "普段の平均" else "普段の平均 → ピークの値" for k in cols if k != "ピークの値"], body)
                     if rows else "<p>区間はありません。</p>"))
     if weak_on:
         wrows = segment_rows(a, a.weak_segments, "参考（表情の弱い方）")
-        wbody = [[rw[k] if k != "普段の平均" else f"{rw['普段の平均']:g} → {rw['ピークの値']:g}"
-                  for k in cols if k != "ピークの値"] for rw in wrows]
+        wbody = [[rw[k] if k != "普段の平均" else peak_text(rw) for k in cols if k != "ピークの値"] for rw in wrows]
         parts.append(f"<h2>表情の弱い方への変化（参考）（{len(wrows)}件）</h2>"
                      "<p class=note>表情の指標が、いつもより弱い方へ外れた区間です。アプリは表情の「いつもより強い」だけを違いとして出すので、"
                      "揃えて区間・通知候補・10分あたりの数には入れていません（criteria.json の face_below_counts で変えられます）。"
@@ -1415,7 +1523,7 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                      "状態の名前を表すものではなく、家族の印と照らし合わせて意味があるかを確かめるために出しています。</p>"
                      f"<p class=note>1コマごとに、普段からの差（今の値 − 普段の平均。マイナスは 0）で "
                      f"{e(groups)}（左右平均。eyeSquint はまばたきのコマを除く）"
-                     f"＋ 目を閉じている間の eyeBlink（左右平均が {rc['eye_closed']['threshold']:g} 以上の状態が {rc['eye_closed']['min_s']:g}秒以上続いている間だけ。短いまばたきは入れない）"
+                     "＋ 目を閉じている間の eyeBlink（区間の「目を閉じている」と同じ決まりで閉じていた間だけ。短いまばたきは入れない）"
                      "を、重みを付けずに足しています。普段の平均は、記録の baseline 行の時間のコマから、アプリと同じ条件で数え直しています。"
                      f"グラフは {rc['smooth_s']:g}秒でならしたものです。表情の判定対象外の時間と普段が無い時間は計算していません。</p>"
                      f"<img src='{figure_composite(a, comp, scene_color)}' alt='{e(RC_NAME)}の時系列'>")

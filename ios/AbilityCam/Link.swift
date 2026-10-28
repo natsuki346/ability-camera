@@ -28,6 +28,8 @@ struct LiveState: Codable {
     var diffCount: Int?               // このセッションで違いが出た回数（sessions.jsonl の segments と同じ数え方）
     // v0.8〜
     var head: String?                 // 顔の向き（HeadState：front / right / left / hidden / oblique）。0.5秒続いて決まったもの。まだ決まっていなければ nil
+    // v1.4〜
+    var eyesClosed: Bool?             // 目を閉じているか（判定していない・古い撮る側では nil）。続いている秒数は diffs の eyes_closed
 }
 
 /// いつもとの違い1つ
@@ -407,6 +409,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     @Published private(set) var events: [LiveEvent] = []   // 直近15分の家族の印・場面（画面に出すだけ）
     @Published private(set) var headTurns: [LiveEvent] = []   // 撮る側のこのセッションの直近5件の head_turn（古い順）。次が来るまで消さない
     @Published private(set) var bands: [Metric: [Run<Band>]] = [:]   // 直近15分の時間の流れ（メモリだけ）
+    @Published private(set) var eyesBand: [Run<Band>] = []           // 目を閉じているの段（above＝閉じていた、usual＝閉じていない、v1.4〜）
     @Published private(set) var scenes: [Run<String>] = []
     @Published private(set) var heads: [Run<HeadState>] = []   // 顔の向きの段（撮る側で0.5秒続いて決まった向き）
     @Published private(set) var baseline: LiveBaseline?    // 撮る側の普段（いつもの範囲を描く）
@@ -555,6 +558,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
             if let i = runs.firstIndex(where: { $0.end >= from }), i > 0 { bands[m]!.removeFirst(i) }
         }
         if let i = scenes.firstIndex(where: { $0.end >= from }), i > 0 { scenes.removeFirst(i) }
+        if let i = eyesBand.firstIndex(where: { $0.end >= from }), i > 0 { eyesBand.removeFirst(i) }
         if let i = heads.firstIndex(where: { $0.end >= from }), i > 0 { heads.removeFirst(i) }
         events.removeAll { Double($0.tMs) / 1000 < from }
     }
@@ -565,6 +569,12 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
               !(m.isFace && !s.faceReadable) else { return .notCompared }
         if let d = s.diffs?.first(where: { $0.metric == m.rawValue }) { return d.above ? .above : .below }
         return s.z?[m.rawValue] != nil ? .usual : .notCompared
+    }
+
+    /// そのとき、目を閉じていたか（判定していない・古い撮る側なら比べていない）
+    static func eyesBand(in s: LiveState) -> Band {
+        guard s.recording, s.baselineReady, let closed = s.eyesClosed else { return .notCompared }
+        return closed ? .above : .usual
     }
 
     private static func extend<V: Equatable>(_ runs: inout [Run<V>], at t: Double, _ v: V) {
@@ -581,6 +591,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         var b = bands
         for m in Metric.allCases { Self.extend(&b[m, default: []], at: t, Self.band(m, in: s)) }
         bands = b
+        Self.extend(&eyesBand, at: t, Self.eyesBand(in: s))
         if let name = s.scene { Self.extend(&scenes, at: t, name) }
         if let h = s.head.flatMap(HeadState.init(rawValue:)) { Self.extend(&heads, at: t, h) }   // 古い撮る側・まだ決まっていないときは塗らない
     }
@@ -620,7 +631,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
                 let id = self.cameraIDs[peerID] ?? self.currentCameraID
                 if id != self.historyCameraID {
                     self.historyCameraID = id
-                    self.bands = [:]; self.scenes = []; self.heads = []; self.events = []; self.headTurns = []   // 普段は、撮る側がつながったときに必ず送ってくる
+                    self.bands = [:]; self.eyesBand = []; self.scenes = []; self.heads = []; self.events = []; self.headTurns = []   // 普段は、撮る側がつながったときに必ず送ってくる
                 }
                 self.ping()
             case .notConnected:

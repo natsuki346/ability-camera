@@ -16,17 +16,30 @@ final class GraphStore: ObservableObject {
         let isMark: Bool
     }
 
+    struct Closed { let id: UUID; let start: Double; var end: Double }   // 目を閉じていた時間（v1.4〜）
+
     static let keepSeconds = 300.0
     @Published private(set) var samples: [Sample] = []
     @Published private(set) var events: [Event] = []
+    @Published private(set) var closed: [Closed] = []
 
-    func reset() { samples = []; events = [] }
+    func reset() { samples = []; events = []; closed = [] }
+
+    /// 目を閉じていた時間を足す・のばす（同じ区間は id で見分ける）
+    func setClosed(_ s: DiffSegment) {
+        if let i = closed.lastIndex(where: { $0.id == s.id }) {
+            if closed[i].end != s.endT { closed[i].end = s.endT }
+        } else {
+            closed.append(Closed(id: s.id, start: s.startT, end: s.endT))
+        }
+    }
 
     func append(t: Double, z: [Metric: Double], values: [Metric: Double], baseline: [Metric: DiffEngine.Stat]?) {
         if let last = samples.last, t <= last.t { return }
         samples.append(Sample(t: t, z: z, values: values, baseline: baseline))
         if let i = samples.firstIndex(where: { $0.t >= t - Self.keepSeconds }), i > 0 { samples.removeFirst(i) }
         events.removeAll { $0.t < t - Self.keepSeconds }
+        if closed.first.map({ $0.end < t - Self.keepSeconds }) == true { closed.removeAll { $0.end < t - Self.keepSeconds } }
     }
 
     func addEvent(t: Double, label: String, isMark: Bool) {
@@ -85,6 +98,7 @@ struct NowPage: View {
                     .tint(ContentView.navyText)
                 Text(model.baselineWait ?? "落ち着いているときに。顔が映っている間だけ数えます")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                eyesClosedNote
             } else if model.differences.isEmpty {
                 Text(model.faceReadable ? "いつもと大きな違いはありません" : "声は、いつもと大きな違いはありません")
                     .font(.title3.bold()).foregroundStyle(ContentView.navyText)
@@ -97,6 +111,15 @@ struct NowPage: View {
                     Text("ほか\(model.differences.count - Self.maxLines)件").font(.caption).foregroundStyle(.secondary)
                 }
             }
+            if model.running, model.comparing == .today { eyesClosedNote }   // 画面に出して取った普段を、取り終えたあとも
+        }
+    }
+
+    /// 普段の間に目を閉じていた時間が、数えた時間の2割を超えたとき（保存した普段で比べながらうしろで取っている普段には出さない）
+    @ViewBuilder private var eyesClosedNote: some View {
+        if model.baselineEyesClosedLong {
+            Text("普段の間に目を閉じていた時間が長いです（取り直せます）")
+                .font(.caption.bold()).foregroundStyle(ContentView.navyText).lineLimit(2).minimumScaleFactor(0.7)
         }
     }
 
@@ -128,7 +151,7 @@ struct NowPage: View {
 struct GraphPage: View {
     @ObservedObject var graph: GraphStore
     @State private var span = 60.0
-    @State private var frozen: (samples: [GraphStore.Sample], events: [GraphStore.Event], end: Double)?
+    @State private var frozen: (samples: [GraphStore.Sample], events: [GraphStore.Event], closed: [GraphStore.Closed], end: Double)?
     @State private var touchX: CGFloat?
 
     static let spans: [(Double, String)] = [(20, "20秒"), (60, "1分"), (300, "5分")]
@@ -138,20 +161,21 @@ struct GraphPage: View {
         let samples = frozen?.samples ?? graph.samples
         let events = frozen?.events ?? graph.events
         let end = frozen?.end ?? (graph.samples.last?.t ?? 0)
+        let closed = frozen?.closed ?? graph.closed
         VStack(spacing: 4) {
             GeometryReader { geo in
                 let w = geo.size.width
                 let sel = touchX.flatMap { x in sample(at: end - span + Double(x / max(w, 1)) * span, in: samples) }
                 ZStack(alignment: .top) {
-                    Canvas { ctx, size in draw(ctx, size, samples: samples, events: events, end: end, sel: sel) }
+                    Canvas { ctx, size in draw(ctx, size, samples: samples, events: events, closed: closed, end: end, sel: sel) }
                         .contentShape(Rectangle())
                         .gesture(DragGesture(minimumDistance: 0)
                             .onChanged { v in
-                                if frozen == nil { frozen = (graph.samples, graph.events, graph.samples.last?.t ?? 0) }
+                                if frozen == nil { frozen = (graph.samples, graph.events, graph.closed, graph.samples.last?.t ?? 0) }
                                 touchX = min(max(v.location.x, 0), w)
                             }
                             .onEnded { _ in touchX = nil; frozen = nil })
-                    if let sel { readout(sel, end: end).padding(4) }
+                    if let sel { readout(sel, end: end, closed: closed.contains { $0.start <= sel.t && sel.t <= $0.end }).padding(4) }
                 }
             }
             if touchX == nil {
@@ -176,6 +200,8 @@ struct GraphPage: View {
         HStack(spacing: 4) {
             ForEach(Metric.allCases, id: \.self) { m in Circle().fill(m.color).frame(width: 7, height: 7) }
             Text("帯＝いつもの範囲").font(.caption2).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+            RoundedRectangle(cornerRadius: 2).fill(DiffTarget.eyesClosedColor.opacity(Self.closedOpacity)).frame(width: 12, height: 8)
+            Text("目を閉じていた").font(.caption2).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
         }
     }
 
@@ -191,9 +217,9 @@ struct GraphPage: View {
     }
 
     /// 「12秒前」と、指標ごとの値（いつもの範囲）
-    private func readout(_ s: GraphStore.Sample, end: Double) -> some View {
+    private func readout(_ s: GraphStore.Sample, end: Double, closed: Bool) -> some View {
         VStack(alignment: .leading, spacing: 1) {
-            Text("\(Int((end - s.t).rounded()))秒前　（ ）内はいつもの範囲").font(.caption2.bold())
+            Text("\(Int((end - s.t).rounded()))秒前　（ ）内はいつもの範囲" + (closed ? "　目を閉じていた" : "")).font(.caption2.bold())
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 0) {
                 ForEach(0..<3, id: \.self) { row in
                     GridRow {
@@ -219,8 +245,10 @@ struct GraphPage: View {
         return text
     }
 
+    static let closedOpacity = 0.22
+
     private func draw(_ ctx: GraphicsContext, _ size: CGSize, samples: [GraphStore.Sample], events: [GraphStore.Event],
-                      end: Double, sel: GraphStore.Sample?) {
+                      closed: [GraphStore.Closed], end: Double, sel: GraphStore.Sample?) {
         let w = size.width, h = size.height
         let start = end - span
         let x = { (t: Double) in CGFloat((t - start) / span) * w }
@@ -229,6 +257,13 @@ struct GraphPage: View {
         ctx.fill(Path(CGRect(x: 0, y: 0, width: w, height: h)), with: .color(.secondary.opacity(0.05)))
         ctx.fill(Path(CGRect(x: 0, y: y(2), width: w, height: y(-2) - y(2))), with: .color(ContentView.paleSlate))
         ctx.fill(Path(CGRect(x: 0, y: y(0) - 0.25, width: w, height: 0.5)), with: .color(ContentView.navy.opacity(0.25)))
+
+        // 目を閉じていた時間（墨紫の薄い帯、上から下まで）
+        for c in closed where c.end >= start && c.start <= end {
+            let x0 = max(x(c.start), 0), x1 = min(x(c.end), w)
+            ctx.fill(Path(CGRect(x: x0, y: 0, width: max(x1 - x0, 1.5), height: h)),
+                     with: .color(DiffTarget.eyesClosedColor.opacity(Self.closedOpacity)))
+        }
 
         // 家族の印（濃紺の点線）・場面（灰の点線）
         for e in events where e.t >= start && e.t <= end {

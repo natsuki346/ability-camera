@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-27.4",
+  "version": "2026-10-28.1",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -24,9 +24,13 @@
     {
       "date": "2026-10-27",
       "reason": "research_composite の groups から [noseSneer, mouthUpperUp] を外し、browDown ／ max(cheekSquint, eyeSquint) ／ 目を閉じている間の eyeBlink の3つにした。わざと動かす記録（3分37秒）で、noseSneer は鼻にしわを寄せてもずっと 0（MediaPipe では AU9 が取れない）、mouthUpperUp は声を出す・口を開ける動きで上がったため。あわせて、記録全体で最大値が 0.01 未満の表情の数値を「記録の質」に出すようにした（docs/validation-log.md）。"
+    },
+    {
+      "date": "2026-10-28",
+      "reason": "eyes_closed（目を閉じている）を足した：eyeBlink 左右平均が 0.5 以上が 0.5秒以上続いたら区間（それより短いのはまばたき）、0.5 未満が 0.2秒続いたら終わり、秒数は閉じ始めた時刻から。普段とは比べず（z を使わない）、普段がある間の、表情を判定できるコマ（顔が読めて |yaw| < 35°）だけで判定する。区間の一覧・時系列・--calm の10分あたりに入れ、通知候補には入れない。アプリ（DiffEngine、v1.4）と同じ値。research_composite の「目を閉じている」もこの決まりに揃え、research_composite.eye_closed を外した（前は終わりの 0.2秒が無く、普段が無い時間や表情の判定対象外の時間も数えていた）。目を細めるの blink_mask は変えない。"
     }
   ],
-  "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
+  "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
   "std_floor": {
     "mouth_smile": 0.03,
     "brow_down": 0.03,
@@ -89,6 +93,12 @@
     "min_face_ratio": 0.5,
     "max_abs_yaw_deg": 35.0
   },
+  "eyes_closed": {
+    "_note": "目を閉じている（v1.4〜）。普段とは比べない。threshold 以上が start_min_s 秒以上続いたら区間、threshold 未満が end_open_s 秒続いたら終わり。普段がある間の face_valid のコマだけ。通知候補には入れない",
+    "threshold": 0.5,
+    "start_min_s": 0.5,
+    "end_open_s": 0.2
+  },
   "stale_s": 1.0,
   "mark_window_s": 10.0,
   "notify": {
@@ -110,7 +120,7 @@
   ],
   "_eda_note": "将来の手首の記録（ability-lab.raw.v1、皮膚電気活動）用：出来事の1〜4秒後に反応を探す窓。今は使っていない。",
   "research_composite": {
-    "_note": "研究用。区間の判定・通知候補には使わない。アプリ・見る側の画面には出さない。groups は表情の数値の名前（Left/Right は左右平均）。各グループの中で普段からの差が一番大きいものを取り、重みを付けずに足す。eyeSquint はまばたきのコマを除く（metrics.eye_squint.blink_mask）",
+    "_note": "研究用。区間の判定・通知候補には使わない。アプリ・見る側の画面には出さない。groups は表情の数値の名前（Left/Right は左右平均）。各グループの中で普段からの差が一番大きいものを取り、重みを付けずに足す。eyeSquint はまばたきのコマを除く（metrics.eye_squint.blink_mask）。目を閉じている間の eyeBlink は、eyes_closed（区間）と同じ決まりで閉じていた間だけ足す",
     "enabled": true,
     "groups": [
       [
@@ -121,10 +131,6 @@
         "eyeSquint"
       ]
     ],
-    "eye_closed": {
-      "threshold": 0.5,
-      "min_s": 0.5
-    },
     "smooth_s": 0.3,
     "mark_window_s": 30,
     "min_marks": 10

@@ -14,34 +14,80 @@ enum DiffCriteria {
     static let faceWindowS = 1.0      // 表情：直近1秒で顔が映るコマが
     static let minFaceRatio = 0.5     //   半分以上で、
     static let maxAbsYaw = 35.0       //   |yaw| < 35° のときだけ比べる
+    // 目を閉じている（v1.4〜、criteria.json の eyes_closed）：普段とは比べず、閉じているかどうかの事実だけ
+    static let eyesClosedThreshold = 0.5   // eyeBlink 左右平均がこれ以上が
+    static let eyesClosedMinS = 0.5        //   0.5秒以上続いたら「目を閉じている」（短いのはまばたき）
+    static let eyesOpenEndS = 0.2          // これ未満が 0.2秒続いたら終わり。秒数は閉じ始めた時刻から
+}
+
+/// 違いの種類：指標（普段の z で比べる）か、目を閉じている（事実だけ、v1.4〜）
+enum DiffTarget: Hashable {
+    case metric(Metric)
+    case eyesClosed
+
+    static let eyesClosedKey = "eyes_closed"
+    static let eyesClosedLabel = "目を閉じている"
+
+    /// 画面・見る側・時間の流れに並べる順（表情4つ・目を閉じている・声2つ）
+    static let all: [DiffTarget] = Metric.allCases.filter(\.isFace).map { .metric($0) } + [.eyesClosed]
+        + Metric.allCases.filter { !$0.isFace }.map { .metric($0) }
+
+    /// 画面に出す名前
+    var label: String {
+        switch self {
+        case .metric(let m): m.label
+        case .eyesClosed: Self.eyesClosedLabel
+        }
+    }
+
+    /// 記録・見る側に書く名前（"brow_down" / "eyes_closed"）
+    var key: String {
+        switch self {
+        case .metric(let m): m.rawValue
+        case .eyesClosed: Self.eyesClosedKey
+        }
+    }
 }
 
 /// 1つの「違い」（いつもの範囲から外れていた間）
 struct DiffSegment: Identifiable, Equatable {
     let id = UUID()
-    let metric: Metric
-    let above: Bool
+    let target: DiffTarget
+    let above: Bool           // 目を閉じているは、いつも true
     let startT: Double        // 撮影時刻（epoch 秒）。|z| ≥ 2 になり始めた時刻
     var endT: Double
     var peakZ: Double
     var open = true           // まだ続いている
 
+    init(metric: Metric, above: Bool, startT: Double, endT: Double, peakZ: Double) {
+        target = .metric(metric); self.above = above; self.startT = startT; self.endT = endT; self.peakZ = peakZ
+    }
+
+    init(eyesClosedFrom startT: Double, to endT: Double) {
+        target = .eyesClosed; above = true; self.startT = startT; self.endT = endT; peakZ = .nan
+    }
+
+    /// 指標の違いならその指標（目を閉じているは nil）
+    var metric: Metric? { if case .metric(let m) = target { m } else { nil } }
+
     var seconds: Double { endT - startT }
 
-    /// 画面に出す文（docs/wording-guide.md）。表情は「いつもより強い」、声は「大きい／小さい」「高い／低い」
+    /// 画面に出す文（docs/wording-guide.md）。表情は「いつもより強い」、声は「大きい／小さい」「高い／低い」。
+    /// 目を閉じているは、状態の名前を付けずに「目を閉じている」だけ（秒数は呼ぶ側が足す）
     var message: String {
         switch metric {
-        case .rmsDb: "声が、いつもより\(above ? "大きい" : "小さい")"
-        case .f0Hz: "声が、いつもより\(above ? "高い" : "低い")"
-        default: "\(metric.label)動きが、いつもより\(above ? "強い" : "弱い")"
+        case nil: DiffTarget.eyesClosedLabel
+        case .rmsDb?: "声が、いつもより\(above ? "大きい" : "小さい")"
+        case .f0Hz?: "声が、いつもより\(above ? "高い" : "低い")"
+        case let m?: "\(m.label)動きが、いつもより\(above ? "強い" : "弱い")"
         }
     }
 
-    /// 記録の change に書く形（"brow_down:above"）
-    var key: String { "\(metric.rawValue):\(above ? "above" : "below")" }
+    /// 記録の change に書く形（"brow_down:above"、目を閉じているは "eyes_closed:closed"）
+    var key: String { metric == nil ? "\(target.key):closed" : "\(target.key):\(above ? "above" : "below")" }
 
     /// 画面に出すか。表情の「いつもより弱い」は出さない（criteria.json の face_below_counts: false）
-    var shown: Bool { above || !metric.isFace }
+    var shown: Bool { above || !(metric?.isFace ?? true) }
 }
 
 /// 1コマ分の入力
@@ -79,17 +125,20 @@ struct DiffEngine {
     private var baseline: [Metric: Stat]?
     private var smooth: [Metric: (v: Double, t: Double)] = [:]
     private var det: [Metric: Detector] = [:]
+    private var closedDet = ClosedDetector()
 
     /// 今の z（判定できたコマのもの。判定できないときは入れない）
     private(set) var z: [Metric: Double] = [:]
     /// 今のならした値（判定したコマのもの。値が古いときは入れない）
     private(set) var value: [Metric: Double] = [:]
     /// 続いている違い（表情の「弱い」も含む。出すかは shown で決める）
-    private(set) var active: [Metric: DiffSegment] = [:]
+    private(set) var active: [DiffTarget: DiffSegment] = [:]
     /// 終わった違い（呼ぶ側が取り出す）
     var finished: [DiffSegment] = []
     /// 最後に判定したコマの時刻
     private(set) var processedT = -Double.infinity
+    /// 最後に判定したコマで、目を閉じているかを判定できたか（普段があり、顔が読めて |yaw| < 35°）
+    private(set) var eyesJudgeable = false
 
     /// 普段を決めた・取り直した（nil）。この時刻より後のコマから使う
     mutating func setBaseline(_ b: [Metric: Stat]?) {
@@ -115,11 +164,11 @@ struct DiffEngine {
     /// 残りを全部判定する（記録の終わり）
     mutating func flush() {
         drain(until: .infinity)
-        for (m, s) in active {
+        for (k, s) in active {
             var s = s
             s.open = false
             finished.append(s)
-            active[m] = nil
+            active[k] = nil
         }
     }
 
@@ -170,18 +219,84 @@ struct DiffEngine {
             var d = det[m] ?? Detector()
             let (started, ended) = d.step(t: x.t, z: zz)
             det[m] = d
+            let k = DiffTarget.metric(m)
             if let e = ended {
-                var seg = active[m] ?? DiffSegment(metric: m, above: e.sign > 0, startT: e.start, endT: e.end, peakZ: e.peak)
+                var seg = active[k] ?? DiffSegment(metric: m, above: e.sign > 0, startT: e.start, endT: e.end, peakZ: e.peak)
                 seg.endT = e.end; seg.peakZ = e.peak; seg.open = false
                 finished.append(seg)
-                active[m] = nil
+                active[k] = nil
             }
             if let s = started {
-                active[m] = DiffSegment(metric: m, above: s.sign > 0, startT: s.start, endT: s.end, peakZ: s.peak)
-            } else if let cur = d.seg, var seg = active[m] {
+                active[k] = DiffSegment(metric: m, above: s.sign > 0, startT: s.start, endT: s.end, peakZ: s.peak)
+            } else if let cur = d.seg, var seg = active[k] {
                 seg.endT = cur.end; seg.peakZ = cur.peak
-                active[m] = seg
+                active[k] = seg
             }
+        }
+
+        // 目を閉じている：普段とは比べないが、ほかの違いと同じく普段がある間だけ、顔が読めて |yaw| < 35° のコマで判定する
+        let judgeable = baseline != nil && faceValid
+        eyesJudgeable = judgeable
+        let (cStarted, cEnded) = closedDet.step(t: x.t, judgeable: judgeable,
+                                               closed: x.face ? x.blink.map { $0 >= DiffCriteria.eyesClosedThreshold } : nil)
+        if let e = cEnded {
+            var seg = active[.eyesClosed] ?? DiffSegment(eyesClosedFrom: e.start, to: e.end)
+            seg.endT = e.end; seg.open = false
+            finished.append(seg)
+            active[.eyesClosed] = nil
+        }
+        if let s = cStarted {
+            active[.eyesClosed] = DiffSegment(eyesClosedFrom: s.start, to: s.end)
+        } else if let cur = closedDet.seg, var seg = active[.eyesClosed] {
+            seg.endT = cur.end
+            active[.eyesClosed] = seg
+        }
+    }
+
+    /// 目を閉じている（review.py の detect_eyes_closed を1コマずつにしたもの）。
+    /// 閉じている（eyeBlink 左右平均 ≥ 0.5）が 0.5秒以上続いたら始まり（閉じ始めた時刻から）、閉じていないが 0.2秒続いたら、その最初のコマで終わり。
+    /// 判定できないコマ（普段が無い・顔が読めない・横を向きすぎ）が来たら、前のコマで打ち切る。顔の無いコマ（closed が nil）は何も変えない
+    struct ClosedDetector {
+        struct Seg { var start: Double; var end: Double }
+        private var run0: Double?
+        private(set) var seg: Seg?
+        private var open0: Double?
+        private var lastT = -Double.infinity
+
+        mutating func step(t: Double, judgeable: Bool, closed: Bool?) -> (Seg?, Seg?) {
+            let prevT = lastT
+            lastT = t
+            guard judgeable else {
+                run0 = nil; open0 = nil
+                guard var s = seg else { return (nil, nil) }
+                s.end = max(prevT, s.start)
+                seg = nil
+                return (nil, s)
+            }
+            guard let closed else { return (nil, nil) }
+            if var s = seg {
+                if closed {
+                    open0 = nil
+                    s.end = t
+                    seg = s
+                    return (nil, nil)
+                }
+                if open0 == nil { open0 = t }
+                if let o = open0, t - o >= DiffCriteria.eyesOpenEndS - 1e-9 {
+                    s.end = o
+                    seg = nil; open0 = nil
+                    return (nil, s)
+                }
+                return (nil, nil)
+            }
+            guard closed else { run0 = nil; return (nil, nil) }
+            if run0 == nil { run0 = t }
+            if let r = run0, t - r >= DiffCriteria.eyesClosedMinS - 1e-9 {
+                let new = Seg(start: r, end: t)
+                seg = new; run0 = nil; open0 = nil
+                return (new, nil)
+            }
+            return (nil, nil)
         }
     }
 

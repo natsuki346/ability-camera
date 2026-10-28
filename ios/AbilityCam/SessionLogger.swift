@@ -86,9 +86,10 @@ struct BaselineRecord: Encodable {
     var savedMs: Int64?         // saved：保存した日時
     var camera: String?         // saved：保存したときのカメラ
     var faceBox: FaceBoxStats?  // 普段の間の顔の位置と大きさ（v1.2〜）
+    var eyesClosedS: Double?    // 普段の間に目を閉じていた秒数（v1.4〜。目を閉じているの決まりで、数えたコマから。保存した普段には無い）
 
     enum CodingKeys: String, CodingKey {
-        case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box"
+        case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", eyesClosedS = "eyes_closed_s"
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
         case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics
     }

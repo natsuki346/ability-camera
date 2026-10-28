@@ -1,25 +1,28 @@
 import AVFoundation
 
-/// 撮る側の設定「カメラ」。初めは広角（今まで通り）
+/// 撮る側の設定「カメラ」。初めは広角（今まで通り）。前面は自分で試す用（胸に着けて使うのは背面、v1.5〜）
 enum CameraLens: String, CaseIterable, Identifiable {
-    case wide = "wide", ultraWide = "ultra_wide"
+    case wide = "wide", ultraWide = "ultra_wide", front = "front"
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .wide: "広角"
         case .ultraWide: "超広角"
+        case .front: "前面（自分で試す用）"
         }
     }
 
     var deviceType: AVCaptureDevice.DeviceType {
         switch self {
-        case .wide: .builtInWideAngleCamera
+        case .wide, .front: .builtInWideAngleCamera
         case .ultraWide: .builtInUltraWideCamera
         }
     }
 
-    var available: Bool { AVCaptureDevice.default(deviceType, for: .video, position: .back) != nil }
+    var position: AVCaptureDevice.Position { self == .front ? .front : .back }
+
+    var available: Bool { AVCaptureDevice.default(deviceType, for: .video, position: position) != nil }
 
     /// 設定に保存してある値（無い・使えなければ広角）
     static var selected: CameraLens {
@@ -27,11 +30,13 @@ enum CameraLens: String, CaseIterable, Identifiable {
     }
 }
 
-/// 背面カメラの映像を1コマずつ受け取る。映像そのものは保存しない。
+/// カメラの映像を1コマずつ受け取る。映像そのものは保存しない。
+/// 前面カメラでも左右反転（鏡の見え方）はしない：背面で向かい合った人を撮ったときと同じ向き（本人の左＝映像の右）で解析し、
+/// 画面の映像も同じ向きにする。顔の絵・顔の向き（yaw）・左右の表情の数値が、背面のときと同じ意味になる（v1.5〜）
 final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     enum CameraError: LocalizedError {
         case noCamera
-        var errorDescription: String? { "背面カメラが見つかりません" }
+        var errorDescription: String? { "カメラが見つかりません" }
     }
 
     let session = AVCaptureSession()
@@ -83,7 +88,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     private func setInput(_ wanted: CameraLens) throws {
         let use = wanted.available ? wanted : .wide
-        guard let device = AVCaptureDevice.default(use.deviceType, for: .video, position: .back) else {
+        guard let device = AVCaptureDevice.default(use.deviceType, for: .video, position: use.position) else {
             throw CameraError.noCamera
         }
         let new = try AVCaptureDeviceInput(device: device)
@@ -97,11 +102,18 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
 
-    /// 縦持ちの向きで解析する
+    /// 縦持ちの向きで解析する。前面でも左右反転しない（背面と同じ向き）
     private func applyRotation() {
-        if let c = output?.connection(with: .video), c.isVideoRotationAngleSupported(90) {
-            c.videoRotationAngle = 90
-        }
+        guard let c = output?.connection(with: .video) else { return }
+        if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
+        Self.unmirror(c)
+    }
+
+    /// 左右反転を切る（前面カメラは、自動にしておくと鏡の見え方になることがある）
+    static func unmirror(_ c: AVCaptureConnection) {
+        guard c.isVideoMirroringSupported else { return }
+        if c.automaticallyAdjustsVideoMirroring { c.automaticallyAdjustsVideoMirroring = false }
+        if c.isVideoMirrored { c.isVideoMirrored = false }
     }
 
     func start() { sessionQueue.async { if !self.session.isRunning { self.session.startRunning() } } }

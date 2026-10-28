@@ -69,7 +69,7 @@ struct FaceSketch: View {
                        "mouthPucker", "mouthStretchLeft", "mouthStretchRight"]
 
     /// MediaPipe の Left/Right は本人から見た左右。背面カメラで向かい合って見ているので、
-    /// 本人の左は画面の右に描く（映像と同じ見え方）。実機で逆なら false にする
+    /// 本人の左は画面の右に描く（前面カメラも左右反転せずに解析するので同じ、v1.5〜）（映像と同じ見え方）。実機で逆なら false にする
     static let subjectLeftOnScreenRight = true
 
     var body: some View {

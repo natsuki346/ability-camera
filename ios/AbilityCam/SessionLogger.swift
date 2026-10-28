@@ -49,15 +49,16 @@ struct EventRecord: Encodable {
     var head: String?           // head_turn：新しい向き（front / right / left / hidden / oblique）
     var from: String?           // head_turn：前の向き
     var yawDeg: Double?         // head_turn：なり始めたときの yaw（見えない：見えなくなる直前の yaw）
-    var camera: String?         // camera：切り替えたカメラ（wide / ultra_wide）
+    var camera: String?         // camera：切り替えたカメラ（wide / ultra_wide / front）
     var count: Int?             // faces：映っている顔の数（0.5秒続いたもの）。faces_limit：探す顔の数
     var baseline: String?       // change：どちらの普段で比べたか（today / saved、v1.2〜）
     var personId: String?       // person：選んだ人の id（名前は書かない）
     var savedCamera: String?    // saved_baseline_skipped：保存した普段のカメラ
+    var mirrorCorrected: Bool?  // camera：前面に切り替えた（左右反転せずに解析する、v1.5〜）
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
-        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera"
+        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected"
     }
 }
 
@@ -122,9 +123,11 @@ final class SessionLogger {
             // 使ったカメラ。超広角は画角の端で顔が歪み、表情の数値が変わることがある
             "camera": camera.rawValue,
             "camera_label": camera.label,
+            // 前面カメラ（自分で試す用、v1.5〜）は左右反転せずに解析した（背面で向かい合って撮ったときと同じ向き：本人の左＝映像の右）
+            "mirror_corrected": camera == .front,
             // 人の id（名前は書かない。v1.2〜）
             "person_id": personId ?? NSNull(),
-            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角。超広角は画角の端で顔が歪み表情の数値が変わることがある)"
+            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角, front=前面・自分で試す用。超広角は画角の端で顔が歪み表情の数値が変わることがある) / mirror_corrected=前面カメラの映像を左右反転せずに解析し、顔の向き・左右の表情が背面と同じ意味"
         ]
         let data = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
         let ms = header["started_at_ms"] as! Int64

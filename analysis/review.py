@@ -649,11 +649,16 @@ def head_events(rec: Recording) -> list[dict]:
 def camera_label(rec: Recording) -> str:
     """記録のヘッダの camera（v0.8〜）。途中で切り替えたら camera の event"""
     code = rec.header.get("camera")
-    names = {"wide": "広角", "ultra_wide": "超広角"}
+    names = {"wide": "広角", "ultra_wide": "超広角", "front": "前面（自分で試す用）"}
     first = names.get(code, code) if code else "広角（記録にカメラが書かれていない v0.8 より前の記録）"
     later = [f"{jst(e['t_ms'] / 1000)} に{e.get('value') or names.get(e.get('camera'), '?')}へ"
              for e in rec.events if e.get("kind") == "camera"]
     return first + (f"（{'、'.join(later)}）" if later else "")
+
+
+def uses_front(rec: Recording) -> bool:
+    return rec.header.get("camera") == "front" or any(
+        e.get("kind") == "camera" and e.get("camera") == "front" for e in rec.events)
 
 
 def uses_ultra_wide(rec: Recording) -> bool:
@@ -1319,6 +1324,10 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     if uses_ultra_wide(rec):
         parts.append("<p class=note>超広角で記録しています。画角の端では顔が歪み、表情の数値が変わることがあります"
                      "（顔が画面の端にあった時間の区間は、特に参考程度に見てください）。</p>")
+    if uses_front(rec):
+        parts.append("<p class=note>前面カメラ（自分で試す用）の記録です。胸に着けて使うのは背面です。"
+                     "前面でも左右反転せずに解析しているので、顔の向き・左右の表情は背面と同じ意味です"
+                     f"（ヘッダの mirror_corrected：{e(str(rec.header.get('mirror_corrected', '書かれていない')))}）。</p>")
     parts.append("<p class=note>記録から、観測された変化（いつもの範囲から数値が外れた区間）を確認するための手がかりです。"
                  "本人の気持ちや状態は判断していません。文言と色は docs/wording-guide.md に従っています。</p>")
 

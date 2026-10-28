@@ -329,6 +329,7 @@ final class AnalysisModel: ObservableObject {
             guard used != before, running else { return }
             var e = EventRecord(tMs: Self.nowMs(), kind: "camera", value: .text(used.label))
             e.camera = used.rawValue
+            e.mirrorCorrected = used == .front
             logger.write(e)
             head.reset()
             restartBaseline()

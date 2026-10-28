@@ -41,7 +41,11 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
     private var lastTs = -1
     private var submitted = 0      // 解析に渡したコマの数（解析コマ/秒が落ちていないか見る）
     private var imageSize = CGSize.zero
+    private var mirrored = false   // 解析に渡す映像が鏡（前面カメラ）。記録の値を背面と同じ意味に直す（v1.6.1〜）
     private let lock = NSLock()
+
+    /// 届いた映像の大きさ（横長なら、カメラに回転を決め直させる）
+    var onImageSize: ((CGSize) -> Void)?
 
     /// MediaPipe のスレッドから呼ばれる
     var onResult: ((Result) -> Void)?
@@ -60,6 +64,21 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         lock.lock(); defer { lock.unlock() }
         preferred = s.map { (Box(cx: $0.cx.mean, cy: $0.cy.mean, w: $0.w.mean),
                              Box(cx: max($0.cx.std, 0.05), cy: max($0.cy.std, 0.05), w: max($0.w.std, 0.05))) }
+    }
+
+    func setMirrored(_ m: Bool) {
+        lock.lock(); mirrored = m; lock.unlock()
+    }
+
+    /// 鏡の映像で取れた値を、背面（鏡でない映像）と同じ意味に直す：左右の表情の名前を入れ替える
+    static func unmirrorBlendshapes(_ bs: [String: Float]) -> [String: Float] {
+        var out: [String: Float] = [:]
+        for (k, v) in bs {
+            if k.hasSuffix("Left") { out[String(k.dropLast(4)) + "Right"] = v }
+            else if k.hasSuffix("Right") { out[String(k.dropLast(5)) + "Left"] = v }
+            else { out[k] = v }
+        }
+        return out
     }
 
     /// 探す顔の数を変える（作り直す）
@@ -101,9 +120,11 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
             imageSize = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
         }
+        let size = imageSize
         sentAt[ms] = CACurrentMediaTime()
         sentAt = sentAt.filter { $0.key > ms - 3000 }      // 返ってこなかったコマの分を掃除
         lock.unlock()
+        onImageSize?(size)
 
         do {
             let image = try MPImage(sampleBuffer: sampleBuffer, orientation: .up)
@@ -134,7 +155,7 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
                         error: Error?) {
         let now = CACurrentMediaTime()
         lock.lock()
-        let sent = sentAt.removeValue(forKey: timestampInMilliseconds), size = imageSize, pref = preferred
+        let sent = sentAt.removeValue(forKey: timestampInMilliseconds), size = imageSize, pref = preferred, mir = mirrored
         lock.unlock()
 
         // 顔が2つ映ったら、普段の位置・大きさに近いほうを本人として使う（普段がまだ無ければ大きいほう）
@@ -143,7 +164,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
             guard !lms.isEmpty else { return nil }
             let xs = lms.map { Double($0.x) }, ys = lms.map { Double($0.y) }
             let x0 = xs.min()!, x1 = xs.max()!, y0 = ys.min()!, y1 = ys.max()!
-            return Box(cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0)
+            let cx = (x0 + x1) / 2
+            return Box(cx: mir ? 1 - cx : cx, cy: (y0 + y1) / 2, w: x1 - x0)   // 鏡なら、背面と同じ向きの位置にする
         }
         var pick = 0
         if boxes.count > 1 {
@@ -160,7 +182,7 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         var pts: [[Float]] = []
         var mesh: [CGPoint] = []
         var pose: Pose?
-        let lms = faces.indices.contains(pick) ? faces[pick] : nil
+        let lms = faces.indices.contains(pick) ? faces[pick] : nil   // 網目（画面だけ）は映像のままの座標（プレビューも同じ鏡）
         if let lms, !lms.isEmpty {
             let blend = result?.faceBlendshapes ?? []
             for c in (blend.indices.contains(pick) ? blend[pick] : blend.first)?.categories ?? [] {
@@ -169,11 +191,16 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
             pts = Self.keyPointIndices.compactMap { i in
                 guard i < lms.count else { return nil }
                 let p = lms[i]
-                return [p.x, p.y, p.z].map { ($0 * 10000).rounded() / 10000 }
+                return [mir ? 1 - p.x : p.x, p.y, p.z].map { ($0 * 10000).rounded() / 10000 }
             }
+            if mir, pts.count == Self.keyPointIndices.count {   // 両目尻・両口角の左右を入れ替える（背面と同じ並び）
+                pts.swapAt(3, 4); pts.swapAt(5, 6)
+            }
+            if mir { bs = Self.unmirrorBlendshapes(bs) }
             mesh = lms.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
             let mats = result?.facialTransformationMatrixes ?? []
             pose = (mats.indices.contains(pick) ? mats[pick] : mats.first).flatMap(Self.pose)
+            if mir, let p = pose { pose = Pose(yaw: -p.yaw, pitch: p.pitch, roll: -p.roll) }   // 鏡の映像の左右を直す
         }
         onResult?(Result(
             captureMs: timestampInMilliseconds,

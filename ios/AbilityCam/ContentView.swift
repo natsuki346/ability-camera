@@ -127,7 +127,7 @@ struct ContentView: View {
     /// 小さいカメラ映像（網目つき）。タップで大きく
     private var camera: some View {
         // 1つのカメラに映像の層は1つだけにする（大きく出している間は、こちらは黒）
-        Group { if cameraLarge { Color.black } else { CameraPreview(session: model.camera.session, fill: true, lens: model.lensInUse) } }
+        Group { if cameraLarge { Color.black } else { CameraPreview(camera: model.camera, fill: true, lens: model.lensInUse) } }
             .overlay {
                 // 網目は解析の遅れの分だけ映像より遅れて見える（即時性そのものなので、隠さない）
                 if model.meshEnabled, let mesh = model.mesh, !cameraLarge { MeshOverlay(mesh: mesh, fill: true) }
@@ -145,7 +145,7 @@ struct ContentView: View {
     private var largeCamera: some View {
         ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
-            CameraPreview(session: model.camera.session, fill: false, lens: model.lensInUse)
+            CameraPreview(camera: model.camera, fill: false, lens: model.lensInUse)
                 .overlay { if model.meshEnabled, let mesh = model.mesh { MeshOverlay(mesh: mesh, fill: false) } }
                 .ignoresSafeArea(edges: .bottom)
             Button { model.meshEnabled.toggle() } label: {
@@ -275,28 +275,30 @@ struct ViewersBar: View {
 }
 
 struct CameraPreview: UIViewRepresentable {
-    let session: AVCaptureSession
+    let camera: CameraManager
     var fill = false   // true: 枠いっぱいに（はみ出す分は切る）
-    var lens: CameraLens?   // 変わったら、プレビューの左右反転をもう一度切る
+    var lens: CameraLens?   // 変わったら、プレビューの向きと鏡をもう一度合わせる
 
     func makeUIView(context: Context) -> PreviewView {
         let v = PreviewView()
-        v.previewLayer.session = session
+        v.camera = camera
+        v.previewLayer.session = camera.session
         v.previewLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
         return v
     }
 
     func updateUIView(_ uiView: PreviewView, context: Context) {
         uiView.previewLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
-        uiView.unmirror()
+        uiView.match()
     }
 
-    /// プレビューも、解析と同じく左右反転しない（前面カメラで、網目が映像と左右逆にならないように）
+    /// プレビューの回転と鏡を、解析に渡す映像と同じにする（網目が顔に重なるように、v1.6.1〜）
     final class PreviewView: UIView {
+        weak var camera: CameraManager?
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
-        func unmirror() { if let c = previewLayer.connection { CameraManager.unmirror(c) } }
-        override func layoutSubviews() { super.layoutSubviews(); unmirror() }
+        func match() { camera?.matchPreview(previewLayer) }
+        override func layoutSubviews() { super.layoutSubviews(); match() }
     }
 }
 

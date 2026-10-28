@@ -88,7 +88,7 @@ struct NowPage: View {
     private var differences: some View {
         VStack(alignment: .leading, spacing: 2) {
             if !model.running {
-                Text(PersonStore.shared.selected?.saved != nil
+                Text(PersonStore.shared.selected?.saved(for: (model.lensInUse ?? CameraLens.selected).rawValue) != nil
                      ? "記録が始まると、保存した普段で比べ始めます（カメラが違うときは、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します）"
                      : "記録が始まると、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します")
                     .font(.callout).foregroundStyle(.secondary).lineLimit(2).minimumScaleFactor(0.7)

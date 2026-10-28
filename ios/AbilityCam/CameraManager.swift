@@ -20,6 +20,9 @@ enum CameraLens: String, CaseIterable, Identifiable {
         }
     }
 
+    /// 短い名前（設定の「人」のカメラごとの普段）
+    var shortLabel: String { self == .front ? "前面" : label }
+
     var position: AVCaptureDevice.Position { self == .front ? .front : .back }
 
     var available: Bool { AVCaptureDevice.default(deviceType, for: .video, position: position) != nil }
@@ -31,8 +34,12 @@ enum CameraLens: String, CaseIterable, Identifiable {
 }
 
 /// カメラの映像を1コマずつ受け取る。映像そのものは保存しない。
-/// 前面カメラでも左右反転（鏡の見え方）はしない：背面で向かい合った人を撮ったときと同じ向き（本人の左＝映像の右）で解析し、
-/// 画面の映像も同じ向きにする。顔の絵・顔の向き（yaw）・左右の表情の数値が、背面のときと同じ意味になる（v1.5〜）
+/// 映像の向き（v1.6.1〜、camera_orientation_version 2）：
+/// - 解析に渡す映像の回転は、カメラの組み替え（入力の付け替え）が終わってから決める（v1.5 は組み替えの途中で決めていて、前面に替えたとき効いていなかった）
+/// - 背面は今まで通り 90°（縦持ち）。前面は RotationCoordinator が出す、水平を保つ角度
+/// - 届いた映像が横長なら、もう一度回転を決め直す
+/// - 左右反転（鏡）は、解析とプレビューで同じにする（どちらもカメラの初めの設定のまま、プレビューを解析に合わせる）。
+///   解析に渡す映像が鏡なら、FaceAnalyzer が記録の値（左右の表情・yaw・roll・顔の枠・鍵となる点）を背面と同じ意味に直す
 final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     enum CameraError: LocalizedError {
         case noCamera
@@ -47,6 +54,17 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var input: AVCaptureDeviceInput?
     /// 今使っているカメラ（超広角が無い端末では、選んでいても広角）
     private(set) var lens = CameraLens.wide
+    /// 解析に渡す映像が鏡のようになっているか（決めた回転のあとで、つながりから読む）
+    private(set) var analysisMirrored = false
+    /// 解析に渡す映像の回転（度）
+    private(set) var rotationAngle: CGFloat = 90
+    static let orientationVersion = 2
+    /// 映像の向き・鏡が決まったとき（main スレッド）
+    var onOrientation: ((_ mirrored: Bool) -> Void)?
+    private var coordinator: AVCaptureDevice.RotationCoordinator?
+    private var coordinatorObservation: NSKeyValueObservation?
+    private var lastLandscapeFix: CFTimeInterval = 0
+    private let previews = NSHashTable<AVCaptureVideoPreviewLayer>.weakObjects()
 
     /// カメラのスレッドから呼ばれる
     var onFrame: ((CMSampleBuffer) -> Void)?
@@ -56,34 +74,38 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     func configureIfNeeded(lens wanted: CameraLens) throws -> CameraLens {
         guard !configured else { return lens }
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
-        session.sessionPreset = .hd1280x720
-
-        try setInput(wanted)
-
-        let output = AVCaptureVideoDataOutput()
-        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        output.alwaysDiscardsLateVideoFrames = true   // 遅れたコマは捨てる（即時性を優先）
-        output.setSampleBufferDelegate(self, queue: frameQueue)
-        if session.canAddOutput(output) { session.addOutput(output) }
-        self.output = output
-        applyRotation()
+        do {
+            session.sessionPreset = .hd1280x720
+            try setInput(wanted)
+            let output = AVCaptureVideoDataOutput()
+            output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            output.alwaysDiscardsLateVideoFrames = true   // 遅れたコマは捨てる（即時性を優先）
+            output.setSampleBufferDelegate(self, queue: frameQueue)
+            if session.canAddOutput(output) { session.addOutput(output) }
+            self.output = output
+        } catch {
+            session.commitConfiguration()
+            throw error
+        }
+        session.commitConfiguration()
         configured = true
+        applyRotation()   // 組み替えが終わってから
         return lens
     }
 
-    /// 広角／超広角を切り替える（動いたままでよい）。使ったカメラを返す
+    /// 広角／超広角／前面を切り替える（動いたままでよい）。使ったカメラを返す
     func switchLens(_ wanted: CameraLens) throws -> CameraLens {
         guard configured else { return try configureIfNeeded(lens: wanted) }
         let target = wanted.available ? wanted : .wide
         guard target != lens else { return lens }
-        return try sessionQueue.sync {
+        let used: CameraLens = try sessionQueue.sync {
             session.beginConfiguration()
             defer { session.commitConfiguration() }
             try setInput(target)
-            applyRotation()   // 入力を替えるとつながりが作り直されるので、向きをもう一度
             return lens
         }
+        applyRotation()   // 入力を替えるとつながりが作り直されるので、組み替えが終わってから向きをもう一度
+        return used
     }
 
     private func setInput(_ wanted: CameraLens) throws {
@@ -97,23 +119,49 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             session.addInput(new)
             input = new
             lens = use
+            // 前面は、水平を保つ回転を RotationCoordinator に求めさせる（背面は今まで通り 90°）
+            coordinatorObservation = nil
+            coordinator = use == .front ? AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil) : nil
+            coordinatorObservation = coordinator?.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.new]) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.applyRotation() }
+            }
         } else if let old = input, session.canAddInput(old) {
             session.addInput(old)   // 替えられなかったら元に戻す
         }
     }
 
-    /// 縦持ちの向きで解析する。前面でも左右反転しない（背面と同じ向き）
-    private func applyRotation() {
+    /// 解析に渡す映像の回転を決め、鏡かどうかを読み、プレビューを同じにする（組み替えが終わってから呼ぶ）
+    func applyRotation() {
         guard let c = output?.connection(with: .video) else { return }
-        if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
-        Self.unmirror(c)
+        let angle = coordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
+        if c.isVideoRotationAngleSupported(angle) {
+            if c.videoRotationAngle != angle { c.videoRotationAngle = angle }
+            rotationAngle = angle
+        }
+        analysisMirrored = c.isVideoMirroringSupported && c.isVideoMirrored
+        for p in previews.allObjects { matchPreview(p) }
+        let m = analysisMirrored
+        if Thread.isMainThread { onOrientation?(m) } else { DispatchQueue.main.async { self.onOrientation?(m) } }
     }
 
-    /// 左右反転を切る（前面カメラは、自動にしておくと鏡の見え方になることがある）
-    static func unmirror(_ c: AVCaptureConnection) {
-        guard c.isVideoMirroringSupported else { return }
-        if c.automaticallyAdjustsVideoMirroring { c.automaticallyAdjustsVideoMirroring = false }
-        if c.isVideoMirrored { c.isVideoMirrored = false }
+    /// プレビューの回転と鏡を、解析に渡す映像と同じにする（網目が顔に重なるように）
+    func matchPreview(_ layer: AVCaptureVideoPreviewLayer) {
+        previews.add(layer)
+        guard let c = layer.connection else { return }
+        if c.isVideoRotationAngleSupported(rotationAngle), c.videoRotationAngle != rotationAngle { c.videoRotationAngle = rotationAngle }
+        if c.isVideoMirroringSupported {
+            if c.automaticallyAdjustsVideoMirroring { c.automaticallyAdjustsVideoMirroring = false }
+            if c.isVideoMirrored != analysisMirrored { c.isVideoMirrored = analysisMirrored }
+        }
+    }
+
+    /// 届いた映像が横長なら（縦持ちのはずが回転が効いていない）、1秒に1回まで回転を決め直す
+    func checkPortrait(_ size: CGSize) {
+        guard size.width > size.height, rotationAngle == 90 || rotationAngle == 270 else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastLandscapeFix > 1 else { return }
+        lastLandscapeFix = now
+        DispatchQueue.main.async { self.applyRotation() }
     }
 
     func start() { sessionQueue.async { if !self.session.isRunning { self.session.startRunning() } } }

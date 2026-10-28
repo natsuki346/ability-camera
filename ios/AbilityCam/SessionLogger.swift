@@ -66,11 +66,12 @@ struct EventRecord: Encodable {
     var baseline: String?       // change：どちらの普段で比べたか（today / saved、v1.2〜）
     var personId: String?       // person：選んだ人の id（名前は書かない）
     var savedCamera: String?    // saved_baseline_skipped：保存した普段のカメラ
-    var mirrorCorrected: Bool?  // camera：前面に切り替えた（左右反転せずに解析する、v1.5〜）
+    var mirrorCorrected: Bool?  // camera：解析に渡す映像が鏡のようになっていて、記録の値（左右の表情・yaw・roll・顔の枠）を背面と同じ意味に直した（v1.6.1〜）
+    var orientationVersion: Int? // camera：解析に渡す映像の向きの決め方（camera_orientation_version、v1.6.1〜は 2）
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
-        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected"
+        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version"
     }
 }
 
@@ -118,7 +119,7 @@ final class SessionLogger {
     private var startedMs = Int64.max   // queue の上でだけ触る
     private var stats = SessionStats()  // queue の上でだけ触る。書いた行から要約を数える
 
-    func start(camera: CameraLens, personId: String?) throws {
+    func start(camera: CameraLens, personId: String?, mirrored: Bool = false) throws {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd-HHmmss"
         let name = "ability-cam-\(f.string(from: Date())).jsonl"
@@ -137,11 +138,14 @@ final class SessionLogger {
             // 使ったカメラ。超広角は画角の端で顔が歪み、表情の数値が変わることがある
             "camera": camera.rawValue,
             "camera_label": camera.label,
-            // 前面カメラ（自分で試す用、v1.5〜）は左右反転せずに解析した（背面で向かい合って撮ったときと同じ向き：本人の左＝映像の右）
-            "mirror_corrected": camera == .front,
+            // 映像の向きの決め方（v1.6.1〜は 2：向きを組み替えのあとに決め、前面は RotationCoordinator の角度。無い記録は 1）。
+            // v1.5〜v1.6 の前面の記録（このキーが無い）は、解析に渡した映像の向きが合っていなかった
+            "camera_orientation_version": CameraManager.orientationVersion,
+            // 解析に渡す映像が鏡のようになっていて、記録の値（左右の表情・yaw・roll・顔の枠・鍵となる点）を背面と同じ意味に直した
+            "mirror_corrected": mirrored,
             // 人の id（名前は書かない。v1.2〜）
             "person_id": personId ?? NSNull(),
-            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角, front=前面・自分で試す用。超広角は画角の端で顔が歪み表情の数値が変わることがある) / mirror_corrected=前面カメラの映像を左右反転せずに解析し、顔の向き・左右の表情が背面と同じ意味"
+            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角, front=前面・自分で試す用。超広角は画角の端で顔が歪み表情の数値が変わることがある) / mirror_corrected=解析の映像が鏡で、記録の値を背面と同じ意味に直した / camera_orientation_version=映像の向きの決め方(2=v1.6.1〜)"
         ]
         let data = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
         let ms = header["started_at_ms"] as! Int64

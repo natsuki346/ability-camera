@@ -34,7 +34,7 @@ struct MeshOverlay: View {
     var body: some View {
         Canvas { ctx, size in
             guard mesh.imageSize.width > 0 else { return }
-            // プレビューと同じ置き方（resizeAspect は余白を除いた領域、resizeAspectFill ははみ出す領域）。前面カメラも左右反転せずに解析・表示するので、反転はしない（v1.5〜）
+            // プレビューと同じ置き方（resizeAspect は余白を除いた領域、resizeAspectFill ははみ出す領域）。プレビューの回転と鏡は解析に渡す映像と同じにしてあるので、反転はしない（v1.6.1〜）
             let k = fill ? max(size.width / mesh.imageSize.width, size.height / mesh.imageSize.height)
                          : min(size.width / mesh.imageSize.width, size.height / mesh.imageSize.height)
             let w = mesh.imageSize.width * k, h = mesh.imageSize.height * k

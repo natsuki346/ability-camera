@@ -29,13 +29,44 @@ struct SavedVoice: Codable, Equatable {
 }
 
 /// 人：名前だけ。この端末の中にだけ保存し、外には送らない（見る側にも、記録にも名前は書かない。記録には id だけ）
+/// 保存した普段はカメラ（広角・超広角・前面）ごとに1つずつ、声の普段はカメラに関係なく1つ（v1.6.1〜）
 struct Person: Codable, Identifiable, Equatable {
     let id: String                               // ランダムな id
     var name: String
-    var saved: SavedBaseline?
+    var savedByCamera: [String: SavedBaseline] = [:]   // カメラ（wide / ultra_wide / front）→ 表情の普段
+    var voice: SavedVoice?                       // 声の普段（どのカメラでも使う）
 
     /// 画面に出す名前（v1.3 から「さん」を付けない：「自分」「姉」）
     var displayName: String { name }
+
+    func saved(for camera: String) -> SavedBaseline? { savedByCamera[camera] }
+    var hasSaved: Bool { !savedByCamera.isEmpty }
+
+    init(id: String, name: String) { self.id = id; self.name = name }
+
+    enum CodingKeys: String, CodingKey { case id, name, savedByCamera = "saved_by_camera", voice, saved }
+
+    /// v1.6 までの persons.json（saved が1つ）は、そのカメラの普段として移す。声の普段は人ごとに移す
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        savedByCamera = try c.decodeIfPresent([String: SavedBaseline].self, forKey: .savedByCamera) ?? [:]
+        voice = try c.decodeIfPresent(SavedVoice.self, forKey: .voice)
+        if var old = try c.decodeIfPresent(SavedBaseline.self, forKey: .saved) {
+            if voice == nil { voice = old.voice }
+            old.voice = nil
+            if savedByCamera[old.camera] == nil { savedByCamera[old.camera] = old }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(savedByCamera, forKey: .savedByCamera)
+        try c.encodeIfPresent(voice, forKey: .voice)
+    }
 }
 
 /// 人の一覧。Application Support の persons.json（「ファイル」アプリには出ない場所）に置く
@@ -71,7 +102,7 @@ final class PersonStore: ObservableObject {
 
     @discardableResult
     func add(name: String) -> Person {
-        let p = Person(id: UUID().uuidString.lowercased(), name: name.trimmingCharacters(in: .whitespaces), saved: nil)
+        let p = Person(id: UUID().uuidString.lowercased(), name: name.trimmingCharacters(in: .whitespaces))
         people.append(p)
         save()
         return p
@@ -85,9 +116,18 @@ final class PersonStore: ObservableObject {
         save()
     }
 
-    func setSaved(_ id: String, _ b: SavedBaseline?) {
+    /// そのカメラの普段だけを置き換える（ほかのカメラの普段は変えない）。nil で消す
+    func setSaved(_ id: String, camera: String, _ b: SavedBaseline?) {
         guard let i = people.firstIndex(where: { $0.id == id }) else { return }
-        people[i].saved = b
+        var b = b
+        b?.voice = nil   // 声の普段は人ごとに別に持つ
+        people[i].savedByCamera[camera] = b
+        save()
+    }
+
+    func setVoice(_ id: String, _ v: SavedVoice?) {
+        guard let i = people.firstIndex(where: { $0.id == id }) else { return }
+        people[i].voice = v
         save()
     }
 
@@ -111,7 +151,7 @@ struct PersonPickerView: View {
                     Button { store.selectedID = nil; dismiss() } label: { row("人を選ばない", selected: store.selectedID == nil) }
                     ForEach(store.people) { p in
                         Button { store.selectedID = p.id; dismiss() } label: {
-                            row(p.displayName, detail: p.saved.map { "保存した普段 \(Self.date($0.savedDate))（\(CameraLens(rawValue: $0.camera)?.label ?? $0.camera)）" } ?? "保存した普段はありません",
+                            row(p.displayName, detail: Self.savedSummary(p),
                                 selected: store.selectedID == p.id)
                         }
                     }
@@ -149,6 +189,12 @@ struct PersonPickerView: View {
         .contentShape(Rectangle())
     }
 
+    /// 「保存した普段：広角 10/28 15:10・前面 10/28 16:02」（カメラごと、v1.6.1〜）
+    static func savedSummary(_ p: Person) -> String {
+        let list = CameraLens.allCases.compactMap { l in p.saved(for: l.rawValue).map { "\(l.shortLabel) \(date($0.savedDate))" } }
+        return list.isEmpty ? "保存した普段はありません" : "保存した普段：" + list.joined(separator: "・")
+    }
+
     static func date(_ d: Date) -> String {
         let f = DateFormatter()
         f.dateFormat = "M/d HH:mm"
@@ -167,7 +213,7 @@ struct PeopleSettingsSection: View {
                 NavigationLink { PersonEditView(id: p.id) } label: {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(p.displayName)
-                        Text(p.saved.map { "保存した普段 \(PersonPickerView.date($0.savedDate))" } ?? "保存した普段はありません")
+                        Text(PersonPickerView.savedSummary(p))
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -178,7 +224,7 @@ struct PeopleSettingsSection: View {
                     .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         } header: { Text("人") } footer: {
-            Text("人ごとに、普段の数値（指標ごとの n・平均・標準偏差、カメラ、普段の長さ、保存した日時、顔の位置と大きさ）だけをこの端末に保存します。名前は外に送りません")
+            Text("人ごとに、普段の数値（指標ごとの n・平均・標準偏差、普段の長さ、保存した日時、顔の位置と大きさ）だけをこの端末に保存します。表情の普段はカメラ（広角・超広角・前面）ごとに1つずつ、声の普段はどのカメラでも使う1つです。名前は外に送りません")
         }
     }
 }
@@ -199,14 +245,25 @@ struct PersonEditView: View {
                 Button("名前を変える") { store.rename(id, to: name) }
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || name == p?.name)
             }
-            Section("保存した普段") {
-                if let s = p?.saved {
-                    LabeledContent("保存した日時", value: PersonPickerView.date(s.savedDate))
-                    LabeledContent("カメラ", value: CameraLens(rawValue: s.camera)?.label ?? s.camera)
-                    LabeledContent("普段の長さ", value: "\(Int(s.targetS))秒")
-                    Button("普段を消す") { store.setSaved(id, nil) }
+            Section {
+                ForEach(CameraLens.allCases) { l in
+                    if let s = p?.saved(for: l.rawValue) {
+                        LabeledContent(l.label, value: "\(PersonPickerView.date(s.savedDate))（\(Int(s.targetS))秒）")
+                        Button("\(l.shortLabel)の普段を消す") { store.setSaved(id, camera: l.rawValue, nil) }
+                    } else {
+                        LabeledContent(l.label, value: "ありません")
+                    }
+                }
+            } header: { Text("保存した表情の普段（カメラごと）") } footer: {
+                Text("このカメラで今日の普段を記録し終えると、そのカメラの普段として自動で保存します（ほかのカメラの普段は変えません）")
+            }
+            Section("保存した声の普段（どのカメラでも使う）") {
+                if let v = p?.voice {
+                    LabeledContent("保存した日時", value: PersonPickerView.date(Date(timeIntervalSince1970: Double(v.savedMs) / 1000)))
+                    LabeledContent("本人の声", value: String(format: "%.0f秒", v.validS))
+                    Button("声の普段を消す") { store.setVoice(id, nil) }
                 } else {
-                    Text("ありません（この人を選んで今日の普段を記録し終えると、自動で保存します）").foregroundStyle(.secondary)
+                    Text("ありません（本人の声が10秒たまると、自動で保存します）").foregroundStyle(.secondary)
                 }
             }
             Section {

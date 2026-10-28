@@ -780,6 +780,11 @@ def uses_front(rec: Recording) -> bool:
         e.get("kind") == "camera" and e.get("camera") == "front" for e in rec.events)
 
 
+def front_orientation_old(rec: Recording) -> bool:
+    """前面カメラの記録で、映像の向きを直す前（v1.5〜v1.6、ヘッダに camera_orientation_version が無い）"""
+    return uses_front(rec) and rec.header.get("camera_orientation_version") is None
+
+
 def uses_ultra_wide(rec: Recording) -> bool:
     return rec.header.get("camera") == "ultra_wide" or any(
         e.get("kind") == "camera" and e.get("camera") == "ultra_wide" for e in rec.events)
@@ -1472,8 +1477,11 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                      "（顔が画面の端にあった時間の区間は、特に参考程度に見てください）。</p>")
     if uses_front(rec):
         parts.append("<p class=note>前面カメラ（自分で試す用）の記録です。胸に着けて使うのは背面です。"
-                     "前面でも左右反転せずに解析しているので、顔の向き・左右の表情は背面と同じ意味です"
+                     "顔の向き・左右の表情は、背面と同じ意味にしてあります"
                      f"（ヘッダの mirror_corrected：{e(str(rec.header.get('mirror_corrected', '書かれていない')))}）。</p>")
+        if front_orientation_old(rec):
+            parts.append("<p class=note><b>この前面の記録は、解析に渡した映像の向きが合っていなかった版（v1.5〜v1.6）のものです</b>"
+                         "（ヘッダに camera_orientation_version がありません）。表情の数値・顔の向きは当てになりません。</p>")
     parts.append("<p class=note>記録から、観測された変化（いつもの範囲から数値が外れた区間）を確認するための手がかりです。"
                  "本人の気持ちや状態は判断していません。文言と色は docs/wording-guide.md に従っています。</p>")
 

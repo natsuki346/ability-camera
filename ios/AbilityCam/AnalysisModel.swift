@@ -102,6 +102,7 @@ final class AnalysisModel: ObservableObject {
     private var boxStats = (cx: Welford(), cy: Welford(), w: Welford())   // 普段の間の顔の位置と大きさ
     private var baselineClosed = DiffEngine.ClosedDetector()  // 普段の間に目を閉じていたか（判定と同じ決まり）
     private var baselineClosedS = 0.0                         // 普段の間に目を閉じていた秒数（終わったものの合計）
+    static let baselineEyesClosedMinS = 10.0                  // 数えた時間がこれを超えてから
     static let baselineEyesClosedRatio = 0.2                  // 目を閉じていた時間がこれを超えたら「取り直せます」と出す
     private var todayBaseline: SavedBaseline?                 // このセッションで記録し終えた今日の普段（保存・保存し直し用）
     private var todayVoice: SavedVoice?                       // このセッションで集め終えた声の普段
@@ -184,7 +185,7 @@ final class AnalysisModel: ObservableObject {
     private func startSession() async {
         guard await startCamera() else { return }
         do {
-            try logger.start(camera: camera.lens, personId: PersonStore.shared.selectedID)
+            try logger.start(camera: camera.lens, personId: PersonStore.shared.selectedID, mirrored: camera.analysisMirrored)
         } catch {
             status = "記録を始められませんでした: \(error.localizedDescription)"
             return
@@ -267,6 +268,9 @@ final class AnalysisModel: ObservableObject {
             status = "カメラの許可がありません（設定アプリから許可してください）"
             return false
         }
+        // 解析に渡す映像の向き・鏡（v1.6.1〜）：鏡なら記録の値を直す。横長の映像が届いたら回転を決め直す
+        camera.onOrientation = { [weak face] m in face?.setMirrored(m) }
+        face.onImageSize = { [weak camera] s in camera?.checkPortrait(s) }
         do {
             try face.load()
             lensInUse = try camera.configureIfNeeded(lens: CameraLens.selected)
@@ -346,11 +350,14 @@ final class AnalysisModel: ObservableObject {
             guard used != before, running else { return }
             var e = EventRecord(tMs: Self.nowMs(), kind: "camera", value: .text(used.label))
             e.camera = used.rawValue
-            e.mirrorCorrected = used == .front
+            e.mirrorCorrected = camera.analysisMirrored
+            e.orientationVersion = CameraManager.orientationVersion
             logger.write(e)
             head.reset()
             restartBaseline()
-            showMessage("カメラを\(used.label)にしました。普段を取り直しています")
+            face.setPreferred(nil)
+            applySaved()   // このカメラの保存した普段があれば、すぐそれで比べる（v1.6.1〜）
+            showMessage("カメラを\(used.label)にしました。" + (comparing == .saved ? "このカメラの保存した普段で比べています" : "普段を取り直しています"))
         } catch {
             status = "カメラを切り替えられませんでした: \(error.localizedDescription)"
         }
@@ -469,21 +476,28 @@ final class AnalysisModel: ObservableObject {
         baselineClosedS + (baselineClosed.seg.map { $0.end - $0.start } ?? 0)
     }
 
-    /// 選んだ人の保存した普段があり、カメラが同じなら、セッションの始めに source: "saved" の baseline 行（compared: true）を書き、
-    /// その普段ですぐ比べ始める（v1.3〜、設定は無い）。今日の普段はうしろで黙って記録し、compared: false で書く（画面には出さない）。
-    /// カメラが保存した普段と違うときは書かず、理由を event（kind: "saved_baseline_skipped"）に残す（今日の普段を画面に出して取る）
+    /// 選んだ人に今のカメラの保存した普段があれば、source: "saved" の baseline 行（compared: true）を書き、
+    /// その普段ですぐ比べ始める（v1.3〜。v1.6.1〜はカメラごと。開いたとき・カメラを変えたとき）。今日の普段はうしろで黙って記録し、compared: false で書く。
+    /// 今のカメラの普段が無い（ほかのカメラの普段だけある）ときは書かず、理由を event（kind: "saved_baseline_skipped"）に残す（今日の普段を画面に出して取る）。
+    /// 声の普段はカメラに関係なく、あればすぐ使う
     private func applySaved() {
-        guard let p = PersonStore.shared.selected, let sv = p.saved else { return }
+        guard let p = PersonStore.shared.selected else { return }
         let lens = (lensInUse ?? camera.lens).rawValue
         let now = Self.nowMs()
-        guard sv.camera == lens else {
+        if let sv = p.saved(for: lens) {
+            applySavedFace(sv, now: now)
+        } else if p.hasSaved {
             var e = EventRecord(tMs: now, kind: "saved_baseline_skipped",
-                                value: .text("カメラが保存した普段と違うため、保存した普段の行を書きませんでした"))
+                                value: .text("このカメラの保存した普段が無いため、保存した普段の行を書きませんでした"))
             e.camera = lens
-            e.savedCamera = sv.camera
+            e.savedCamera = p.savedByCamera.keys.sorted().joined(separator: ",")
             logger.write(e)
-            return
         }
+        if let v = p.voice { applySavedVoice(v, now: now) }
+        publishBaseline(tMs: now)
+    }
+
+    private func applySavedFace(_ sv: SavedBaseline, now: Int64) {
         // 表情の部分（v1.5 までに保存した普段の声の数値は、本人以外の声も入っているので使わない）
         let faceMetrics = sv.metrics.filter { Metric(rawValue: $0.key)?.isFace ?? false }
         var row = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
@@ -496,8 +510,12 @@ final class AnalysisModel: ObservableObject {
         comparing = .saved
         savedFromMs = sv.savedMs
         usedFace = (sv.savedMs, faceMetrics)
-        // 声の部分（v1.6〜に保存したものがあれば、すぐ声も比べ始める。今日の声の普段はうしろで集める）
-        if let v = sv.voice {
+        face.setPreferred(sv.faceBox)
+    }
+
+    /// 声の部分（v1.6〜に保存したものがあれば、すぐ声も比べ始める。今日の声の普段はうしろで集める）
+    private func applySavedVoice(_ v: SavedVoice, now: Int64) {
+        do {
             var vr = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
                                     yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                     minN: Self.minSamples, targetS: DiffCriteria.voiceBaselineS, blinkMasked: true, metrics: v.metrics)
@@ -509,18 +527,16 @@ final class AnalysisModel: ObservableObject {
             usedVoice = v.metrics
             voiceSec = nil
         }
-        publishBaseline(tMs: now)
-        face.setPreferred(sv.faceBox)
     }
 
     /// 「この普段で保存し直しますか？」で「保存し直す」
     func overwriteSaved() {
         askResave = false
-        guard var t = todayBaseline, let p = PersonStore.shared.selected else { return }
-        t.voice = todayVoice ?? p.saved?.voice   // 声の普段がまだなら、集め終えたときに保存し直す
-        resaveAccepted = true
-        PersonStore.shared.setSaved(p.id, t)
-        showMessage("\(p.displayName)の普段を保存し直しました")
+        guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
+        resaveAccepted = true   // 声の普段も、集め終えたもので置き換える
+        PersonStore.shared.setSaved(p.id, camera: t.camera, t)   // 今のカメラの普段だけ置き換える
+        if let v = todayVoice { PersonStore.shared.setVoice(p.id, v) }
+        showMessage("\(p.displayName)の\(CameraLens(rawValue: t.camera)?.shortLabel ?? "")の普段を保存し直しました")
     }
 
     /// 上の帯で人を変えた：記録に id を書く（名前は書かない）。今日の普段があれば、その人に保存する（あれば保存し直すか聞く）
@@ -538,11 +554,11 @@ final class AnalysisModel: ObservableObject {
     /// （うしろで黙って取った今日の普段は、記録に書くだけで保存しない）
     private func saveTodayIfNew() {
         askResave = false
-        guard var t = todayBaseline, let p = PersonStore.shared.selected else { return }
-        if p.saved == nil {
-            t.voice = todayVoice
-            PersonStore.shared.setSaved(p.id, t)
-            showMessage("\(p.displayName)の普段を保存しました")
+        guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
+        if p.voice == nil, let v = todayVoice { PersonStore.shared.setVoice(p.id, v) }
+        if p.saved(for: t.camera) == nil {   // このカメラの普段がまだ無い（ほかのカメラの普段は変えない）
+            PersonStore.shared.setSaved(p.id, camera: t.camera, t)
+            showMessage("\(p.displayName)の\(CameraLens(rawValue: t.camera)?.shortLabel ?? "")の普段を保存しました")
         } else if todayShown {
             askResave = true
         }
@@ -634,9 +650,8 @@ final class AnalysisModel: ObservableObject {
         let v = SavedVoice(metrics: out, validS: row.voiceValidS ?? voiceValidS, savedMs: tMs)
         todayVoice = v
         // 人の保存した普段に声の普段が無ければ足す（「保存し直す」を選んだあとなら置き換える）。うしろで集めたものは置き換えない
-        if let p = PersonStore.shared.selected, var sv = p.saved, sv.voice == nil || resaveAccepted {
-            sv.voice = v
-            PersonStore.shared.setSaved(p.id, sv)
+        if let p = PersonStore.shared.selected, p.voice == nil || resaveAccepted {
+            PersonStore.shared.setVoice(p.id, v)
             showMessage("\(p.displayName)の声の普段を保存しました")
         }
     }
@@ -753,7 +768,8 @@ final class AnalysisModel: ObservableObject {
             let (_, ended) = baselineClosed.step(t: captureT, judgeable: judgeable,
                                                  closed: blink.map { $0 >= DiffCriteria.eyesClosedThreshold })
             if let e = ended { baselineClosedS += e.end - e.start }
-            let long = baselineValidS > 0 && baselineEyesClosedS > baselineValidS * Self.baselineEyesClosedRatio
+            // 数えた時間が10秒を超えてから判定する（数え始めは短い閉じでも2割を超えてしまうため、v1.6.1〜）
+            let long = baselineValidS > Self.baselineEyesClosedMinS && baselineEyesClosedS > baselineValidS * Self.baselineEyesClosedRatio
             if baselineEyesClosedLong != long { baselineEyesClosedLong = long }
         }
         if valid {

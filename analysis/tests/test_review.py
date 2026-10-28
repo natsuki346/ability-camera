@@ -777,3 +777,25 @@ class VoiceSelfTest(unittest.TestCase):
         a = review.analyze(rec, self.c)
         on = [self_t for self_t in (70.5, 80.5, 30.0) if a.voice_self[int(np.searchsorted(rec.t, T0 + self_t))] == 1]
         self.assertEqual(on, [70.5, 80.5])
+
+
+class FrontCameraTest(unittest.TestCase):
+    """前面カメラの記録：v1.5〜v1.6（camera_orientation_version が無い）は、向きが合っていなかったと出す"""
+
+    def report(self, header_extra):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            lines = FIXTURE.read_text(encoding="utf-8").splitlines()
+            h = json.loads(lines[0])
+            h.update({"camera": "front", "camera_label": "前面（自分で試す用）", **header_extra})
+            p = Path(d) / "front.jsonl"
+            p.write_text("\n".join([json.dumps(h, ensure_ascii=False)] + lines[1:]) + "\n", encoding="utf-8")
+            review.main([str(p), "--out-dir", d])
+            return (Path(d) / "front.html").read_text(encoding="utf-8")
+
+    def test_old_and_new(self):
+        old = self.report({"mirror_corrected": True})
+        self.assertIn("前面（自分で試す用）", old)
+        self.assertIn("映像の向きが合っていなかった版", old)
+        new = self.report({"mirror_corrected": False, "camera_orientation_version": 2})
+        self.assertNotIn("映像の向きが合っていなかった版", new)

@@ -61,6 +61,36 @@ struct VoiceSelfTracker {
     }
 }
 
+/// 声の普段の進み具合が増えないときの理由（v1.6.2〜）。本人の声の決まり（VoiceSelfTracker）のどこで外れたかを、コマごとに数える。
+/// 本人の声のコマが stallS 秒来ていないとき、直近 stallS 秒で一番多かった理由を出す
+struct VoiceWaitTracker {
+    enum Reason: String {
+        case noPitch = "声の高さが取れていません"
+        case noMouth = "口が動いていません"
+        case noFace = "顔が読めていません"
+    }
+    static let stallS = 3.0
+    private var recent: [(t: Double, r: Reason)] = []
+    private var lastSelfT: Double?
+    private var firstT: Double?
+
+    /// voiceSelf：VoiceSelfTracker の返り値（nil：f0 が無い）。faceValid：顔が読めているか（そのコマに顔があり、直近1秒で読めている）
+    mutating func add(t: Double, voiceSelf: Bool?, faceValid: Bool) -> Reason? {
+        if firstT == nil { firstT = t }
+        if voiceSelf == true { lastSelfT = t; recent = []; return nil }
+        // 顔が読めていなければ、口が動いているかは分からないので先に出す。f0 が無いのは、顔が読めているときだけ「声の高さ」とする
+        let r: Reason = !faceValid ? .noFace : voiceSelf == nil ? .noPitch : .noMouth
+        recent.append((t, r))
+        while let f = recent.first, t - f.t > Self.stallS { recent.removeFirst() }
+        guard t - (lastSelfT ?? firstT!) >= Self.stallS else { return nil }
+        var count: [Reason: Int] = [:]
+        for x in recent { count[x.r, default: 0] += 1 }
+        return [Reason.noPitch, .noMouth, .noFace].max { (count[$0] ?? 0) < (count[$1] ?? 0) }
+    }
+
+    mutating func reset() { recent = []; lastSelfT = nil; firstT = nil }
+}
+
 /// baseline 行のどの部分か（v1.6〜）。古い記録の行は all（表情も声も）
 enum BaselinePart: String {
     case all, face, voice

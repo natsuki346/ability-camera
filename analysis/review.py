@@ -30,6 +30,9 @@ HERE = Path(__file__).resolve().parent
 METRICS = ["mouth_smile", "brow_down", "eye_squint", "jaw_open", "rms_db", "f0_hz"]
 FACE_METRICS = {"mouth_smile", "brow_down", "eye_squint", "jaw_open"}
 VOICE_METRICS = ["rms_db", "f0_hz"]
+# 声の高さとして使う範囲（Hz、criteria.json の pitch.range_hz と同じ。アプリは ios/AbilityCam/Pitch.swift の PitchCriteria）。
+# v1.6.1 までの記録には 800Hz のような倍音の取り違えが入っているので、読むときに外す（アプリのリプレイも同じ）
+F0_RANGE = (70.0, 500.0)
 LABEL = {"mouth_smile": "口角を上げる", "brow_down": "眉を寄せる", "eye_squint": "目を細める",
          "jaw_open": "口を開ける", "rms_db": "声の大きさ", "f0_hz": "声の高さ"}
 UNIT = {"rms_db": " dB", "f0_hz": " Hz"}
@@ -77,6 +80,7 @@ class Recording:
     pairs: dict[str, np.ndarray] = field(default_factory=dict)   # 表情の数値 52種を左右平均したもの（browDown など。顔が無いコマは NaN）
     bs_raw: dict[str, np.ndarray] = field(default_factory=dict)  # 口の動きを見る表情の数値（左右の無いもの。顔が無い・値が無いコマは NaN）
     voice_self_rec: np.ndarray | None = None                     # 記録の voice_self（1 / 0 / NaN＝null、キーが無いコマは -1）。v1.6〜
+    f0_dropped: int = 0                                          # 範囲（F0_RANGE）の外で使わなかった f0 の数（v1.6.1 までの記録の取り違え）
 
     @property
     def has_pose(self) -> bool:
@@ -124,6 +128,7 @@ def load(path: Path) -> Recording:
     pairs: dict[str, np.ndarray] = {}
     bs_raw = {k: np.full(n, np.nan) for k in MOUTH_KEYS_ALL}
     vsr = np.full(n, -1.0)
+    f0_dropped = 0
     for i, o in enumerate(frames):
         if "voice_self" in o:
             v = o["voice_self"]
@@ -151,7 +156,10 @@ def load(path: Path) -> Recording:
         if o.get("rms_db") is not None:
             raw["rms_db"][i] = o["rms_db"]
         if o.get("f0_hz") is not None:
-            raw["f0_hz"][i] = o["f0_hz"]
+            if F0_RANGE[0] <= o["f0_hz"] <= F0_RANGE[1]:
+                raw["f0_hz"][i] = o["f0_hz"]
+            else:
+                f0_dropped += 1
         if o.get("yaw_deg") is not None:
             yaw[i] = o["yaw_deg"]
         lat[i] = o.get("lat_ms", np.nan)
@@ -162,7 +170,7 @@ def load(path: Path) -> Recording:
     # 区間はアプリと同じく、比べるのに使った行（compared が false でないもの）で判定する
     used = [b for b in baselines if b.get("compared", True) is not False]
     return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines,
-                     bs_raw=bs_raw, voice_self_rec=vsr)
+                     bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped)
 
 
 # ---------------------------------------------------------------- 基準
@@ -1105,6 +1113,10 @@ def quality(a: Analysis, calm: bool) -> dict:
             x = rng[sel]
             q["voice"]["mouth"] = (tuple(float(np.percentile(x, p)) for p in (10, 50, 90)), int(len(x))) if len(x) else None
 
+    # 声の高さ（v1.6.2〜）：求め方の版と、取れたコマ・範囲の外で使わなかった値
+    q["pitch"] = {"version": rec.header.get("f0_version", 1), "floor_db": rec.header.get("f0_floor_db"),
+                  "f0_frames": int(np.isfinite(rec.raw["f0_hz"]).sum()), "dropped": rec.f0_dropped}
+
     yaw = rec.yaw[np.isfinite(rec.yaw)]
     if len(yaw):
         ay = np.abs(yaw)
@@ -1510,6 +1522,12 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
             (p10, p50, p90), n = v["mouth"]
             qrows.append(["声が出ていて顔が読めているコマの口の動き（直近0.3秒の変化、10% / 中央値 / 90%）",
                           f"{p10:.3f} / {p50:.3f} / {p90:.3f}（{n}コマ。しきい値 {c['voice_self']['min_range']:g}）"])
+    p = q["pitch"]
+    qrows.append(["声の高さ（f0）が取れたコマ",
+                  f"{p['f0_frames']}コマ（求め方 {p['version']}："
+                  + (f"{p['floor_db']:g}dB 以上の音、{F0_RANGE[0]:g}〜{F0_RANGE[1]:g}Hz）" if p["version"] >= 2 and p["floor_db"] is not None
+                     else "v1.6.1 までの求め方。-40dB より小さい音では取れていない）")
+                  + (f"。{F0_RANGE[0]:g}〜{F0_RANGE[1]:g}Hz の外で使わなかった値 {p['dropped']}件" if p["dropped"] else "")])
     if "yaw" in q:
         y = q["yaw"]
         qrows.append(["yaw の分布（5% / 中央値 / 95%）", f"{y['p5']:.0f}° / {y['median']:.0f}° / {y['p95']:.0f}°"])

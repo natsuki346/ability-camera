@@ -46,6 +46,8 @@ final class AnalysisModel: ObservableObject {
     @Published var baselineEyesClosedLong = false   // 普段の間に目を閉じていた時間が、数えた時間の2割を超えた（v1.4〜）
     @Published var voiceSec: Int?             // 声の普段を集めている：本人の声の秒数（画面に出すときだけ。v1.6〜）
     @Published var otherVoice = false         // 本人以外の声（と言えない声）だけが入っている（直近1秒）
+    @Published var voiceWait: String?         // 声の普段の進み具合が3秒増えていない理由（v1.6.2〜、VoiceWaitTracker）
+    @Published var pitchRatio: Double?        // 「数字」：声の高さが取れた割合（直近10秒、声が出ていたときのうち。v1.6.2〜）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
     @Published var differences: [String] = []
     @Published var faceReadable = true
@@ -114,6 +116,9 @@ final class AnalysisModel: ObservableObject {
     private var voiceValidS = 0.0, voicePrevT: Double?, voiceStartMs: Int64 = 0, voiceDone = false
     private var lastSelfVoiceT = -Double.infinity, lastOtherVoiceT = -Double.infinity
     private let voiceBox = VoiceSelfBox()                     // MediaPipe のスレッドの上でだけ触る
+    private var voiceWaitTracker = VoiceWaitTracker()
+    private var pitchCoverage = PitchCoverage()
+    private var lastAudioAtCoverage: CFTimeInterval = 0
     private var todayShown = false                            // 今日の普段を画面に出して取った（保存した普段で比べながら、うしろで黙って取ったのではない）
     private var faceCount: Int?                               // 映っている顔の数（0.5秒続いたもの）
     private var faceCountPending: (n: Int, tMs: Int64)?
@@ -229,6 +234,7 @@ final class AnalysisModel: ObservableObject {
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false
+            voiceWait = nil
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
             if let s = logger.finish() {
@@ -336,6 +342,7 @@ final class AnalysisModel: ObservableObject {
         lastBlinkT = -.infinity; squintPending = []
         faceReadable = true
         faceCount = nil; faceCountPending = nil; facesCheck = nil; analyzedRatio = nil
+        pitchCoverage.reset(); pitchRatio = nil
         head.reset()   // カメラを止めていた間の向きは分からないので、今から数え直す（最初に決まった向きは記録しない）
     }
 
@@ -457,6 +464,7 @@ final class AnalysisModel: ObservableObject {
         // 声の普段も、表情とは別に初めから集め直す（v1.6〜）
         voiceStats = [:]; voiceValidS = 0; voicePrevT = nil; voiceStartMs = Self.nowMs(); voiceDone = false
         voiceSec = 0; comparingVoice = nil; usedFace = nil; usedVoice = nil; todayVoice = nil
+        voiceWaitTracker.reset(); voiceWait = nil
     }
 
     /// 今比べている表情と声の普段を合わせて、画面（いつもの範囲・データ不足）と見る側に出す
@@ -525,7 +533,7 @@ final class AnalysisModel: ObservableObject {
             engine.setBaseline(Self.engineBaseline(v.metrics), part: .voice)
             comparingVoice = .saved
             usedVoice = v.metrics
-            voiceSec = nil
+            voiceSec = nil; voiceWait = nil
         }
     }
 
@@ -605,7 +613,7 @@ final class AnalysisModel: ObservableObject {
     }
 
     /// 声の普段：本人の声のコマが合計 10秒たまったら（v1.6〜）。表情の普段とは別の baseline 行（part: "voice"）
-    private func collectVoice(tMs: Int64, voiceSelf: Bool?, audio a: AudioAnalyzer.Snapshot) {
+    private func collectVoice(tMs: Int64, voiceSelf: Bool?, faceValid: Bool, audio a: AudioAnalyzer.Snapshot) {
         guard running, !voiceDone else { return }
         let t = Double(tMs) / 1000
         let warm = t - Double(sessionStartMs) / 1000 >= Self.baselineWarmup
@@ -618,8 +626,11 @@ final class AnalysisModel: ObservableObject {
         }
         if voiceValidS >= DiffCriteria.voiceBaselineS {
             finishVoice(tMs: tMs)
-        } else if comparingVoice == nil, voiceSec != Int(voiceValidS) {
-            voiceSec = Int(voiceValidS)
+        } else if comparingVoice == nil {
+            if voiceSec != Int(voiceValidS) { voiceSec = Int(voiceValidS) }
+            // 進み具合が増えないときの理由（開いてから5秒より後だけ）
+            let w = warm ? voiceWaitTracker.add(t: t, voiceSelf: voiceSelf, faceValid: faceValid)?.rawValue : nil
+            if voiceWait != w { voiceWait = w }
         }
     }
 
@@ -646,7 +657,7 @@ final class AnalysisModel: ObservableObject {
             usedVoice = out
             publishBaseline(tMs: tMs)
         }
-        voiceSec = nil
+        voiceSec = nil; voiceWait = nil
         let v = SavedVoice(metrics: out, validS: row.voiceValidS ?? voiceValidS, savedMs: tMs)
         todayVoice = v
         // 人の保存した普段に声の普段が無ければ足す（「保存し直す」を選んだあとなら置き換える）。うしろで集めたものは置き換えない
@@ -668,7 +679,11 @@ final class AnalysisModel: ObservableObject {
 
     private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64, voiceSelf: Bool?, voiceFaceValid: Bool) {
         guard cameraActive else { return }
-        collectVoice(tMs: tMs, voiceSelf: voiceSelf, audio: a)
+        collectVoice(tMs: tMs, voiceSelf: voiceSelf, faceValid: r.face && voiceFaceValid, audio: a)
+        if a.at > lastAudioAtCoverage, let db = a.rmsDb {   // 音の塊ごとに1回
+            lastAudioAtCoverage = a.at
+            pitchCoverage.add(t: a.at, db: db, f0: a.f0Hz != nil)
+        }
         let tNow = Double(tMs) / 1000
         if voiceSelf == true { lastSelfVoiceT = tNow }
         if voiceSelf == false, voiceFaceValid { lastOtherVoiceT = tNow }   // 顔が読めていて口が動いていない声
@@ -745,6 +760,7 @@ final class AnalysisModel: ObservableObject {
         latMs = latSum / Double(frames)
         rmsDb = a.rmsDb
         f0Hz = a.f0Hz
+        pitchRatio = pitchCoverage.ratio(now: CACurrentMediaTime())
 
         // 今の値
         let faceValues = Self.faceValues(r)
@@ -862,7 +878,8 @@ final class AnalysisModel: ObservableObject {
             z: comparing != nil ? liveZ : nil, diffs: comparing != nil ? liveDiffs : nil, diffCount: running ? diffCount : nil,
             head: head.state?.rawValue,
             eyesClosed: comparing != nil && engine.eyesJudgeable ? engine.active[.eyesClosed] != nil : nil,
-            voiceSec: running ? voiceSec : nil, voiceTotal: Int(DiffCriteria.voiceBaselineS), otherVoice: running ? otherVoice : nil))
+            voiceSec: running ? voiceSec : nil, voiceTotal: Int(DiffCriteria.voiceBaselineS), otherVoice: running ? otherVoice : nil,
+            voiceWait: running && voiceSec != nil ? voiceWait : nil))
     }
 
     /// 映っている顔の数が変わって0.5秒続いたら、event（kind: "faces"、count）を書く。最初に決まった数は書かない

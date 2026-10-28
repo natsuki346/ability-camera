@@ -34,6 +34,8 @@ struct LiveState: Codable {
     var voiceSec: Int?                // 声の普段を集めている：本人の声の秒数（集め終えた・保存した声の普段で比べているときは nil）
     var voiceTotal: Int?              // 声の普段に必要な本人の声の秒数（10）
     var otherVoice: Bool?             // 本人以外の声（と言えない声）だけが入っている
+    // v1.6.2〜
+    var voiceWait: String?            // 声の普段の進み具合が増えない理由（「声の高さが取れていません」など。集めていない・古い撮る側では nil）
 }
 
 /// いつもとの違い1つ

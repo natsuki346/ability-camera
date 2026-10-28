@@ -274,7 +274,7 @@ struct ViewerView: View {
         guard let s else { return nil }
         if !s.recording { return "記録していません" }
         if !s.baselineReady { return "普段を記録中のため、いつもの範囲はまだありません" }
-        if let sec = s.voiceSec { return "普段を集めています（本人の声 \(sec)/\(s.voiceTotal ?? 10)秒）" }
+        if let sec = s.voiceSec { return "普段を集めています（本人の声 \(sec)/\(s.voiceTotal ?? 10)秒）" + (s.voiceWait.map { "・\($0)" } ?? "") }
         if s.otherVoice == true { return "本人以外の声が入っています" }
         return nil
     }

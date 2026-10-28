@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-28.2",
+  "version": "2026-10-28.3",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -32,9 +32,13 @@
     {
       "date": "2026-10-28",
       "reason": "voice_self と voice_baseline を足した（v1.6）：声の大きさ・声の高さの違いは、本人の声のコマ（f0 が取れていて、顔が読めていて、jawOpen・mouthClose・mouthFunnel・mouthPucker のどれかの直近0.3秒の変化が 0.04 以上）だけで判定し、本人の声と言えない声のコマでは判定しない。胸に着けた iPhone のマイクには介助する人の声が一番大きく入り、本人以外の声で違いが出ていたため。声の普段は、表情の30秒とは別に、本人の声が合計10秒たまったら作る（30秒の間に声を出さず、声の高さがいつもデータ不足だったため）。min_range 0.04 は仮の値で、記録の「口の動き」の分布を見て決める。アプリ（v1.6）と同じ値。"
+    },
+    {
+      "date": "2026-10-28",
+      "reason": "pitch を足した（v1.6.2）：声の高さ（f0）は、音が -60dBFS 以上のとき（v1.6.1 までは -40dBFS）に、70〜500Hz（v1.6.1 までは 70〜1000Hz）で、正規化した自己相関（NSDF）の山が 0.6 以上のときだけ求める。一番高い山の 0.9 倍以上の山のうち周期の一番短いものを選び（半分の高さへの取り違えを防ぐ）、500Hz より高い山が選ばれたら f0 にしない（2倍の高さへの取り違えを防ぐ）。直近1秒の f0 の中央値から 0.75 オクターブより離れたら、中央値に近い山（高さ 0.7 倍以上）に替える。iPhone を50cm離して普通に話すと -45〜-60dB で、4分の記録で f0 があったのは 105コマだけ、声の普段の本人の声が 0/10秒から増えず、取れた値に 800Hz・842Hz が混ざっていたため。下限は -55 より -60 にした：作り物の声（say の4声）で、平均 -55dB の声の f0 が下限 -55 では6〜7割しか取れず、-60 では8〜9割取れた。雑音（白色・ピンク・ブラウン・扇風機のような音・電源のうなり・離れた話し声のような音を -55〜-35dB）では、山の高さは最大 0.45 で f0 は 0件だった（下限を下げても雑音を f0 にしないのは声らしさの基準の役目）。v1.6.1 までの求め方のまま下限だけ下げると、ピンク・ブラウンの雑音が f0 になった。範囲の外の f0（v1.6.1 までの記録）は読むときに外す（アプリのリプレイも同じ）。docs/validation-log.md 2026-10-28。"
     }
   ],
-  "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
+  "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
   "std_floor": {
     "mouth_smile": 0.03,
     "brow_down": 0.03,
@@ -118,6 +122,19 @@
   "voice_baseline": {
     "_note": "声の普段（v1.6〜）。表情の普段とは別に、開いてから warmup 秒より後の本人の声のコマが合計 target_s 秒たまったら作る（baseline 行の part: \"voice\"）",
     "target_s": 10.0
+  },
+  "pitch": {
+    "_note": "声の高さ（f0）の求め方（v1.6.2〜、アプリ ios/AbilityCam/Pitch.swift の PitchCriteria と同じ値）。記録のヘッダに f0_version: 2・f0_floor_db・f0_range_hz を書く。range_hz の外の f0（v1.6.1 までの記録）は読むときに外す。floor_db より小さい音では計算しない。clarity_min：正規化した自己相関の山の高さ（声らしさ）。first_peak_ratio：一番高い山のこの割合以上の山のうち周期の一番短いもの。octave_*：直近 history_s 秒の中央値から octave_jump オクターブより離れたら、中央値に近い山（octave_alt_ratio 以上）に替える",
+    "floor_db": -60.0,
+    "range_hz": [
+      70.0,
+      500.0
+    ],
+    "clarity_min": 0.6,
+    "first_peak_ratio": 0.9,
+    "octave_jump": 0.75,
+    "octave_alt_ratio": 0.7,
+    "history_s": 1.0
   },
   "stale_s": 1.0,
   "mark_window_s": 10.0,

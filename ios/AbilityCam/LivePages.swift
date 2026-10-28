@@ -122,6 +122,9 @@ struct NowPage: View {
             if let v = model.voiceSec {
                 Text("声の高さ：普段を集めています（本人の声 \(v)/\(Int(DiffCriteria.voiceBaselineS))秒）")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+                if let w = model.voiceWait {   // 進み具合が3秒増えていないとき（v1.6.2〜）
+                    Text("声の普段が増えない理由：\(w)").font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+                }
             }
             if model.otherVoice {
                 Text("声：本人以外の声が入っています").font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -324,6 +327,7 @@ struct NumbersPage: View {
             stat("撮影→網目 ms", model.meshLagMs.map { String(format: "%.0f", $0) })
             stat("音量 dB", model.rmsDb.map { String(format: "%.0f", $0) })
             stat("声の高さ Hz", model.f0Hz.map { String(format: "%.0f", $0) })
+            stat("声の高さが取れた割合（直近10秒、声が出ていたときのうち）", model.pitchRatio.map { "\(Int(($0 * 100).rounded()))%" })
             stat("カメラ", model.lensInUse?.label)
             stat("探す顔の数", "\(model.maxFaces)")
             stat("解析できた割合（10秒）", model.analyzedRatio.map { "\(Int(($0 * 100).rounded()))%" })

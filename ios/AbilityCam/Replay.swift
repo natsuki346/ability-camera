@@ -97,7 +97,9 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             pitch[i] = (o["pitch_deg"] as? NSNumber)?.doubleValue
             roll[i] = (o["roll_deg"] as? NSNumber)?.doubleValue
             rms[i] = (o["rms_db"] as? NSNumber)?.doubleValue
-            f0[i] = (o["f0_hz"] as? NSNumber)?.doubleValue
+            // 声の高さの範囲の外（v1.6.1 までの記録の 800Hz のような取り違え）は使わない（review.py の F0_RANGE と同じ）
+            f0[i] = ((o["f0_hz"] as? NSNumber)?.doubleValue).flatMap {
+                $0 >= Double(PitchCriteria.minHz) && $0 <= Double(PitchCriteria.maxHz) ? $0 : nil }
             if (o["face"] as? Bool) == true, let bs = o["bs"] as? [String: Any] {
                 face[i] = true
                 var d: [String: Double] = [:]

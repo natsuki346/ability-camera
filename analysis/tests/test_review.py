@@ -799,3 +799,46 @@ class FrontCameraTest(unittest.TestCase):
         self.assertIn("映像の向きが合っていなかった版", old)
         new = self.report({"mirror_corrected": False, "camera_orientation_version": 2})
         self.assertNotIn("映像の向きが合っていなかった版", new)
+
+
+class PitchTest(unittest.TestCase):
+    """声の高さ（v1.6.2〜）：アプリの求め方（Pitch.swift）が決まりどおりで、criteria.json と同じ値。範囲の外の f0 は読むときに外す"""
+
+    def test_selftest(self):
+        import pitch_check
+        self.assertEqual(pitch_check.selftest(pitch_check.build()), [])
+
+    def test_criteria_match_app(self):
+        import re
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "Pitch.swift").read_text(encoding="utf-8")
+        val = lambda name: float(re.search(rf"static let {name}(?:: \w+)? = (-?[\d.]+)", src).group(1))
+        p = review.load_criteria(review.HERE / "criteria.json", [])["pitch"]
+        self.assertEqual(val("floorDb"), p["floor_db"])
+        self.assertEqual([val("minHz"), val("maxHz")], p["range_hz"])
+        self.assertEqual(list(review.F0_RANGE), p["range_hz"])
+        for k, name in (("clarity_min", "clarityMin"), ("first_peak_ratio", "firstPeakRatio"), ("octave_jump", "octaveJump"),
+                        ("octave_alt_ratio", "octaveAltRatio"), ("history_s", "historyS")):
+            self.assertEqual(val(name), p[k], k)
+
+    def test_out_of_range_dropped_same_in_app(self):
+        import json
+        import check_app
+        lines = VOICE_FIXTURE.read_text(encoding="utf-8").splitlines()
+        out, n = [], 0
+        for line in lines:
+            o = json.loads(line)
+            if o.get("type") == "frame" and o.get("f0_hz") is not None:
+                n += 1
+                if n % 7 == 0:
+                    o["f0_hz"] = 842.0   # v1.6.1 までの取り違え
+                    o.pop("voice_self", None)
+            out.append(json.dumps(o, ensure_ascii=False))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "old_f0.jsonl"
+            p.write_text("\n".join(out) + "\n", encoding="utf-8")
+            rec = review.load(p)
+            self.assertEqual(rec.f0_dropped, n // 7)
+            self.assertLessEqual(np.nanmax(rec.raw["f0_hz"]), 500)
+            c = review.load_criteria(review.HERE / "criteria.json", [])
+            diffs, _ = check_app.compare(p, check_app.build(), c)
+            self.assertEqual(diffs, [])

@@ -65,6 +65,7 @@ struct SettingsView: View {
     @AppStorage("role") private var role = ""
     @AppStorage("deviceName") private var deviceName = ""
     @AppStorage("sendVideo") private var sendVideo = false
+    @AppStorage("speakerRecord") private var speakerRecord = false   // 話者の区別を記録する（v1.10〜、初めはオフ）
     @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
     @AppStorage("baselineSeconds") private var baselineSeconds = AnalysisModel.defaultBaselineSeconds
     @State private var allowed = AllowedViewers.all()
@@ -107,6 +108,11 @@ struct SettingsView: View {
                         Text("初めは30秒。顔が映っていて横を向きすぎていない時間がこの秒数になったら、普段を記録し終えます。普段を記録している途中に変えると、今の記録にすぐ使います（数えた分はそのまま）。記録し終えたあとに変えると、次に普段を記録するとき（取り直す・次のセッション）から使います。使った長さは記録の baseline 行（target_s）に書きます。選んだ人に保存した普段があり、カメラが同じときは、開いてすぐその普段で比べ始め、今日の普段は画面に出さずにうしろで記録します")
                     }
                     PeopleSettingsSection()
+                    Section {
+                        Toggle("話者の区別を記録する", isOn: $speakerRecord)
+                    } footer: {
+                        Text("初めはオフ。オンのあいだは、声が出ている間 0.5秒ごとに声の特徴を数値にし、設定の「人」で声を登録した人ごとの似ている度合いを記録に書きます（type: \"speaker\" の行）。画面には出しません。声の特徴の数値はこの端末の persons.json の中だけで、記録にも見る側にも送りません。本人確認・認証には使いません。次に記録を始めたときから使います")
+                    }
                     Section {
                         Toggle("見る側に映像も送る", isOn: $sendVideo)
                     } footer: {

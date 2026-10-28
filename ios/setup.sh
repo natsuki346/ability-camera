@@ -23,6 +23,20 @@ if [ ! -f "$MODEL" ]; then
   curl -fL -o "$MODEL" https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 fi
 
+# 話者の区別のモデル（v1.10〜）：WeSpeaker ResNet34-LM（pyannote/wespeaker-voxceleb-resnet34-LM）を Fluid Inference が Core ML に変換したもの。
+# CC BY 4.0（README の「ライセンス」）。変わっていないかを sha256 で確かめる
+SPK=AbilityCam/Resources/wespeaker.mlmodelc
+SPK_URL=https://huggingface.co/FluidInference/speaker-diarization-coreml/resolve/main/wespeaker.mlmodelc
+SPK_SHA=680837ec172d67c3197bba93800e1623eebfd35c3b17011802f5f98b8026a0aa
+if [ ! -f "$SPK/weights/weight.bin" ]; then
+  echo "話者の区別のモデルをダウンロードします…"
+  mkdir -p "$SPK/weights" "$SPK/analytics"
+  for f in coremldata.bin metadata.json model.mil weights/weight.bin analytics/coremldata.bin; do
+    curl -fL -o "$SPK/$f" "$SPK_URL/$f"
+  done
+fi
+echo "$SPK_SHA  $SPK/weights/weight.bin" | shasum -a 256 -c - >/dev/null || { echo "エラー: 話者の区別のモデルの中身が違います（$SPK を消して、もう一度 setup.sh）"; exit 1; }
+
 command -v xcodegen >/dev/null || { echo "xcodegen がありません: brew install xcodegen"; exit 1; }
 command -v pod >/dev/null      || { echo "CocoaPods がありません: brew install cocoapods"; exit 1; }
 

@@ -1480,3 +1480,72 @@ class PitchRangeAfterRetakeTest(unittest.TestCase):
                 self.assertEqual(check_app.compare_voice(p, exe, c), [], (part, event))
                 diffs, _ = check_app.compare(p, exe, c)
                 self.assertEqual(diffs, [], (part, event))
+
+
+class SpeakerTest(unittest.TestCase):
+    """話者の区別（v1.10〜、記録に書くだけ）"""
+
+    def test_swift_math(self):
+        import subprocess
+        import speaker_check
+        out = subprocess.run([str(speaker_check.build()), "--selftest"], capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "OK", out.stdout)
+
+    def test_model_separates_voices(self):
+        """アプリと同じモデルで、say の2つの声を分けられる。短い声（0.5秒）も計算できる（Mac。モデルか say が無ければ飛ばす）"""
+        import shutil
+        import subprocess
+        import speaker_check
+        if not speaker_check.MODEL.exists() or not shutil.which("say") or not shutil.which("afconvert"):
+            self.skipTest("モデル（ios/setup.sh）か say が無い")
+        text = {"A": "おはようございます。きょうは朝から少し雨が降っていますね。お茶を一杯いただけますか。午後になったら窓を開けましょう。",
+                "B": "昨日の夜はよく眠れましたか。お昼ごはんは、温かいうどんにしましょうか。毛布をもう一枚持ってきますね。"}
+        with tempfile.TemporaryDirectory() as d:
+            files = {}
+            for v in ("Kyoko", "Grandpa"):
+                for k, t in text.items():
+                    a, w = Path(d) / f"{v}{k}.aiff", Path(d) / f"{v}{k}.wav"
+                    subprocess.run(["say", "-v", v, "-o", str(a), t], check=True)
+                    subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(a), str(w)], check=True)
+                    files[(v, k)] = w
+            r = speaker_check.evaluate(speaker_check.build(), {v: files[(v, "A")] for v in ("Kyoko", "Grandpa")},
+                                       {v: files[(v, "B")] for v in ("Kyoko", "Grandpa")}, [3.0, 0.5])
+        (s3, acc3, same3, other3, ms3, n3), (s05, acc05, same05, other05, ms05, n05) = r["rows"]
+        self.assertGreater(acc3, 0.9)
+        self.assertGreater(same3, other3 + 0.2)
+        self.assertGreater(n05, n3)                 # 短い声も計算する
+        self.assertGreater(same05, other05)
+
+    def record(self, d, on):
+        import json
+        t0 = 1_800_000_000_000
+        lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "speaker_on": on,
+                             **({"speaker_model": "wespeaker-r34lm-fluid-coreml-v1",
+                                 "speaker_enrolled": [{"id": "aaaa1111", "role": "self"}, {"id": "bbbb2222", "role": "family"}]} if on else {})})]
+        for k in range(300):
+            lines.append(json.dumps({"type": "frame", "t_ms": t0 + k * 33, "face": True, "lat_ms": 45.0 if on else 42.0, "proc_ms": 12.0}))
+        if on:
+            for k in range(20):
+                lines.append(json.dumps({"type": "speaker", "t_ms": t0 + 500 * (k + 1), "window_ms": 400 if k < 5 else 3000,
+                                         "scores": {"aaaa1111": 0.7, "bbbb2222": 0.3}, "calc_ms": 8.0 + k % 3, "model": "wespeaker-r34lm-fluid-coreml-v1"}))
+        p = Path(d) / f"spk_{on}.jsonl"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def test_report_and_perf(self):
+        import perf_check
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            on, off = self.record(d, True), self.record(d, False)
+            q = review.quality(review.analyze(review.load(on), c), calm=False)
+            rows = [perf_check.summary(on), perf_check.summary(off)]
+            text = perf_check.table(rows)
+            raw = on.read_text(encoding="utf-8")
+        sp = q["speaker"]
+        self.assertEqual((sp["n"], sp["short"]), (20, 5))
+        self.assertEqual(sp["scores"]["aaaa1111"][0], "self")
+        self.assertAlmostEqual(rows[0]["calc_p50"], 9.0)
+        self.assertEqual(rows[1]["speaker_rows"], 0)
+        self.assertAlmostEqual(rows[0]["fps"], 1000 / 33, delta=0.2)
+        self.assertIn("オン", text)
+        self.assertNotIn("embedding", raw)       # 記録に埋め込みは無い

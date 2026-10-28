@@ -90,6 +90,7 @@ class Recording:
     pairs: dict[str, np.ndarray] = field(default_factory=dict)   # 表情の数値 52種を左右平均したもの（browDown など。顔が無いコマは NaN）
     bs_raw: dict[str, np.ndarray] = field(default_factory=dict)  # 口の動きを見る表情の数値（左右の無いもの。顔が無い・値が無いコマは NaN）
     voice_self_rec: np.ndarray | None = None                     # 記録の voice_self（1 / 0 / NaN＝null、キーが無いコマは -1）。v1.6〜
+    speaker: list = field(default_factory=list)                  # 話者の区別の行（type: "speaker"、v1.10〜。似ている度合いだけ、埋め込みは無い）
     audio_t: np.ndarray | None = None                            # 映像のコマごと（約33ms）の声の大きさの区切りの始まりの時刻（v1.9.1〜、type: "audio"）
     audio_db: np.ndarray | None = None
     other_jaw: np.ndarray | None = None                          # もう1つの顔の jawOpen（v1.9〜、2つ映っているとき）
@@ -116,7 +117,7 @@ def face_values(bs: dict) -> dict[str, float]:
 
 def load(path: Path) -> Recording:
     header: dict = {}
-    frames, baselines, events, audio = [], [], [], []
+    frames, baselines, events, audio, speaker = [], [], [], [], []
     with open(path, encoding="utf-8") as f:
         for n, line in enumerate(f):
             line = line.strip()
@@ -132,6 +133,8 @@ def load(path: Path) -> Recording:
                 events.append(o)
             elif kind == "audio":
                 audio.append(o)
+            elif kind == "speaker":
+                speaker.append(o)
             elif kind == "frame" or (kind is None and "face" in o):
                 frames.append(o)
     if not frames:
@@ -210,7 +213,7 @@ def load(path: Path) -> Recording:
     used = [b for b in baselines if b.get("compared", True) is not False]
     return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines,
                      bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped, direction_flipped=flipped, pitch=pitch, roll=roll,
-                     other_jaw=other_jaw, voice_extra=extra, **audio_blocks(audio))
+                     other_jaw=other_jaw, voice_extra=extra, speaker=sorted(speaker, key=lambda o: o["t_ms"]), **audio_blocks(audio))
 
 
 def audio_blocks(rows: list[dict]) -> dict:
@@ -1447,6 +1450,18 @@ def quality(a: Analysis, calm: bool) -> dict:
     q["pitch"] = {"version": rec.header.get("f0_version", 1), "floor_db": rec.header.get("f0_floor_db"),
                   "f0_frames": int(np.isfinite(rec.raw["f0_hz"]).sum()), "dropped": rec.f0_dropped}
 
+    # 話者の区別（v1.10〜、記録に書くだけ）：行の数・使った声の長さ・計算時間・登録した人ごとの似ている度合い
+    if rec.speaker:
+        win = np.array([r.get("window_ms", 0) for r in rec.speaker], float)
+        calc = np.array([r.get("calc_ms", np.nan) for r in rec.speaker], float)
+        ids = sorted({k for r in rec.speaker for k in (r.get("scores") or {})})
+        roles = {x.get("id"): x.get("role") for x in rec.header.get("speaker_enrolled") or []}
+        q["speaker"] = {"n": len(rec.speaker), "short": int((win < 1500).sum()), "win": tuple(np.percentile(win, [10, 50, 90])),
+                        "calc": (float(np.nanmedian(calc)), float(np.nanpercentile(calc, 95))) if np.isfinite(calc).any() else None,
+                        "model": rec.header.get("speaker_model") or rec.speaker[0].get("model"),
+                        "scores": {k: (roles.get(k, "?"), tuple(np.percentile([r["scores"][k] for r in rec.speaker if k in (r.get("scores") or {})], [10, 50, 90])))
+                                   for k in ids}}
+
     yaw = rec.yaw[np.isfinite(rec.yaw)]
     if len(yaw):
         ay = np.abs(yaw)
@@ -1921,6 +1936,14 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
             mn = {"self": "本人として選んだ顔", "other": "もう1つの顔", "none": "どちらとも合っていない"}
             qrows.append(["声のタイミングが合っていた口（声のコマ、v1.9〜。判定は本人として選んだ顔で）",
                           "、".join(f"{mn.get(k, k)} {n}コマ" for k, n in v["matches"].most_common())])
+    if "speaker" in q:
+        sp = q["speaker"]
+        rl = {"self": "本人として撮る人", "family": "家族", "?": "役割が書かれていない"}
+        qrows.append(["話者の区別の行（v1.10〜、記録に書くだけ）",
+                      f"{sp['n']}行（使った声が1.5秒未満 {sp['short']}行）。使った声の長さ 10% / 中央値 / 90%：" + " / ".join(f"{v / 1000:.1f}秒" for v in sp["win"])
+                      + (f"。計算時間 中央値 {sp['calc'][0]:.1f}ms・95% {sp['calc'][1]:.1f}ms" if sp["calc"] else "") + f"。モデル {sp['model']}"])
+        for k, (role, (p10, p50, p90)) in sp["scores"].items():
+            qrows.append([f"声を登録した人 {k[:8]}（{rl.get(role, role)}）との似ている度合い（10% / 中央値 / 90%）", f"{p10:.2f} / {p50:.2f} / {p90:.2f}"])
     p = q["pitch"]
     qrows.append(["声の高さ（f0）が取れたコマ",
                   f"{p['f0_frames']}コマ（求め方 {p['version']}："

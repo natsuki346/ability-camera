@@ -24,6 +24,7 @@ ios/AbilityCam *.xcworkspace
 ios/Podfile.lock
 ios/AbilityCam/Info.plist
 ios/AbilityCam/Resources/*.task
+ios/AbilityCam/Resources/*.mlmodelc/
 xcuserdata/
 DerivedData/
 build/

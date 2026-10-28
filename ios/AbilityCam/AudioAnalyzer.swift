@@ -16,6 +16,8 @@ final class AudioAnalyzer {
     /// 映像のコマごと（約33ms）の声の大きさ（v1.9.1〜）。音の塊ごとに、その塊の始まりの時刻（epoch ms）と区切りごとの dB を渡す（音のスレッドから呼ぶ）。
     /// 口の開きとのタイミングを振り返りレポートで見るため（記録の type: "audio" の行）。音声そのものは保存しない
     var onBlocks: ((_ startMs: Int64, _ blockMs: Double, _ db: [Double]) -> Void)?
+    /// 話者の区別（v1.10〜）。nil なら計算しない（設定「話者の区別を記録する」がオフ、またはモデルが無い）
+    var speaker: SpeakerFeed?
 
     func start() throws {
         let s = AVAudioSession.sharedInstance()
@@ -29,6 +31,7 @@ final class AudioAnalyzer {
         input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buf, when in
             self?.analyze(buf, sampleRate: sr)
             self?.blocks(buf, sampleRate: sr, hostTime: when.hostTime)
+            if let self, let sp = self.speaker { sp.feed(buf, hostTime: when.hostTime, voiced: self.current.f0Hz != nil) }
         }
         try engine.start()
     }
@@ -78,3 +81,65 @@ final class AudioAnalyzer {
         lock.unlock()
     }
 }
+
+/// 話者の区別の音の流れ（v1.10〜、docs/speaker-plan.md）。タップの中では計算しない：16kHz に変えて輪のバッファ（10秒、メモリだけ）に足すだけ。
+/// 声が出ている間だけ、0.5秒ごとに、別の低い優先度のキューで直近の声のまとまり（最大3秒。1.5秒未満も）の埋め込みを求め、onEmbedding に渡す
+final class SpeakerFeed {
+    private let queue = DispatchQueue(label: "speaker", qos: .utility)
+    private let lock = NSLock()
+    private var ring = SpeakerRing()            // lock の中でだけ触る
+    private var converter: AVAudioConverter?
+    private var outFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(SpeakerCriteria.sampleRate), channels: 1, interleaved: false)!
+    private var busy = false
+    private var lastRun = -Double.infinity
+    private var embedder: SpeakerEmbedder?
+    private let ready: Bool
+
+    /// 埋め込みを求めた（音のスレッドではなく speaker のキュー）。endMs：使った声のまとまりの終わりの時刻（epoch ms）
+    var onEmbedding: ((_ endMs: Int64, _ spanS: Double, _ calcMs: Double, _ embedding: [Float]) -> Void)?
+
+    /// モデルが無ければ nil
+    init?() {
+        guard Bundle.main.url(forResource: SpeakerCriteria.resourceName, withExtension: "mlmodelc") != nil else { return nil }
+        ready = true
+        queue.async { [weak self] in self?.embedder = SpeakerEmbedder() }   // 読み込みも別のキューで
+    }
+
+    func feed(_ buf: AVAudioPCMBuffer, hostTime: UInt64, voiced: Bool) {
+        guard ready else { return }
+        if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: outFormat) }
+        guard let conv = converter else { return }
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * outFormat.sampleRate / buf.format.sampleRate) + 32
+        guard let out = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: cap) else { return }
+        var given = false
+        var err: NSError?
+        conv.convert(to: out, error: &err) { _, status in
+            if given { status.pointee = .noDataNow; return nil }
+            given = true; status.pointee = .haveData; return buf
+        }
+        guard err == nil, let x = out.floatChannelData?[0] else { return }
+        let hostS = hostTime > 0 ? AVAudioTime.seconds(forHostTime: hostTime) : CACurrentMediaTime()
+        let endS = hostS + Double(buf.frameLength) / buf.format.sampleRate
+        lock.lock()
+        ring.append(x, count: Int(out.frameLength))
+        ring.mark(voiced: voiced, at: endS)
+        let span = ring.span(now: endS)
+        var job: (window: [Float], span: Double)?
+        if voiced, let s = span, s >= SpeakerCriteria.minSpanS, endS - lastRun >= SpeakerCriteria.hopS - 1e-6, !busy {
+            busy = true; lastRun = endS
+            job = (ring.window(), s)
+        }
+        lock.unlock()
+        guard let job else { return }
+        let endMs = Int64(((Date().timeIntervalSince1970 - (CACurrentMediaTime() - endS)) * 1000).rounded())
+        queue.async { [weak self] in
+            guard let self else { return }
+            defer { self.lock.lock(); self.busy = false; self.lock.unlock() }
+            guard let emb = self.embedder else { return }
+            let t0 = CACurrentMediaTime()
+            guard let e = emb.embed(window: job.window, spanS: job.span) else { return }
+            self.onEmbedding?(endMs, job.span, (CACurrentMediaTime() - t0) * 1000, e)
+        }
+    }
+}
+

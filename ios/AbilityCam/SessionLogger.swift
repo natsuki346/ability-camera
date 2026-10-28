@@ -43,6 +43,17 @@ struct AudioRecord: Encodable {
     enum CodingKeys: String, CodingKey { case type, tMs = "t_ms", blockMs = "block_ms", rmsDb = "rms_db" }
 }
 
+/// 話者の区別（v1.10〜）：声が出ている間 0.5秒ごとに1行。声の特徴の数値（埋め込み）は書かない
+struct SpeakerRecord: Encodable {
+    let type = "speaker"
+    let tMs: Int64              // 使った声のまとまりの終わりの時刻（epoch ms）
+    let windowMs: Int           // 使った声の長さ（ms。1500 より短いものも書く）
+    let scores: [String: Double]   // 声を登録した人（id）ごとの似ている度合い（コサイン類似度、-1〜1）。登録した人がいなければ空
+    let calcMs: Double          // 計算にかかった時間
+    let model: String
+    enum CodingKeys: String, CodingKey { case type, tMs = "t_ms", windowMs = "window_ms", scores, calcMs = "calc_ms", model }
+}
+
 /// nil のときも null と書く値（書いていない古い記録と見分けるため）
 struct Nullable<T: Encodable>: Encodable {
     let value: T?
@@ -145,7 +156,7 @@ final class SessionLogger {
     private var startedMs = Int64.max   // queue の上でだけ触る
     private var stats = SessionStats()  // queue の上でだけ触る。書いた行から要約を数える
 
-    func start(camera: CameraLens, personId: String?, mirrored: Bool = false) throws {
+    func start(camera: CameraLens, personId: String?, mirrored: Bool = false, extra: [String: Any] = [:]) throws {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd-HHmmss"
         let name = "ability-cam-\(f.string(from: Date())).jsonl"
@@ -181,7 +192,7 @@ final class SessionLogger {
             "person_id": personId ?? NSNull(),
             "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(本人から見て右・上・右へ傾くが+。direction_version=2、head_turn の右・左も本人から見て) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角, front=前面・自分で試す用。超広角は画角の端で顔が歪み表情の数値が変わることがある) / mirror_corrected=解析の映像が鏡で、記録の値を背面と同じ意味に直した / camera_orientation_version=映像の向きの決め方(2=v1.6.1〜) / f0_version=声の高さの求め方(2=v1.6.2〜、f0_floor_db 以上の音で f0_range_hz の範囲)"
         ]
-        let data = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+        let data = try JSONSerialization.data(withJSONObject: header.merging(extra) { a, _ in a }, options: [.sortedKeys])
         let ms = header["started_at_ms"] as! Int64
         queue.async {
             self.startedMs = ms

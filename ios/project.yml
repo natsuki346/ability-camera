@@ -14,6 +14,13 @@ targets:
       - path: AbilityCam/Resources
         buildPhase: resources
         optional: true
+        excludes:
+          - "wespeaker.mlmodelc/**"
+      # 話者の区別のモデル（v1.10〜、setup.sh が取ってくる。CC BY 4.0、README の「ライセンス」）。コンパイル済みの Core ML をフォルダのまま入れる
+      - path: AbilityCam/Resources/wespeaker.mlmodelc
+        type: folder
+        buildPhase: resources
+        optional: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ability.cam

@@ -44,12 +44,6 @@ struct NowPage: View {
             HStack(alignment: .center, spacing: 6) {
                 Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(2).minimumScaleFactor(0.6)
                 Spacer(minLength: 2)
-                if model.canOverwriteSaved {
-                    Button("今日の普段で上書き") { model.overwriteSaved() }
-                        .font(.caption)
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
-                }
                 Button("普段を取り直す") { model.restartBaseline() }
                     .font(.caption)
                     .buttonStyle(.bordered)
@@ -63,25 +57,28 @@ struct NowPage: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    /// 「顔：読めています・普段：記録しました」
+    /// 「顔：読めています・普段：記録しました」。保存した普段で比べているときは「顔：読めています・普段：保存した普段（10/28 15:10）」
+    /// だけを出す（うしろで記録している今日の普段は出さない、v1.3〜）
     private var statusText: String {
         let face = !model.cameraActive ? "顔：–" : model.faceReadable ? "顔：読めています" : "顔：読めません"
+        if model.comparing == .saved {
+            let at = model.savedFromMs.map { PersonPickerView.date(Date(timeIntervalSince1970: Double($0) / 1000)) } ?? ""
+            return "\(face)・普段：保存した普段（\(at)）"
+        }
         let today: String
         if let sec = model.baselineSec { today = "記録中 \(sec)/\(Int(model.baselineTarget))秒" }
         else if model.baselineReady { today = "記録しました" }
         else { today = "まだありません" }
-        if model.comparing == .saved {
-            let at = model.savedFromMs.map { PersonPickerView.date(Date(timeIntervalSince1970: Double($0) / 1000)) } ?? ""
-            return "\(face)・保存した普段（\(at)）で比べています・今日の普段：\(today)"
-        }
         return "\(face)・普段：\(today)"
     }
 
     private var differences: some View {
         VStack(alignment: .leading, spacing: 2) {
             if !model.running {
-                Text("記録が始まると、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します")
-                    .font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                Text(PersonStore.shared.selected?.saved != nil
+                     ? "記録が始まると、保存した普段で比べ始めます（カメラが違うときは、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します）"
+                     : "記録が始まると、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します")
+                    .font(.callout).foregroundStyle(.secondary).lineLimit(2).minimumScaleFactor(0.7)
             } else if model.comparing == nil, let sec = model.baselineSec {
                 Text("普段を記録しています").font(.title3.bold()).foregroundStyle(ContentView.navyText)
                 ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget)

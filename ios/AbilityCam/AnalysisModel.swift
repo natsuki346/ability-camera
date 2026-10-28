@@ -38,7 +38,7 @@ final class AnalysisModel: ObservableObject {
     @Published var baselineReady = false      // 今日の普段を記録し終えた
     @Published var comparing: BaselineSource? // いつもとの違いを比べている普段（nil：まだ比べていない）
     @Published var savedFromMs: Int64?        // 保存した普段で比べているとき、その普段を保存した日時
-    @Published var canOverwriteSaved = false  // 「今日の普段で上書き」を出す
+    @Published var askResave = false          // 「この普段で保存し直しますか？」を聞く（画面に出して取った今日の普段を、取り終えたとき）
     @Published var maxFaces = 2               // 一度に探す顔の数（解析コマ/秒が落ちたら1）
     @Published var analyzedRatio: Double?     // 直近10秒で、カメラから解析に渡したコマのうち解析できた割合
     @Published var baselineTarget = AnalysisModel.selectedBaselineSeconds   // 今の普段の長さ（数えた時間の目標）
@@ -97,7 +97,8 @@ final class AnalysisModel: ObservableObject {
     private var diffCount = 0                                 // このセッションで違いが出た回数（segments と同じ数え方）
     private var head = HeadTurnTracker()                      // 顔を向ける・そむける（0.5秒続いたら記録）
     private var boxStats = (cx: Welford(), cy: Welford(), w: Welford())   // 普段の間の顔の位置と大きさ
-    private var todayBaseline: SavedBaseline?                 // このセッションで記録し終えた今日の普段（保存・上書き用）
+    private var todayBaseline: SavedBaseline?                 // このセッションで記録し終えた今日の普段（保存・保存し直し用）
+    private var todayShown = false                            // 今日の普段を画面に出して取った（保存した普段で比べながら、うしろで黙って取ったのではない）
     private var faceCount: Int?                               // 映っている顔の数（0.5秒続いたもの）
     private var faceCountPending: (n: Int, tMs: Int64)?
     private var facesCheck: (host: CFTimeInterval, submitted: Int, analyzed: Int)?   // 2つ探して解析コマ/秒が落ちていないか
@@ -189,7 +190,7 @@ final class AnalysisModel: ObservableObject {
         todayBaseline = nil
         face.setPreferred(nil)
         resetBaseline()   // 普段（設定の長さ）も自動で始める
-        applySaved()   // 保存した普段の行を書く（設定でオンなら、その普段ですぐ比べ始める。今日の普段もうしろで記録する）
+        applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
         running = true
         sessionStartedAt = Date()
         status = "記録しています: \(logger.fileName ?? "-")" + note
@@ -209,7 +210,7 @@ final class AnalysisModel: ObservableObject {
             running = false
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
-            comparing = nil; savedFromMs = nil; canOverwriteSaved = false; todayBaseline = nil
+            comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
             if let s = logger.finish() {
@@ -340,7 +341,8 @@ final class AnalysisModel: ObservableObject {
         baselineTarget = Self.selectedBaselineSeconds
     }
 
-    /// 普段を取り直す
+    /// 普段を取り直す：保存した普段で比べていても、それをやめて今日の普段を画面に出して取り直す。
+    /// 取り終えたら、選んだ人に保存した普段があれば「この普段で保存し直しますか？」と聞く
     func restartBaseline() {
         guard running else { return }
         logger.write(EventRecord(tMs: Self.nowMs(), kind: "baseline_restart", value: nil))
@@ -420,13 +422,13 @@ final class AnalysisModel: ObservableObject {
         liveZ = [:]; liveDiffs = []
         link.baseline = nil   // 見る側の「いつもの範囲」も消す（記録し終えたら、また送る）
         meterZ = [:]; diffMetrics = [:]; baselineStats = nil
-        comparing = nil; savedFromMs = nil; canOverwriteSaved = false
+        comparing = nil; savedFromMs = nil; askResave = false
         boxStats = (Welford(), Welford(), Welford())
     }
 
-    /// 選んだ人の保存した普段があれば、セッションの始めに source: "saved" の baseline 行を書く（v1.2.1〜、設定がオフでも）。
-    /// 設定「保存した普段ですぐ始める」がオンなら、その普段で比べ始める（compared: true）。オフなら記録するだけ（compared: false）。
-    /// カメラが保存した普段と違うときは書かず、理由を event（kind: "saved_baseline_skipped"）に残す
+    /// 選んだ人の保存した普段があり、カメラが同じなら、セッションの始めに source: "saved" の baseline 行（compared: true）を書き、
+    /// その普段ですぐ比べ始める（v1.3〜、設定は無い）。今日の普段はうしろで黙って記録し、compared: false で書く（画面には出さない）。
+    /// カメラが保存した普段と違うときは書かず、理由を event（kind: "saved_baseline_skipped"）に残す（今日の普段を画面に出して取る）
     private func applySaved() {
         guard let p = PersonStore.shared.selected, let sv = p.saved else { return }
         let lens = (lensInUse ?? camera.lens).rawValue
@@ -439,14 +441,12 @@ final class AnalysisModel: ObservableObject {
             logger.write(e)
             return
         }
-        let use = UserDefaults.standard.bool(forKey: "useSavedBaseline")
         var row = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
                                  yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                  minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: sv.metrics)
-        row.source = BaselineSource.saved.rawValue; row.compared = use
+        row.source = BaselineSource.saved.rawValue; row.compared = true
         row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox
         logger.write(row)
-        guard use else { return }   // オフ：比べるのは今まで通り今日の普段だけ
         let b = Self.engineBaseline(sv.metrics)
         engine.setBaseline(b)
         baselineStats = b
@@ -457,15 +457,15 @@ final class AnalysisModel: ObservableObject {
         face.setPreferred(sv.faceBox)
     }
 
-    /// 「今日の普段で上書き」
+    /// 「この普段で保存し直しますか？」で「保存し直す」
     func overwriteSaved() {
+        askResave = false
         guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
         PersonStore.shared.setSaved(p.id, t)
-        canOverwriteSaved = false
-        showMessage("\(p.displayName)の保存した普段を、今日の普段で上書きしました")
+        showMessage("\(p.displayName)の普段を保存し直しました")
     }
 
-    /// 上の帯で人を変えた：記録に id を書く（名前は書かない）。今日の普段があれば、その人に保存する（あれば上書きのボタン）
+    /// 上の帯で人を変えた：記録に id を書く（名前は書かない）。今日の普段があれば、その人に保存する（あれば保存し直すか聞く）
     func personChanged() {
         let id = PersonStore.shared.selectedID
         if running {
@@ -476,14 +476,16 @@ final class AnalysisModel: ObservableObject {
         saveTodayIfNew()
     }
 
+    /// 保存した普段がまだ無ければ自動で保存する。あるときは、今日の普段を画面に出して取ったときだけ保存し直すか聞く
+    /// （うしろで黙って取った今日の普段は、記録に書くだけで保存しない）
     private func saveTodayIfNew() {
-        canOverwriteSaved = false
+        askResave = false
         guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
         if p.saved == nil {
             PersonStore.shared.setSaved(p.id, t)
             showMessage("\(p.displayName)の普段を保存しました")
-        } else {
-            canOverwriteSaved = true
+        } else if todayShown {
+            askResave = true
         }
     }
 
@@ -520,9 +522,10 @@ final class AnalysisModel: ObservableObject {
         }
         baselineSec = nil; baselineWait = nil
         baselineReady = true
+        todayShown = useToday
         todayBaseline = SavedBaseline(metrics: out, camera: (lensInUse ?? camera.lens).rawValue, targetS: baselineTarget,
                                       savedMs: Self.nowMs(), faceBox: faceBox)
-        saveTodayIfNew()   // 人を選んでいて、保存した普段がまだ無ければ保存する（あれば上書きのボタンを出す）
+        saveTodayIfNew()   // 人を選んでいて、保存した普段がまだ無ければ保存する（あれば、画面に出して取ったときだけ保存し直すか聞く）
     }
 
     /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない

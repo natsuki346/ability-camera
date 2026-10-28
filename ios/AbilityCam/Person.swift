@@ -26,8 +26,8 @@ struct Person: Codable, Identifiable, Equatable {
     var name: String
     var saved: SavedBaseline?
 
-    /// 「姉さん」（名前がもう「さん」で終わっていれば足さない）
-    var displayName: String { name.hasSuffix("さん") ? name : "\(name)さん" }
+    /// 画面に出す名前（v1.3 から「さん」を付けない：「自分」「姉」）
+    var displayName: String { name }
 }
 
 /// 人の一覧。Application Support の persons.json（「ファイル」アプリには出ない場所）に置く

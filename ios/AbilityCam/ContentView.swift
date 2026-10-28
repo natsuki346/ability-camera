@@ -34,6 +34,13 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) { SettingsView(link: model.link) }
         .sheet(isPresented: $showPeople) { PersonPickerView() }
         .onChange(of: people.selectedID) { model.personChanged() }
+        // 「普段を取り直す」などで画面に出して取った今日の普段を、取り終えたとき（保存した普段がある人だけ）
+        .alert("この普段で保存し直しますか？", isPresented: Binding(get: { model.askResave }, set: { if !$0 { model.askResave = false } })) {
+            Button("保存し直す") { model.overwriteSaved() }
+            Button("保存しない", role: .cancel) { model.askResave = false }
+        } message: {
+            Text("\(people.selected?.displayName ?? "")の保存した普段を、今取った普段に置き換えます。次からは、この普段ですぐ比べ始めます")
+        }
     }
 
     /// 上：左に ≡、真ん中に「記録中 12分34秒」、右に歯車

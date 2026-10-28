@@ -1,9 +1,25 @@
 import Foundation
 
+/// 顔の向きの左右（v1.7.1〜、記録のヘッダの direction_version）。
+/// 2：本人から見た右・左（本人が自分の右へ向く・右へ傾けると yaw・roll が +、「右」）。前面でも背面でも同じ。表情の Left / Right（本人の側）とも同じ側
+/// 1（ヘッダに無い記録、v1.6.1 まで）：向かい合って見る人から見た右（映像で見て右が +）。読むときに左右を入れ替える
+enum FaceDirection {
+    static let version = 2
+    static let note = "本人から見て"
+
+    /// 記録の direction_version（無ければ 1）
+    static func version(of header: [String: Any]) -> Int { (header["direction_version"] as? NSNumber)?.intValue ?? 1 }
+
+    /// 「右へ」「見えなくなった（直前は右 40°）」などの右と左を入れ替える（v1.6.1 までの記録を読むとき）
+    static func swapSides(_ s: String) -> String {
+        String(s.map { $0 == "右" ? "左" : $0 == "左" ? "右" : $0 })
+    }
+}
+
 /// 顔の向きの段（見る側の「時間の流れ」と、記録の head_turn）。状態の名前ではなく、向きの事実だけ
 enum HeadState: String, Codable, CaseIterable {
     case front          // 正面（|yaw| < 15° になってから、35° を超えるまで）
-    case right, left    // 映像で見て右／左へ 35° を超えた（15° 未満に戻るまで）
+    case right, left    // 本人から見て右／左へ 35° を超えた（15° 未満に戻るまで。v1.7.1〜、それまでは映像で見て）
     case hidden         // 顔が見えない
     case oblique        // 見えなくなったあと、15〜35° で見えるようになった（正面にも横にも入っていない）
 
@@ -80,7 +96,7 @@ struct HeadTurnTracker {
         }
     }
 
-    /// 「右 40°」「左 20°」「正面」（映像で見て右が +）
+    /// 「右 40°」「左 20°」「正面」（本人から見て右が +、v1.7.1〜）
     static func side(_ yaw: Double) -> String {
         let d = Int(abs(yaw).rounded())
         if abs(yaw) < frontDeg { return "正面" }

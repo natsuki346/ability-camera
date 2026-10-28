@@ -210,13 +210,15 @@ class HeadTurnTest(unittest.TestCase):
         c = review.load_criteria(review.HERE / "criteria.json", [])
         a = review.analyze(review.load(FIXTURE), c)
         q = review.quality(a, calm=False)
-        self.assertAlmostEqual(q["head"]["right"][0], 2.0, delta=0.1)
+        # 作り物の記録は direction_version の無い古い形（映像で見て右）なので、読むときに入れ替えて本人から見て左（v1.7.1〜）
+        self.assertAlmostEqual(q["head"]["left"][0], 2.0, delta=0.1)
         self.assertAlmostEqual(q["head"]["hidden"][0], 2.0, delta=0.1)
         with tempfile.TemporaryDirectory() as d:
             review.main([str(FIXTURE), "--out-dir", d])
             doc = (Path(d) / "fixture_basic.html").read_text(encoding="utf-8")
             self.assertIn("顔を向けた・そむけた記録（head_turn、4件）", doc)
             self.assertIn("見えなくなった（直前は正面）", doc)
+            self.assertIn("本人から見た右・左にしています", doc)
             self.assertIn("カメラ：広角", doc)
             self.assertNotIn("超広角で記録しています", doc)
 
@@ -972,3 +974,57 @@ class VoiceCarryReportTest(unittest.TestCase):
         cond = review.baseline_time_row(b)[-1]
         self.assertIn("3回のセッション・2日にまたがって集めた", cond)
         self.assertIn("前のセッションまでの分 7.4秒", cond)
+
+
+class DirectionTest(unittest.TestCase):
+    """顔の向きの左右（v1.7.1〜）：direction_version 2 の記録は本人から見た右・左のまま、無い記録は入れ替えて読む（アプリのリプレイと同じ）"""
+
+    def write(self, d, version):
+        import json
+        lines = FIXTURE.read_text(encoding="utf-8").splitlines()
+        h = json.loads(lines[0])
+        if version:
+            h["direction_version"] = version
+        p = Path(d) / f"dir{version}.jsonl"
+        p.write_text("\n".join([json.dumps(h, ensure_ascii=False)] + lines[1:]) + "\n", encoding="utf-8")
+        return p
+
+    def test_old_is_swapped_new_is_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            old, new = review.load(self.write(d, None)), review.load(self.write(d, 2))
+        self.assertTrue(old.direction_flipped)
+        self.assertFalse(new.direction_flipped)
+        self.assertTrue(np.allclose(np.nan_to_num(old.yaw), -np.nan_to_num(new.yaw)))
+        ov = [e["value"] for e in review.head_events(old)]
+        nv = [e["value"] for e in review.head_events(new)]
+        self.assertEqual(nv[0], "右へ")
+        self.assertEqual(ov[0], "左へ")
+        self.assertEqual(ov, [review.swap_sides(v) for v in nv])
+        self.assertEqual(review.head_events(old)[0]["head"], "left")
+
+    def test_swap_sides(self):
+        self.assertEqual(review.swap_sides("見えなくなった（直前は右 40°）"), "見えなくなった（直前は左 40°）")
+        self.assertEqual(review.swap_sides("正面に戻った"), "正面に戻った")
+
+    def test_same_in_replay(self):
+        import json
+        import check_app
+        exe = check_app.build()
+        with tempfile.TemporaryDirectory() as d:
+            for v in (None, 2):
+                p = self.write(d, v)
+                out = __import__("subprocess").run([str(exe), "--heads", str(p)], check=True, capture_output=True, text=True).stdout
+                rows = [json.loads(x) for x in out.splitlines() if x.strip()]
+                texts = [r["text"] for r in rows if r["kind"] == "head_text"]
+                rec = review.load(p)
+                want = [f"顔の向き：{e['value']}（本人から見て）" for e in review.head_events(rec)]
+                self.assertEqual(texts, want)
+                runs = [r["value"] for r in rows if r["kind"] == "head"]
+                states, _ = review.head_states(rec.t, rec.face, rec.yaw)
+                seq = [s for i, s in enumerate(states) if s is not None and (i == 0 or s != states[i - 1])]
+                self.assertEqual([x for i, x in enumerate(runs) if i == 0 or x != runs[i - 1]], [s for s in seq if s != "unknown"])
+
+    def test_app_constant(self):
+        import re
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "HeadTurn.swift").read_text(encoding="utf-8")
+        self.assertEqual(int(re.search(r"static let version = (\d+)", src).group(1)), review.DIRECTION_VERSION)

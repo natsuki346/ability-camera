@@ -44,12 +44,14 @@ struct FaceSketch: View {
     /// 左右がこれを超えると、表情の数値は当てにならない
     static let sideLimit = 35.0
 
-    var yaw: Double { shape?["yaw"] ?? 0 }
+    // 絵は映像と同じ見え方（向かい合って見る）で描く。値の yaw・roll は本人から見て右が +（v1.7.1〜）なので、描くときは符号を反対にする
+    var yaw: Double { -(shape?["yaw"] ?? 0) }
     var pitch: Double { shape?["pitch"] ?? 0 }
-    var roll: Double { shape?["roll"] ?? 0 }
+    var roll: Double { -(shape?["roll"] ?? 0) }
     var turnedAway: Bool { abs(yaw) > Self.sideLimit }
 
-    /// 「右 25°・下 10°」のような事実だけ。15°未満は出さず、どれも無ければ「正面」
+    /// 「右 25°・下 10°（本人から見て）」のような事実だけ。15°未満は出さず、どれも無ければ「正面」。
+    /// 右・左は本人から見た向き（v1.7.1〜）。右・左が入るときは「（本人から見て）」を付ける
     static func directionText(_ shape: [String: Double]) -> String {
         func part(_ v: Double?, _ plus: String, _ minus: String) -> String? {
             guard let v, abs(v) >= 15 else { return nil }
@@ -57,7 +59,8 @@ struct FaceSketch: View {
         }
         let parts = [part(shape["yaw"], "右", "左"), part(shape["pitch"], "上", "下"),
                      part(shape["roll"], "右に傾き", "左に傾き")].compactMap { $0 }
-        return parts.isEmpty ? "正面" : parts.joined(separator: "・")
+        let sided = [shape["yaw"], shape["roll"]].contains { ($0.map(abs) ?? 0) >= 15 }
+        return parts.isEmpty ? "正面" : parts.joined(separator: "・") + (sided ? "（\(FaceDirection.note)）" : "")
     }
 
     static let keys = ["browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft", "browOuterUpRight",
@@ -78,7 +81,7 @@ struct FaceSketch: View {
             draw(&ctx, sz, pal)
         }
         .frame(width: size, height: size)
-        .rotationEffect(.degrees(roll))   // 頭の上が映像の右へ傾く＝時計回り
+        .rotationEffect(.degrees(roll))   // 頭の上が映像の右へ傾く（本人から見て左へ傾く）＝時計回り
         .background(RoundedRectangle(cornerRadius: size * 0.12).fill(pal.background))
         .accessibilityHidden(true)
     }

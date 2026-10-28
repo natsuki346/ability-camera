@@ -35,6 +35,7 @@ struct LiveState: Codable {
     var voiceTotal: Int?              // 声の普段に必要な本人の声の秒数（10）
     var otherVoice: Bool?             // 本人以外の声（と言えない声）だけが入っている
     // v1.6.2〜
+    var directionVersion: Int?        // 顔の向きの左右（v1.7.1〜は 2：本人から見て。古い撮る側は nil で、見る側が入れ替える）
     var voiceOn: Bool?                // 声が出た（v1.7〜）：本人の声のまとまりが続いているか（記録していない・古い撮る側では nil）。秒数は diffs の voice_on
     var voiceWait: String?            // 声の普段の進み具合が増えない理由（「声の高さが取れていません」など。集めていない・古い撮る側では nil）
 }
@@ -573,6 +574,20 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     }
 
     /// そのとき、この指標がどう見えていたか（撮る側の「いつもとの違い」と同じ決まり）
+    /// 古い撮る側（v1.7 まで、directionVersion が無い）の顔の向きは映像で見た右・左なので、本人から見た右・左に入れ替える
+    static func normalized(_ s: LiveState) -> LiveState {
+        guard (s.directionVersion ?? 1) < 2 else { return s }
+        var o = s
+        o.yaw = s.yaw.map { -$0 }; o.roll = s.roll.map { -$0 }
+        if var sh = s.shape {
+            for k in ["yaw", "roll"] { if let v = sh[k] { sh[k] = -v } }
+            o.shape = sh
+        }
+        o.head = s.head.map { $0 == HeadState.right.rawValue ? HeadState.left.rawValue : $0 == HeadState.left.rawValue ? HeadState.right.rawValue : $0 }
+        o.directionVersion = FaceDirection.version
+        return o
+    }
+
     static func band(_ m: Metric, in s: LiveState) -> Band {
         guard s.recording, s.baselineReady, !s.insufficient.contains(m.label),
               !(m.isFace && !s.faceReadable) else { return .notCompared }
@@ -689,7 +704,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
             guard session === self.session else { return }
             switch w.kind {
             case "state":
-                guard let s = w.state else { return }
+                guard let s = w.state.map(Self.normalized) else { return }
                 self.state = s
                 self.lastReceived = Date()
                 if let off = self.offsetMs { self.latencyMs = Double(t1) + off - Double(s.captureMs) }

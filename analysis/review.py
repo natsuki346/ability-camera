@@ -90,6 +90,7 @@ class Recording:
     pairs: dict[str, np.ndarray] = field(default_factory=dict)   # 表情の数値 52種を左右平均したもの（browDown など。顔が無いコマは NaN）
     bs_raw: dict[str, np.ndarray] = field(default_factory=dict)  # 口の動きを見る表情の数値（左右の無いもの。顔が無い・値が無いコマは NaN）
     voice_self_rec: np.ndarray | None = None                     # 記録の voice_self（1 / 0 / NaN＝null、キーが無いコマは -1）。v1.6〜
+    direction_flipped: bool = False                              # v1.6.1 までの記録（direction_version が無い）の左右を、本人から見た右・左に入れ替えた
     f0_dropped: int = 0                                          # 範囲（F0_RANGE）の外で使わなかった f0 の数（v1.6.1 までの記録の取り違え）
 
     @property
@@ -175,12 +176,40 @@ def load(path: Path) -> Recording:
         lat[i] = o.get("lat_ms", np.nan)
         p = o.get("proc_ms", -1)
         proc[i] = p if p is not None and p >= 0 else np.nan
+    # 顔の向きの左右（v1.7.1〜、direction_version 2）：本人から見た右・左。それより前の記録は映像で見た右・左なので入れ替える（アプリのリプレイと同じ）
+    flipped = int(header.get("direction_version") or 1) < 2
+    if flipped:
+        yaw = -yaw
+        events = [swap_head_event(e) if e.get("kind") == "head_turn" else e for e in events]
     t = np.array([o["t_ms"] for o in frames], float) / 1000
     # v1.2〜：保存した普段（source: "saved"）で比べたときは、今日の普段の行も compared: false で書かれる。
     # 区間はアプリと同じく、比べるのに使った行（compared が false でないもの）で判定する
     used = [b for b in baselines if b.get("compared", True) is not False]
     return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines,
-                     bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped)
+                     bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped, direction_flipped=flipped)
+
+
+DIRECTION_VERSION = 2   # アプリの FaceDirection.version
+SIDE_NOTE = "本人から見て"
+
+
+def swap_sides(text: str) -> str:
+    """「右へ」「見えなくなった（直前は右 40°）」などの右と左を入れ替える（アプリの FaceDirection.swapSides と同じ）"""
+    return text.translate(str.maketrans({"右": "左", "左": "右"}))
+
+
+def swap_head_event(e: dict) -> dict:
+    """v1.6.1 までの head_turn（映像で見た右・左）を、本人から見た右・左にする"""
+    o = dict(e)
+    sw = {"right": "left", "left": "right"}
+    for k in ("head", "from"):
+        if o.get(k) in sw:
+            o[k] = sw[o[k]]
+    if isinstance(o.get("value"), str):
+        o["value"] = swap_sides(o["value"])
+    if isinstance(o.get("yaw_deg"), (int, float)):
+        o["yaw_deg"] = -o["yaw_deg"]
+    return o
 
 
 # ---------------------------------------------------------------- 基準
@@ -739,7 +768,7 @@ def analyze(rec: Recording, c: dict) -> Analysis:
 # ---------------------------------------------------------------- 顔の向き（head_turn）
 
 HEAD_SIDE_DEG, HEAD_FRONT_DEG, HEAD_HOLD_S = 35.0, 15.0, 0.5
-HEAD_LABEL = {"front": "正面", "right": "右（35°超）", "left": "左（35°超）", "hidden": "見えない",
+HEAD_LABEL = {"front": "正面", "right": "右（本人から見て、35°超）", "left": "左（本人から見て、35°超）", "hidden": "見えない",
               "oblique": "斜め（見えるようになったあと 15〜35°）", "unknown": "まだ決まっていない"}
 HEAD_ORDER = ["front", "right", "left", "hidden", "oblique", "unknown"]
 # 色は見る側の「時間の流れ」と同じ（docs/wording-guide.md：赤と赤・黄・緑の組み合わせは使わない）
@@ -1453,7 +1482,7 @@ def head_track(a: Analysis, states: np.ndarray) -> Track:
             for t0, t1 in spans(states == k, t):
                 ax.axvspan(to_num(t0), to_num(t1), color=HEAD_COLOR[k], lw=0)
         ax.set_yticks([])
-        ax.set_title("顔の向き（正面・右・左・見えない）", loc="left", fontsize=10)
+        ax.set_title("顔の向き（正面・右・左・見えない。右・左は本人から見て）", loc="left", fontsize=10)
 
     return Track("顔の向き", draw, height=0.7)
 
@@ -1602,6 +1631,9 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         if front_orientation_old(rec):
             parts.append("<p class=note><b>この前面の記録は、解析に渡した映像の向きが合っていなかった版（v1.5〜v1.6）のものです</b>"
                          "（ヘッダに camera_orientation_version がありません）。表情の数値・顔の向きは当てになりません。</p>")
+    if rec.direction_flipped:
+        parts.append("<p class=note>この記録は顔の向きの左右を映像で見た向きで書いていた版（v1.6.1 まで、ヘッダに direction_version が無い）なので、"
+                     "読むときに入れ替えて、本人から見た右・左にしています（yaw と head_turn の右・左）。</p>")
     parts.append("<p class=note>記録から、観測された変化（いつもの範囲から数値が外れた区間）を確認するための手がかりです。"
                  "本人の気持ちや状態は判断していません。文言と色は docs/wording-guide.md に従っています。</p>")
 
@@ -1642,7 +1674,7 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                   + (f"。{F0_RANGE[0]:g}〜{F0_RANGE[1]:g}Hz の外で使わなかった値 {p['dropped']}件" if p["dropped"] else "")])
     if "yaw" in q:
         y = q["yaw"]
-        qrows.append(["yaw の分布（5% / 中央値 / 95%）", f"{y['p5']:.0f}° / {y['median']:.0f}° / {y['p95']:.0f}°"])
+        qrows.append(["yaw の分布（5% / 中央値 / 95%。本人から見て右が +）", f"{y['p5']:.0f}° / {y['median']:.0f}° / {y['p95']:.0f}°"])
         qrows.append(["|yaw| <15° / 15〜35° / ≥35°", f"{pc(y['lt15'])} / {pc(y['15to35'])} / {pc(y['ge35'])}"])
     else:
         qrows.append(["yaw", "記録に顔の向きがありません（v0.3 より前）"])

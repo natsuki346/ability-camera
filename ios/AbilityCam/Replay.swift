@@ -83,6 +83,8 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         baselines.sort { (ms($0) ?? 0) < (ms($1) ?? 0) }
         evs = evs.filter { ms($0) != nil }.sorted { ms($0)! < ms($1)! }
         camera = header["camera_label"] as? String
+        // v1.6.1 までの記録（direction_version が無い）は、映像で見た右・左なので入れ替えて、本人から見た右・左にする（review.py と同じ）
+        let flip: Double = FaceDirection.version(of: header) < 2 ? -1 : 1
 
         // コマを読む
         let n = frames.count
@@ -96,9 +98,9 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         for (i, o) in frames.enumerated() {
             if let v = o["voice_self"] { recordedVoiceSelf[i] = .some(v as? Bool) }
             t[i] = ms(o)!
-            yaw[i] = (o["yaw_deg"] as? NSNumber)?.doubleValue
+            yaw[i] = (o["yaw_deg"] as? NSNumber).map { $0.doubleValue * flip }
             pitch[i] = (o["pitch_deg"] as? NSNumber)?.doubleValue
-            roll[i] = (o["roll_deg"] as? NSNumber)?.doubleValue
+            roll[i] = (o["roll_deg"] as? NSNumber).map { $0.doubleValue * flip }
             rms[i] = (o["rms_db"] as? NSNumber)?.doubleValue
             // 声の高さの範囲の外（v1.6.1 までの記録の 800Hz のような取り違え）は使わない（review.py の F0_RANGE と同じ）
             f0[i] = ((o["f0_hz"] as? NSNumber)?.doubleValue).flatMap {
@@ -236,7 +238,8 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
                 let ev = ReplayEvent(t: et, kind: .mark, text: "家族の印：\(value ?? "")\(by)")
                 mk.append(ev); list.append(ev)
             case "head_turn":
-                list.append(ReplayEvent(t: et, kind: .head, text: "顔の向き：\(value ?? "")"))
+                let v = flip < 0 ? FaceDirection.swapSides(value ?? "") : (value ?? "")
+                list.append(ReplayEvent(t: et, kind: .head, text: "顔の向き：\(v)（\(FaceDirection.note)）"))
             default: break
             }
         }

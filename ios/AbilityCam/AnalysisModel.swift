@@ -968,6 +968,7 @@ final class AnalysisModel: ObservableObject {
             head: head.state?.rawValue,
             eyesClosed: comparing != nil && engine.eyesJudgeable ? engine.active[.eyesClosed] != nil : nil,
             voiceSec: running ? voiceSec : nil, voiceTotal: Int(DiffCriteria.voiceBaselineS), otherVoice: running ? otherVoice : nil,
+            directionVersion: FaceDirection.version,
             voiceOn: running ? engine.active[.voiceOn] != nil : nil,
             voiceWait: running && voiceSec != nil ? voiceWait : nil))
     }

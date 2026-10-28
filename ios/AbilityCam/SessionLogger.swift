@@ -12,7 +12,7 @@ struct FrameRecord: Encodable {
     let f0Hz: Float?
     let procMs: Double
     let latMs: Double
-    var yawDeg: Double?         // 顔の向き（度）。映像で見て右・上・右へ傾く が +
+    var yawDeg: Double?         // 顔の向き（度）。本人から見て右・上・右へ傾く が +（v1.7.1〜、direction_version 2。それまでは映像で見て右）
     var pitchDeg: Double?
     var rollDeg: Double?
     var faceCx: Double?         // 本人として使った顔の枠：中心 x・y と幅（0〜1、v1.2〜）
@@ -150,13 +150,15 @@ final class SessionLogger {
             "mirror_corrected": mirrored,
             // 声の高さ（f0）の求め方（v1.6.2〜は 2：-60dBFS 以上の音で、70〜500Hz、正規化した自己相関の山 0.6 以上、2倍・半分の取り違えを防ぐ。
             // 無い記録は 1：-40dBFS 以上、70〜1000Hz で、小さい声ではほとんど取れず、800Hz のような取り違えが混ざる）
+            // 顔の向きの左右（v1.7.1〜は 2：本人から見た右・左が +。無い記録は 1：映像で見て右が +。読むときに左右を入れ替える）
+            "direction_version": FaceDirection.version,
             "f0_version": PitchCriteria.version,
             "f0_floor_db": Double(PitchCriteria.floorDb),
             "f0_range_hz": [Double(PitchCriteria.minHz), Double(PitchCriteria.maxHz)],
             "f0_clarity_min": Double(PitchCriteria.clarityMin),
             // 人の id（名前は書かない。v1.2〜）
             "person_id": personId ?? NSNull(),
-            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(映像で見て右・上・右へ傾くが+) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角, front=前面・自分で試す用。超広角は画角の端で顔が歪み表情の数値が変わることがある) / mirror_corrected=解析の映像が鏡で、記録の値を背面と同じ意味に直した / camera_orientation_version=映像の向きの決め方(2=v1.6.1〜) / f0_version=声の高さの求め方(2=v1.6.2〜、f0_floor_db 以上の音で f0_range_hz の範囲)"
+            "note": "type=frame|baseline|event / t_ms=撮影時刻・イベントの時刻(epoch ms) / bs=表情の数値52種(0-1) / yaw_deg,pitch_deg,roll_deg=顔の向き(本人から見て右・上・右へ傾くが+。direction_version=2、head_turn の右・左も本人から見て) / pts=鍵となる顔の点[x,y,z] / proc_ms=解析時間 / lat_ms=撮影→結果 / camera=使ったカメラ(wide=広角, ultra_wide=超広角, front=前面・自分で試す用。超広角は画角の端で顔が歪み表情の数値が変わることがある) / mirror_corrected=解析の映像が鏡で、記録の値を背面と同じ意味に直した / camera_orientation_version=映像の向きの決め方(2=v1.6.1〜) / f0_version=声の高さの求め方(2=v1.6.2〜、f0_floor_db 以上の音で f0_range_hz の範囲)"
         ]
         let data = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
         let ms = header["started_at_ms"] as! Int64

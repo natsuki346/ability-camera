@@ -172,7 +172,7 @@ struct ViewerView: View {
     private func headTurns(now: Date, _ k: CGFloat) -> some View {
         let list = link.headTurns
         return VStack(alignment: .leading, spacing: 8 * k) {
-            caption("顔の向きの記録（0.5秒以上続いたもの）", k)
+            caption("顔の向きの記録（0.5秒以上続いたもの。右・左は\(FaceDirection.note)）", k)
             if let last = list.last {
                 let h = last.head.flatMap(HeadState.init(rawValue:))
                 HStack(alignment: .top, spacing: 10 * k) {
@@ -697,8 +697,8 @@ extension HeadState {
     var legend: String {
         switch self {
         case .front: "正面"
-        case .right: "右（35°超）"
-        case .left: "左（35°超）"
+        case .right: "右（\(FaceDirection.note)、35°超）"
+        case .left: "左（\(FaceDirection.note)、35°超）"
         case .hidden: "見えない"
         case .oblique: "斜め（見えるようになったあと 15〜35°）"
         }

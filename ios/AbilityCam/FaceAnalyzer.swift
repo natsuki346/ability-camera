@@ -9,7 +9,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         var errorDescription: String? { "表情解析モデル（face_landmarker.task）がありません。ios/setup.sh を実行してください" }
     }
 
-    /// 顔の向き（度）。映像で見て右を向く＝yaw +、上を向く＝pitch +、頭の上が映像の右へ傾く＝roll +
+    /// 顔の向き（度）。本人から見て右を向く＝yaw +、上を向く＝pitch +、頭の上が本人から見て右へ傾く＝roll +（v1.7.1〜、direction_version 2）。
+    /// v1.6.1 までは映像で見て右が +（向かい合って見る人から見た右）だった
     struct Pose { let yaw: Double; let pitch: Double; let roll: Double }
 
     /// 顔の枠：中心 x・y と幅（解析した画像の中で 0〜1）
@@ -200,7 +201,12 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
             mesh = lms.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
             let mats = result?.facialTransformationMatrixes ?? []
             pose = (mats.indices.contains(pick) ? mats[pick] : mats.first).flatMap(Self.pose)
-            if mir, let p = pose { pose = Pose(yaw: -p.yaw, pitch: p.pitch, roll: -p.roll) }   // 鏡の映像の左右を直す
+            // 変換行列から出した向きは、鏡でない映像で見て右が +。鏡の映像なら左右を直し、そのあと本人から見た右・左にする
+            // （鏡でない映像で見て右＝向かい合う本人の左。v1.7.1〜）
+            if let p = pose {
+                let imageYaw = mir ? -p.yaw : p.yaw, imageRoll = mir ? -p.roll : p.roll
+                pose = Pose(yaw: -imageYaw, pitch: p.pitch, roll: -imageRoll)
+            }
         }
         onResult?(Result(
             captureMs: timestampInMilliseconds,

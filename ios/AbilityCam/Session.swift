@@ -37,7 +37,8 @@ struct SessionStats {
         case "mark": marks += 1
         case "scene": if let v = value?.first, v != "なし" { scenes += 1 }
         case "change":
-            let keys = Set(value ?? [])
+            // 声が出た（v1.7〜）は普段と比べた違いではないので、違いの数に入れない（sessions.py と同じ）
+            let keys = Set((value ?? []).filter { !$0.hasPrefix(DiffTarget.voiceOnKey + ":") })
             segments += keys.subtracting(activeKeys).count
             activeKeys = keys
         case "baseline_restart": activeKeys = []

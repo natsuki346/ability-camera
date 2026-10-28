@@ -35,6 +35,7 @@ struct Person: Codable, Identifiable, Equatable {
     var name: String
     var savedByCamera: [String: SavedBaseline] = [:]   // カメラ（wide / ultra_wide / front）→ 表情の普段
     var voice: SavedVoice?                       // 声の普段（どのカメラでも使う）
+    var voicePartial: VoicePartial?              // 途中まで集めた声の普段（v1.7〜。声の普段ができたら消す）
 
     /// 画面に出す名前（v1.3 から「さん」を付けない：「自分」「姉」）
     var displayName: String { name }
@@ -44,7 +45,7 @@ struct Person: Codable, Identifiable, Equatable {
 
     init(id: String, name: String) { self.id = id; self.name = name }
 
-    enum CodingKeys: String, CodingKey { case id, name, savedByCamera = "saved_by_camera", voice, saved }
+    enum CodingKeys: String, CodingKey { case id, name, savedByCamera = "saved_by_camera", voice, saved, voicePartial = "voice_partial" }
 
     /// v1.6 までの persons.json（saved が1つ）は、そのカメラの普段として移す。声の普段は人ごとに移す
     init(from decoder: Decoder) throws {
@@ -53,6 +54,7 @@ struct Person: Codable, Identifiable, Equatable {
         name = try c.decode(String.self, forKey: .name)
         savedByCamera = try c.decodeIfPresent([String: SavedBaseline].self, forKey: .savedByCamera) ?? [:]
         voice = try c.decodeIfPresent(SavedVoice.self, forKey: .voice)
+        voicePartial = try c.decodeIfPresent(VoicePartial.self, forKey: .voicePartial)
         if var old = try c.decodeIfPresent(SavedBaseline.self, forKey: .saved) {
             if voice == nil { voice = old.voice }
             old.voice = nil
@@ -66,6 +68,7 @@ struct Person: Codable, Identifiable, Equatable {
         try c.encode(name, forKey: .name)
         try c.encode(savedByCamera, forKey: .savedByCamera)
         try c.encodeIfPresent(voice, forKey: .voice)
+        try c.encodeIfPresent(voicePartial, forKey: .voicePartial)
     }
 }
 
@@ -125,9 +128,18 @@ final class PersonStore: ObservableObject {
         save()
     }
 
+    /// 声の普段を置き換える。できたら、途中まで集めた分は消す
     func setVoice(_ id: String, _ v: SavedVoice?) {
         guard let i = people.firstIndex(where: { $0.id == id }) else { return }
         people[i].voice = v
+        if v != nil { people[i].voicePartial = nil }
+        save()
+    }
+
+    /// 途中まで集めた声の普段を置き換える（nil で消す。v1.7〜）
+    func setVoicePartial(_ id: String, _ p: VoicePartial?) {
+        guard let i = people.firstIndex(where: { $0.id == id }), people[i].voicePartial != p else { return }
+        people[i].voicePartial = p
         save()
     }
 

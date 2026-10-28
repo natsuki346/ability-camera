@@ -251,6 +251,7 @@ struct ViewerView: View {
                     ForEach(Metric.allCases.filter { !$0.isFace }, id: \.self) { m in
                         meterRow(m, s, faded: false, k)
                     }
+                    voiceOnRow(s, k)
                     meterLegend(k).padding(.top, 2 * k)
                 }
             }
@@ -362,6 +363,29 @@ struct ViewerView: View {
                 .frame(width: 210 * k, alignment: .leading)
         }
         .opacity(faded ? 0.35 : 1)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// 声が出た（v1.7〜）：メーターは作らず、本人の声が出ているかどうかと続いている秒数だけ（普段とは比べない。声の普段が無くても出す）
+    private func voiceOnRow(_ s: LiveState?, _ k: CGFloat) -> some View {
+        let on = s.flatMap { $0.recording ? $0.voiceOn : nil }
+        let sec = s?.diffs?.first { $0.metric == DiffTarget.voiceOnKey }?.seconds
+        let status = on == true ? "声が出た（\(sec ?? 0)秒）" : on == false ? "出ていない" : ""
+        return HStack(alignment: .center, spacing: 12 * k) {
+            HStack(spacing: 6) {
+                Circle().fill(DiffTarget.voiceOnColor).frame(width: 10 * k, height: 10 * k)
+                Text(DiffTarget.voiceOnLabel).font(.system(size: 19 * k, weight: .medium)).lineLimit(1).minimumScaleFactor(0.7)
+            }
+            .frame(width: 140 * k, alignment: .leading)
+            Text("普段とは比べず、本人の声が出たかどうかだけ（0.3秒以上）")
+                .font(.system(size: 12 * k)).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(status)
+                .font(.system(size: (on == true ? 19 : 15) * k, weight: on == true ? .bold : .regular).monospacedDigit())
+                .foregroundStyle(on == true ? Self.navy : .secondary)
+                .lineLimit(1).minimumScaleFactor(0.7)
+                .frame(width: 210 * k, alignment: .leading)
+        }
         .accessibilityElement(children: .combine)
     }
 
@@ -516,7 +540,7 @@ struct ViewerView: View {
                     Spacer()
                     if !live { Text(lastReceivedText).font(.system(size: 14 * k)).foregroundStyle(.secondary) }
                 }
-                TimelineChart(bands: link.bands, eyes: link.eyesBand, scenes: link.scenes, heads: link.heads,
+                TimelineChart(bands: link.bands, eyes: link.eyesBand, voice: link.voiceBand, scenes: link.scenes, heads: link.heads,
                               marks: link.events.filter { $0.kind == "mark" },
                               start: end - span, end: end, k: k)
                 timelineLegend(k)
@@ -532,6 +556,7 @@ struct ViewerView: View {
             HStack(spacing: 4) { sw(Self.slate.opacity(TimelineChart.fillOpacity)); Text("いつもより下（小さい・低い）") }
             HStack(spacing: 4) { sw(Self.usualBand); Text("いつもの範囲") }
             HStack(spacing: 4) { sw(DiffTarget.eyesClosedColor.opacity(TimelineChart.fillOpacity)); Text("目を閉じていた") }
+            HStack(spacing: 4) { sw(DiffTarget.voiceOnColor.opacity(TimelineChart.fillOpacity)); Text("声が出た") }
             HStack(spacing: 4) {
                 Canvas { ctx, size in
                     ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.secondary.opacity(0.08)))
@@ -684,6 +709,7 @@ extension HeadState {
 struct TimelineChart: View {
     let bands: [Metric: [ViewerLink.Run<ViewerLink.Band>]]
     let eyes: [ViewerLink.Run<ViewerLink.Band>]
+    let voice: [ViewerLink.Run<ViewerLink.Band>]   // 声が出たの段（above＝声が出た、usual＝出ていない、v1.7〜）
     let scenes: [ViewerLink.Run<String>]
     let heads: [ViewerLink.Run<HeadState>]
     let marks: [LiveEvent]
@@ -715,9 +741,7 @@ struct TimelineChart: View {
         .accessibilityLabel("時間の流れ")
     }
 
-    static func color(_ d: DiffTarget) -> Color {
-        if case .metric(let m) = d { m.color } else { DiffTarget.eyesClosedColor }
-    }
+    static func color(_ d: DiffTarget) -> Color { d.color }
 
     /// 「比べていない・届いていない」の斜線（いつもの範囲の青灰と見分けやすくする）
     private func hatch(_ ctx: GraphicsContext, _ r: CGRect) {
@@ -785,8 +809,9 @@ struct TimelineChart: View {
             switch d {
             case .metric(let m): runs = bands[m] ?? []
             case .eyesClosed: runs = eyes
+            case .voiceOn: runs = voice
             }
-            let aboveColor = d == .eyesClosed ? DiffTarget.eyesClosedColor : ViewerView.amber
+            let aboveColor = d.fill(above: true, amber: ViewerView.amber, slate: ViewerView.slate)
             for r in runs {
                 guard let rr = rect(r, y: y) else { continue }
                 switch r.value {

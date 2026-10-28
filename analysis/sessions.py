@@ -98,7 +98,8 @@ def summarize_record(path: Path) -> dict:
                 elif kind == "scene" and vals and vals[0] != "なし":
                     scenes += 1
                 elif kind == "change":
-                    keys = set(vals)
+                    # 声が出た（v1.7〜）は普段と比べた違いではないので数えない（アプリの SessionStats と同じ）
+                    keys = {k for k in vals if not k.startswith("voice_on:")}
                     segments += len(keys - active)
                     active = keys
                 elif kind == "baseline_restart":

@@ -99,6 +99,10 @@ struct NowPage: View {
                 Text(model.baselineWait ?? "落ち着いているときに。顔が映っている間だけ数えます")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 eyesClosedNote
+                // 普段を記録している間も、普段と比べないもの（声が出た、v1.7〜）は出す
+                ForEach(Array(model.differences.prefix(Self.maxLines)), id: \.self) {
+                    Text($0).font(.callout.bold()).foregroundStyle(ContentView.navyText).lineLimit(1).minimumScaleFactor(0.6)
+                }
             } else if model.differences.isEmpty {
                 Text(model.faceReadable ? "いつもと大きな違いはありません" : "声は、いつもと大きな違いはありません")
                     .font(.title3.bold()).foregroundStyle(ContentView.navyText)

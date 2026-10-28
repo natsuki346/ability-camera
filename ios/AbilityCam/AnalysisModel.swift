@@ -117,6 +117,12 @@ final class AnalysisModel: ObservableObject {
     private var lastSelfVoiceT = -Double.infinity, lastOtherVoiceT = -Double.infinity
     private let voiceBox = VoiceSelfBox()                     // MediaPipe のスレッドの上でだけ触る
     private var voiceWaitTracker = VoiceWaitTracker()
+    // 途中まで集めた声の普段（v1.7〜）：前のセッションまでの分（voiceCarry）に、このセッションの分（voiceStats・voiceValidS）を足す。
+    // 人に保存するのは、その人に声の普段がまだ無いときだけ
+    private var voiceCarry: VoicePartial?                     // このセッションの始め（・人を選んだとき）に読んだもの
+    private var voiceCarryOwner: String?                      // voiceCarry を読んだ人（人を変えたら、その人の分を元に戻す）
+    private var voiceSessionFirstMs: Int64?                   // このセッションで初めて本人の声を数えた時刻
+    private var voiceSavedSec = -1                            // 最後に保存した秒（1秒ごとに保存する）
     private var pitchCoverage = PitchCoverage()
     private var lastAudioAtCoverage: CFTimeInterval = 0
     private var todayShown = false                            // 今日の普段を画面に出して取った（保存した普段で比べながら、うしろで黙って取ったのではない）
@@ -211,7 +217,9 @@ final class AnalysisModel: ObservableObject {
         todayBaseline = nil; todayVoice = nil; resaveAccepted = false
         sessionStartMs = Self.nowMs()
         face.setPreferred(nil)
+        voiceCarry = nil; voiceCarryOwner = nil
         resetBaseline()   // 普段（設定の長さ）も自動で始める
+        loadVoiceCarry()  // 途中まで集めた声の普段があれば、続きから（v1.7〜）
         applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
         running = true
         sessionStartedAt = Date()
@@ -229,6 +237,8 @@ final class AnalysisModel: ObservableObject {
     private func finalizeSession() {
         finalizeTask?.cancel(); finalizeTask = nil
         if running {
+            saveVoicePartial()   // 途中まで集めた声の普段は、次のセッションで続きから（v1.7〜）
+            voiceCarry = nil; voiceCarryOwner = nil
             running = false
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
@@ -361,7 +371,7 @@ final class AnalysisModel: ObservableObject {
             e.orientationVersion = CameraManager.orientationVersion
             logger.write(e)
             head.reset()
-            restartBaseline()
+            restartBaseline(keepVoice: true)
             face.setPreferred(nil)
             applySaved()   // このカメラの保存した普段があれば、すぐそれで比べる（v1.6.1〜）
             showMessage("カメラを\(used.label)にしました。" + (comparing == .saved ? "このカメラの保存した普段で比べています" : "普段を取り直しています"))
@@ -379,10 +389,13 @@ final class AnalysisModel: ObservableObject {
 
     /// 普段を取り直す：保存した普段で比べていても、それをやめて今日の普段を画面に出して取り直す。
     /// 取り終えたら、選んだ人に保存した普段があれば「この普段で保存し直しますか？」と聞く
-    func restartBaseline() {
+    /// keepVoice：カメラを変えたとき（v1.7〜）。声の普段はカメラに関係ないので続ける（記録には part: "face" で書く）
+    func restartBaseline(keepVoice: Bool = false) {
         guard running else { return }
-        logger.write(EventRecord(tMs: Self.nowMs(), kind: "baseline_restart", value: nil))
-        resetBaseline()
+        var e = EventRecord(tMs: Self.nowMs(), kind: "baseline_restart", value: nil)
+        if keepVoice { e.part = BaselinePart.face.rawValue }
+        logger.write(e)
+        resetBaseline(keepVoice: keepVoice)
     }
 
     /// 同じ場面をもう一度押すと「場面なし」
@@ -444,7 +457,7 @@ final class AnalysisModel: ObservableObject {
 
     private static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
-    private func resetBaseline() {
+    private func resetBaseline(keepVoice: Bool = false) {
         baselineStartHost = CACurrentMediaTime()
         baselineStartMs = Self.nowMs()
         stats = [:]
@@ -453,7 +466,7 @@ final class AnalysisModel: ObservableObject {
         baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []
         lastChange = nil
         squintPending = []
-        engine.setBaseline(nil)   // 普段が無い間は比べない
+        engine.setBaseline(nil, part: keepVoice ? .face : .all)   // 普段が無い間は比べない
         engine.finished = []
         liveZ = [:]; liveDiffs = []
         link.baseline = nil   // 見る側の「いつもの範囲」も消す（記録し終えたら、また送る）
@@ -461,10 +474,70 @@ final class AnalysisModel: ObservableObject {
         comparing = nil; savedFromMs = nil; askResave = false
         boxStats = (Welford(), Welford(), Welford())
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
-        // 声の普段も、表情とは別に初めから集め直す（v1.6〜）
+        usedFace = nil
+        guard !keepVoice else { return }
+        // 声の普段も、表情とは別に初めから集め直す（v1.6〜）。前のセッションまでに途中まで集めた分（voiceCarry）は残す（v1.7〜）
         voiceStats = [:]; voiceValidS = 0; voicePrevT = nil; voiceStartMs = Self.nowMs(); voiceDone = false
-        voiceSec = 0; comparingVoice = nil; usedFace = nil; usedVoice = nil; todayVoice = nil
+        voiceSessionFirstMs = nil; voiceSavedSec = -1
+        voiceSec = Int(voiceCarry?.validS ?? 0); comparingVoice = nil; usedVoice = nil; todayVoice = nil
         voiceWaitTracker.reset(); voiceWait = nil
+    }
+
+    // MARK: 途中まで集めた声の普段（v1.7〜）
+
+    /// 選んだ人の途中まで集めた声の普段を読む（声の普段がまだ無い人だけ）。集め始めてから14日たったものは捨て、event に残す
+    private func loadVoiceCarry() {
+        voiceCarry = nil; voiceCarryOwner = nil
+        guard let p = PersonStore.shared.selected, p.voice == nil else { return }
+        voiceCarryOwner = p.id
+        guard let part = p.voicePartial else { return }
+        let now = Self.nowMs()
+        if part.expired(now: now) {
+            PersonStore.shared.setVoicePartial(p.id, nil)
+            var e = EventRecord(tMs: now, kind: "voice_partial_discarded",
+                                value: .text("集め始めてから\(Int(DiffCriteria.voiceBaselineMaxAgeDays))日たったため、途中まで集めた声の普段（本人の声 \(Int(part.validS))秒）を使いませんでした"))
+            e.personId = p.id
+            logger.write(e)
+            return
+        }
+        voiceCarry = part
+        if !voiceDone, comparingVoice == nil { voiceSec = Int(voiceTotalS) }
+    }
+
+    /// 前のセッションまでの分とこのセッションの分を足した、本人の声の秒数
+    private var voiceTotalS: Double { (voiceCarry?.validS ?? 0) + voiceValidS }
+
+    /// 前のセッションまでの分とこのセッションの分を足した値
+    private var voiceMergedStats: [Metric: Welford] {
+        var out = voiceStats
+        for (k, w) in voiceCarry?.stats ?? [:] {
+            guard let m = Metric(rawValue: k) else { continue }
+            out[m] = w.merged(out[m] ?? Welford())
+        }
+        return out
+    }
+
+    private static func dayString(_ ms: Int64) -> String {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+    }
+
+    /// 今までの分（このセッションを含む）。このセッションで本人の声を数えていなければ、前のままの値
+    private func voicePartialNow() -> VoicePartial? {
+        guard let first = voiceSessionFirstMs, voiceValidS > 0 else { return voiceCarry }
+        let days = Set((voiceCarry?.days ?? []) + [Self.dayString(first)]).sorted()
+        return VoicePartial(startedMs: voiceCarry?.startedMs ?? first, updatedMs: Self.nowMs(), validS: (voiceTotalS * 10).rounded() / 10,
+                            stats: Dictionary(uniqueKeysWithValues: voiceMergedStats.map { ($0.key.rawValue, $0.value) }),
+                            sessions: (voiceCarry?.sessions ?? 0) + 1, days: days)
+    }
+
+    /// 選んだ人に、途中まで集めた声の普段を保存する（声の普段がまだ無い人だけ。集め終えたら setVoice で消える）
+    private func saveVoicePartial() {
+        guard !voiceDone, let owner = voiceCarryOwner, let p = PersonStore.shared.selected, p.id == owner, p.voice == nil else { return }
+        PersonStore.shared.setVoicePartial(owner, voicePartialNow())
     }
 
     /// 今比べている表情と声の普段を合わせて、画面（いつもの範囲・データ不足）と見る側に出す
@@ -501,7 +574,7 @@ final class AnalysisModel: ObservableObject {
             e.savedCamera = p.savedByCamera.keys.sorted().joined(separator: ",")
             logger.write(e)
         }
-        if let v = p.voice { applySavedVoice(v, now: now) }
+        if comparingVoice == nil, let v = p.voice { applySavedVoice(v, now: now) }   // カメラを変えたときは、続けている声の普段のまま
         publishBaseline(tMs: now)
     }
 
@@ -554,6 +627,12 @@ final class AnalysisModel: ObservableObject {
             var e = EventRecord(tMs: Self.nowMs(), kind: "person", value: nil)
             e.personId = id ?? ""
             logger.write(e)
+            // 声の普段を集めている途中なら：前の人の途中まで集めた分を、このセッションで足す前に戻し、新しい人の分を読んで続ける
+            if !voiceDone, comparingVoice == nil {
+                if let owner = voiceCarryOwner, owner != id { PersonStore.shared.setVoicePartial(owner, voiceCarry) }
+                loadVoiceCarry()
+                voiceSavedSec = -1
+            }
         }
         saveTodayIfNew()
     }
@@ -621,13 +700,16 @@ final class AnalysisModel: ObservableObject {
         if counted, let p = voicePrevT, t > p { voiceValidS += min(t - p, 0.5) }
         voicePrevT = t
         if counted {
+            if voiceSessionFirstMs == nil { voiceSessionFirstMs = tMs }
             if let db = a.rmsDb { voiceStats[.rmsDb, default: Welford()].add(Double(db)) }
             if let f0 = a.f0Hz { voiceStats[.f0Hz, default: Welford()].add(Double(f0)) }
         }
-        if voiceValidS >= DiffCriteria.voiceBaselineS {
+        let total = voiceTotalS   // 前のセッションまでに途中まで集めた分も足す（v1.7〜）
+        if total >= DiffCriteria.voiceBaselineS {
             finishVoice(tMs: tMs)
         } else if comparingVoice == nil {
-            if voiceSec != Int(voiceValidS) { voiceSec = Int(voiceValidS) }
+            if voiceSec != Int(total) { voiceSec = Int(total) }
+            if Int(voiceValidS) != voiceSavedSec { voiceSavedSec = Int(voiceValidS); saveVoicePartial() }   // 1秒ごとに保存
             // 進み具合が増えないときの理由（開いてから5秒より後だけ）
             let w = warm ? voiceWaitTracker.add(t: t, voiceSelf: voiceSelf, faceValid: faceValid)?.rawValue : nil
             if voiceWait != w { voiceWait = w }
@@ -636,20 +718,26 @@ final class AnalysisModel: ObservableObject {
 
     private func finishVoice(tMs: Int64) {
         voiceDone = true
+        let merged = voiceMergedStats
+        let partial = voicePartialNow()
         var out: [String: BaselineRecord.Stat] = [:]
         for m in Metric.allCases where !m.isFace {
-            let w = voiceStats[m] ?? Welford()
+            let w = merged[m] ?? Welford()
             out[m.rawValue] = BaselineRecord.Stat(n: w.n,
                                                   mean: w.n > 0 ? (w.mean * 10000).rounded() / 10000 : nil,
                                                   std: w.n > 0 ? (w.std * 10000).rounded() / 10000 : nil,
                                                   insufficient: w.n < Self.minSamples)
         }
         let useToday = comparingVoice == nil   // 保存した声の普段で比べているときは切り替えない
-        var row = BaselineRecord(tMs: tMs, startedMs: voiceStartMs, wallS: (Double(tMs - voiceStartMs) / 100).rounded() / 10,
+        let started = voiceCarry?.startedMs ?? voiceStartMs   // 前のセッションから続けたなら、集め始めた日時
+        var row = BaselineRecord(tMs: tMs, startedMs: started, wallS: (Double(tMs - started) / 100).rounded() / 10,
                                  validS: nil, yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                  minN: Self.minSamples, targetS: DiffCriteria.voiceBaselineS, blinkMasked: true, metrics: out)
         row.source = BaselineSource.today.rawValue; row.compared = useToday; row.part = BaselinePart.voice.rawValue
-        row.voiceValidS = (voiceValidS * 10).rounded() / 10
+        row.voiceValidS = (voiceTotalS * 10).rounded() / 10
+        row.voiceSessions = partial?.sessions ?? 1
+        row.voiceDays = partial?.days.count ?? 1
+        row.voiceCarriedS = ((voiceCarry?.validS ?? 0) * 10).rounded() / 10
         logger.write(row)
         if useToday {
             engine.setBaseline(Self.engineBaseline(out), part: .voice)
@@ -658,7 +746,7 @@ final class AnalysisModel: ObservableObject {
             publishBaseline(tMs: tMs)
         }
         voiceSec = nil; voiceWait = nil
-        let v = SavedVoice(metrics: out, validS: row.voiceValidS ?? voiceValidS, savedMs: tMs)
+        let v = SavedVoice(metrics: out, validS: row.voiceValidS ?? voiceTotalS, savedMs: tMs)
         todayVoice = v
         // 人の保存した普段に声の普段が無ければ足す（「保存し直す」を選んだあとなら置き換える）。うしろで集めたものは置き換えない
         if let p = PersonStore.shared.selected, p.voice == nil || resaveAccepted {
@@ -822,7 +910,8 @@ final class AnalysisModel: ObservableObject {
                 if baselineWait != wait { baselineWait = wait }
             }
         }
-        if running && comparing != nil { updateDifferences(latestT: epochT, faceReadable: readable) }
+        // 声が出た（v1.7〜）は普段が無くても出すので、記録中はいつも更新する（普段が無い間、ほかの違いは出ない）
+        if running { updateDifferences(latestT: epochT, faceReadable: readable) }
         checkFaceLimit(now: now)
         sendLive(r, now: now, readable: readable, values: faceValues, audio: a)
         adjustVideo(now: now)
@@ -875,10 +964,11 @@ final class AnalysisModel: ObservableObject {
             recording: running, sessionStartedMs: sessionStartedAt.map { Int64($0.timeIntervalSince1970 * 1000) },
             scene: scene?.rawValue,
             faceRatio: faceRatio, fps: fps,
-            z: comparing != nil ? liveZ : nil, diffs: comparing != nil ? liveDiffs : nil, diffCount: running ? diffCount : nil,
+            z: comparing != nil ? liveZ : nil, diffs: running ? liveDiffs : nil, diffCount: running ? diffCount : nil,
             head: head.state?.rawValue,
             eyesClosed: comparing != nil && engine.eyesJudgeable ? engine.active[.eyesClosed] != nil : nil,
             voiceSec: running ? voiceSec : nil, voiceTotal: Int(DiffCriteria.voiceBaselineS), otherVoice: running ? otherVoice : nil,
+            voiceOn: running ? engine.active[.voiceOn] != nil : nil,
             voiceWait: running && voiceSec != nil ? voiceWait : nil))
     }
 
@@ -939,6 +1029,7 @@ final class AnalysisModel: ObservableObject {
         let shown = DiffTarget.all.compactMap { engine.active[$0] }.filter(\.shown)
         let messages = shown.map { "\($0.message)（\(Int(max(0, latestT - $0.startT)))秒）" }
         let keys = shown.map(\.key)
+        let diffKeys = keys.filter { !$0.hasPrefix(DiffTarget.voiceOnKey + ":") }   // 声が出たは違いの数に入れない（v1.7〜）
         if differences != messages { differences = messages }
         if meterZ != engine.z { meterZ = engine.z }
         let dm = Dictionary(uniqueKeysWithValues: shown.compactMap { s in s.metric.map { ($0, s.above) } })
@@ -947,7 +1038,7 @@ final class AnalysisModel: ObservableObject {
         liveDiffs = shown.map { LiveDiff(metric: $0.target.key, above: $0.above, seconds: Int(max(0, latestT - $0.startT))) }
 
         if lastChange == nil || lastChange!.diffs != keys || lastChange!.faceReadable != faceReadable {
-            diffCount += Set(keys).subtracting(lastChange?.diffs ?? []).count
+            diffCount += Set(diffKeys).subtracting(lastChange?.diffs ?? []).count
             lastChange = (keys, faceReadable)
             var e = EventRecord(tMs: Self.nowMs(), kind: "change", value: .list(keys))
             e.faceReadable = faceReadable

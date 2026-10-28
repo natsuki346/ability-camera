@@ -59,7 +59,7 @@ struct ReplayView: View {
             Text(RecordRow.date.string(from: Date(timeIntervalSince1970: data.startT))).font(.headline)
             Text(["長さ \(ContentView.duration(data.durationS))",
                   "顔 \(data.faceRatio.map { "\(Int(($0 * 100).rounded()))%" } ?? "–")",
-                  "違い \(data.diffCount)回", "家族の印 \(data.markCount)",
+                  "違い \(data.diffCount)回", "声が出た \(data.voiceOnCount)回（\(Int(data.voiceOnS.rounded()))秒）", "家族の印 \(data.markCount)",
                   data.camera.map { "カメラ \($0)" }].compactMap { $0 }.joined(separator: "・"))
                 .font(.callout).foregroundStyle(.secondary).monospacedDigit()
             ForEach(data.notes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
@@ -211,7 +211,7 @@ struct ReplayTimeline: View {
                     .frame(height: 18 + heights.reduce(0, +) + Self.gap * 3 + 16)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
-            Text("いつもとの違いの段は、上から \(DiffTarget.all.map(\.label).joined(separator: "・"))。アンバー＝いつもより強い・大きい・高い、青灰＝いつもより小さい・低い、墨紫＝目を閉じていた。斜線は普段が無く比べていない時間")
+            Text("いつもとの違いの段は、上から \(DiffTarget.all.map(\.label).joined(separator: "・"))。アンバー＝いつもより強い・大きい・高い、青灰＝いつもより小さい・低い、墨紫＝目を閉じていた、焦げ茶＝声が出た（普段とは比べない）。斜線は普段が無く比べていない時間")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .ignore)
@@ -264,7 +264,7 @@ struct ReplayTimeline: View {
         for s in data.segments {
             guard var rr = visible(s.startT, s.endT), let i = DiffTarget.all.firstIndex(of: s.target) else { continue }
             rr.origin.y = ys[2] + CGFloat(i) * Self.diffRowH + 1; rr.size.height = Self.diffRowH - 2
-            let color = s.target == .eyesClosed ? DiffTarget.eyesClosedColor : s.above ? ViewerView.amber : ViewerView.slate
+            let color = s.target.fill(above: s.above, amber: ViewerView.amber, slate: ViewerView.slate)
             ctx.fill(Path(roundedRect: rr, cornerRadius: 2), with: .color(color.opacity(TimelineChart.fillOpacity)))
         }
 

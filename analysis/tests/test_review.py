@@ -707,7 +707,7 @@ class AppMatchTest(unittest.TestCase):
         import check_app
         c = review.load_criteria(review.HERE / "criteria.json", [])
         exe = check_app.build()
-        for p, n in ((FIXTURE, 5), (EYES_FIXTURE, 5), (VOICE_FIXTURE, 2)):
+        for p, n in ((FIXTURE, 7), (EYES_FIXTURE, 5), (VOICE_FIXTURE, 5)):   # v1.7〜は声が出たの区間も入る
             diffs, count = check_app.compare(p, exe, c)
             self.assertEqual(diffs, [], p.name)
             self.assertEqual(count, n)
@@ -743,9 +743,12 @@ class VoiceSelfTest(unittest.TestCase):
         self.assertEqual(int((want == 0).sum()), 12 * 30)  # 本人以外の声 10秒 ＋ 横向き 2秒
 
     def test_segments_only_self_voice(self):
-        got = [(s.metric, s.sign, self.sec(s.i0)) for s in self.a.segments]
+        got = [(s.metric, s.sign, self.sec(s.i0)) for s in self.a.segments if s.metric != review.VOICE_ON]
         self.assertEqual(got, [("f0_hz", 1, 50.0), ("rms_db", 1, 80.0)])   # 本人以外の声（12–20・60–62）と横向き（70–72）は区間なし
-        rows = review.segment_rows(self.a)
+        # 声が出た（v1.7〜）：本人の声の時間だけ（本人以外の声・横向きは入らない）
+        on = [round(self.sec(s.i0)) for s in self.a.segments if s.metric == review.VOICE_ON]
+        self.assertEqual(on, [25, 50, 80])
+        rows = [r for r in review.segment_rows(self.a) if r["指標"] != review.VOICE_ON]
         self.assertEqual(rows[0]["普段の平均"], 200.0)                         # 声の普段の行（part: voice）を使う
 
     def test_voice_baseline_rows(self):
@@ -842,3 +845,130 @@ class PitchTest(unittest.TestCase):
             c = review.load_criteria(review.HERE / "criteria.json", [])
             diffs, _ = check_app.compare(p, check_app.build(), c)
             self.assertEqual(diffs, [])
+
+
+def _frames_record(path, spans, marks=(), length=12.0, fps=30):
+    """声が出たの確かめ用の作り物の記録（v1.6〜の形：frame に voice_self を書く）。spans：本人の声の [開始, 終了) 秒"""
+    import json
+    t0 = 1_800_000_000_000
+    lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "camera": "wide"})]
+    for k in range(int(length * fps)):
+        s = k / fps
+        on = any(a <= s < b for a, b in spans)
+        lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(s * 1000), "face": True,
+                                 "bs": {"jawOpen": 0.3 if on and k % 2 else 0.05}, "yaw_deg": 0.0,
+                                 "rms_db": -40.0 if on else -70.0, "f0_hz": 200.0 if on else None,
+                                 "voice_self": True if on else None}))
+    for m_t, v in marks:
+        lines.append(json.dumps({"type": "event", "t_ms": t0 + round(m_t * 1000), "kind": "mark", "value": v}))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class VoiceOnTest(unittest.TestCase):
+    """声が出た（v1.7〜）：本人の声のコマを 0.5秒未満の切れ目でまとめ、0.3秒以上なら区間。普段が無くても出し、違いの数には入れない"""
+
+    SPANS = [(1.0, 1.2),              # 0.2秒 → 短いので無し
+             (2.0, 3.0),              # 1秒 → 1件
+             (4.0, 4.2), (4.5, 4.7),  # 0.3秒の切れ目 → つながって 1件（4.0〜4.67）
+             (6.0, 6.4), (7.0, 7.4),  # 0.6秒の切れ目 → 別々に 2件
+             (11.0, 12.0)]            # 記録の終わりまで → 1件（打ち切り）
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.path = Path(cls.dir.name) / "voice_on.jsonl"
+        _frames_record(cls.path, cls.SPANS, marks=[(3.5, "快"), (9.5, "分からない")])
+        cls.c = review.load_criteria(review.HERE / "criteria.json", [])
+        cls.rec = review.load(cls.path)
+        cls.a = review.analyze(cls.rec, cls.c)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def segs(self):
+        t0 = self.rec.t[0]
+        return [(round(self.rec.t[s.i0] - t0, 2), round(self.rec.t[s.i1] - t0, 2)) for s in self.a.segments if s.metric == review.VOICE_ON]
+
+    def test_segments(self):
+        self.assertEqual(self.segs(), [(2.0, 2.97), (4.0, 4.67), (6.0, 6.37), (7.0, 7.37), (11.0, 11.97)])
+        last = [s for s in self.a.segments if s.metric == review.VOICE_ON][-1]
+        self.assertIn("記録の終わり", last.truncated)
+
+    def test_no_baseline_needed_and_not_a_difference(self):
+        self.assertEqual(self.rec.baselines, [])                 # 普段が無くても出す
+        q = review.quality(self.a, calm=False)
+        self.assertEqual(q["rates"]["total"], 0)                  # いつもとの違いの数には入れない
+        self.assertEqual(q["rates"]["per_metric"][review.VOICE_ON][0], 5)
+        self.assertEqual(review.candidates(self.a), [])           # 通知候補にも入れない
+        self.assertTrue(all(best is None for _, _, best in q["mark_rows"]))
+
+    def test_marks_and_totals(self):
+        q = review.quality(self.a, calm=False)
+        vq = q["voice_on"]
+        self.assertEqual(vq["count"], 5)
+        self.assertAlmostEqual(vq["total_s"], 0.97 + 0.67 + 0.37 + 0.37 + 0.97, delta=0.02)
+        (t1, v1, b1, _, a1, _), (t2, v2, b2, _, a2, _) = vq["marks"]
+        self.assertEqual((v1, b1, a1), ("快", True, True))        # 3.5 の前 10秒に 2.0〜、後 10秒に 4.0〜
+        self.assertEqual((v2, b2, a2), ("分からない", True, True))
+
+    def test_same_in_app(self):
+        import check_app
+        diffs, n = check_app.compare(self.path, check_app.build(), self.c)
+        self.assertEqual(diffs, [])
+        self.assertEqual(n, 5)
+
+    def test_html(self):
+        rows = review.segment_rows(self.a)
+        self.assertEqual({r["指標名"] for r in rows}, {"声が出た"})
+        self.assertTrue(all(r["ピークのz"] == "" for r in rows))
+
+
+class VoiceCheckQualityTest(unittest.TestCase):
+    """本人の声の見分けを見直すための記録の質（v1.7〜）"""
+
+    def test_ratios(self):
+        a = review.analyze(review.load(VOICE_FIXTURE), review.load_criteria(review.HERE / "criteria.json", []))
+        v = review.quality(a, calm=False)["voice"]
+        x, n = v["voiced_no_mouth"]
+        self.assertGreater(n, 0)
+        self.assertGreater(x, 0)          # 本人以外の声（口は動かない）が入っている
+        self.assertLess(x, n)
+        y, m = v["mouth_no_voice"]
+        self.assertGreater(m, 0)
+        self.assertLessEqual(y, m)
+
+
+class VoiceCarryTest(unittest.TestCase):
+    """途中まで集めた声の普段（v1.7〜）：セッションごとに足しても、まとめて集めたのと同じ平均・標準偏差になり、14日で捨てる"""
+
+    def test_swift(self):
+        import shutil
+        import subprocess
+        if not shutil.which("swiftc"):
+            self.skipTest("swiftc がありません")
+        app = review.HERE.parent / "ios"
+        src = [app / "AbilityCam" / n for n in ("Baseline.swift", "DiffEngine.swift", "Pitch.swift")] + [app / "Tools" / "VoiceCarryCheck" / "main.swift"]
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "voicecarry"
+            subprocess.run(["swiftc", "-o", str(exe), *map(str, src)], check=True, capture_output=True)
+            out = subprocess.run([str(exe)], capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "OK", out.stdout)
+
+    def test_criteria(self):
+        import re
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "DiffEngine.swift").read_text(encoding="utf-8")
+        val = lambda name: float(re.search(rf"static let {name} = ([\d.]+)", src).group(1))
+        self.assertEqual(val("voiceBaselineMaxAgeDays"), c["voice_baseline"]["max_age_days"])
+        self.assertEqual(val("voiceOnMinS"), c["voice_on"]["min_s"])
+        self.assertEqual(val("voiceOnGapS"), c["voice_on"]["gap_s"])
+
+
+class VoiceCarryReportTest(unittest.TestCase):
+    def test_baseline_row_text(self):
+        b = {"type": "baseline", "t_ms": 1_800_000_000_000, "started_ms": 1_799_500_000_000, "part": "voice",
+             "voice_valid_s": 10.0, "voice_sessions": 3, "voice_days": 2, "voice_carried_s": 7.4, "target_s": 10.0, "metrics": {}}
+        cond = review.baseline_time_row(b)[-1]
+        self.assertIn("3回のセッション・2日にまたがって集めた", cond)
+        self.assertIn("前のセッションまでの分 7.4秒", cond)

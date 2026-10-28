@@ -35,6 +35,7 @@ struct LiveState: Codable {
     var voiceTotal: Int?              // 声の普段に必要な本人の声の秒数（10）
     var otherVoice: Bool?             // 本人以外の声（と言えない声）だけが入っている
     // v1.6.2〜
+    var voiceOn: Bool?                // 声が出た（v1.7〜）：本人の声のまとまりが続いているか（記録していない・古い撮る側では nil）。秒数は diffs の voice_on
     var voiceWait: String?            // 声の普段の進み具合が増えない理由（「声の高さが取れていません」など。集めていない・古い撮る側では nil）
 }
 
@@ -416,6 +417,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     @Published private(set) var headTurns: [LiveEvent] = []   // 撮る側のこのセッションの直近5件の head_turn（古い順）。次が来るまで消さない
     @Published private(set) var bands: [Metric: [Run<Band>]] = [:]   // 直近15分の時間の流れ（メモリだけ）
     @Published private(set) var eyesBand: [Run<Band>] = []           // 目を閉じているの段（above＝閉じていた、usual＝閉じていない、v1.4〜）
+    @Published private(set) var voiceBand: [Run<Band>] = []          // 声が出たの段（above＝声が出た、usual＝出ていない、v1.7〜）
     @Published private(set) var scenes: [Run<String>] = []
     @Published private(set) var heads: [Run<HeadState>] = []   // 顔の向きの段（撮る側で0.5秒続いて決まった向き）
     @Published private(set) var baseline: LiveBaseline?    // 撮る側の普段（いつもの範囲を描く）
@@ -565,6 +567,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         }
         if let i = scenes.firstIndex(where: { $0.end >= from }), i > 0 { scenes.removeFirst(i) }
         if let i = eyesBand.firstIndex(where: { $0.end >= from }), i > 0 { eyesBand.removeFirst(i) }
+        if let i = voiceBand.firstIndex(where: { $0.end >= from }), i > 0 { voiceBand.removeFirst(i) }
         if let i = heads.firstIndex(where: { $0.end >= from }), i > 0 { heads.removeFirst(i) }
         events.removeAll { Double($0.tMs) / 1000 < from }
     }
@@ -583,6 +586,12 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         return closed ? .above : .usual
     }
 
+    /// そのとき、本人の声が出ていたか（普段が無くても判定する。記録していない・古い撮る側なら比べていない）
+    static func voiceBand(in s: LiveState) -> Band {
+        guard s.recording, let on = s.voiceOn else { return .notCompared }
+        return on ? .above : .usual
+    }
+
     private static func extend<V: Equatable>(_ runs: inout [Run<V>], at t: Double, _ v: V) {
         if let last = runs.last, t - last.end <= runGap {
             guard t >= last.end else { return }   // 順番が入れ替わって届いたもの
@@ -598,6 +607,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
         for m in Metric.allCases { Self.extend(&b[m, default: []], at: t, Self.band(m, in: s)) }
         bands = b
         Self.extend(&eyesBand, at: t, Self.eyesBand(in: s))
+        Self.extend(&voiceBand, at: t, Self.voiceBand(in: s))
         if let name = s.scene { Self.extend(&scenes, at: t, name) }
         if let h = s.head.flatMap(HeadState.init(rawValue:)) { Self.extend(&heads, at: t, h) }   // 古い撮る側・まだ決まっていないときは塗らない
     }
@@ -637,7 +647,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
                 let id = self.cameraIDs[peerID] ?? self.currentCameraID
                 if id != self.historyCameraID {
                     self.historyCameraID = id
-                    self.bands = [:]; self.eyesBand = []; self.scenes = []; self.heads = []; self.events = []; self.headTurns = []   // 普段は、撮る側がつながったときに必ず送ってくる
+                    self.bands = [:]; self.eyesBand = []; self.voiceBand = []; self.scenes = []; self.heads = []; self.events = []; self.headTurns = []   // 普段は、撮る側がつながったときに必ず送ってくる
                 }
                 self.ping()
             case .notConnected:

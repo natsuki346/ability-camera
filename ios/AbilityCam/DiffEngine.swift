@@ -24,6 +24,12 @@ enum DiffCriteria {
     static let mouthMinRange = 0.04        //   変化（最大 − 最小）が、どれかでこれ以上なら口が動いている（仮の値）
     // 声の普段（v1.6〜、criteria.json の voice_baseline）：本人の声のコマが合計これだけたまったら
     static let voiceBaselineS = 10.0
+    // 途中まで集めた声の普段は人ごとに保存して、次のセッションで続きから足す（v1.7〜）。集め始めてからこの日数たったら捨てる
+    static let voiceBaselineMaxAgeDays = 14.0
+    // 声が出た（v1.7〜、criteria.json の voice_on）：普段とは比べず、本人の声のコマがあったという事実だけ。
+    // 本人の声のコマを、間が gapS 未満ならひとまとまりにし、最初から最後までが minS 以上なら「声が出た」（最初のコマから最後のコマまで）
+    static let voiceOnMinS = 0.3
+    static let voiceOnGapS = 0.5
 }
 
 /// 本人の声か（review.py の voice_self と同じ決まり）。1コマずつ流す。
@@ -99,32 +105,47 @@ enum BaselinePart: String {
     func covers(_ m: Metric) -> Bool { self == .all || (self == .face) == m.isFace }
 }
 
-/// 違いの種類：指標（普段の z で比べる）か、目を閉じている（事実だけ、v1.4〜）
+/// 違いの種類：指標（普段の z で比べる）か、目を閉じている（事実だけ、v1.4〜）か、声が出た（事実だけ、v1.7〜）
 enum DiffTarget: Hashable {
     case metric(Metric)
     case eyesClosed
+    case voiceOn
 
     static let eyesClosedKey = "eyes_closed"
     static let eyesClosedLabel = "目を閉じている"
+    static let voiceOnKey = "voice_on"
+    static let voiceOnLabel = "声が出た"
 
-    /// 画面・見る側・時間の流れに並べる順（表情4つ・目を閉じている・声2つ）
+    /// 画面・見る側・時間の流れに並べる順（表情4つ・目を閉じている・声2つ・声が出た）
     static let all: [DiffTarget] = Metric.allCases.filter(\.isFace).map { .metric($0) } + [.eyesClosed]
-        + Metric.allCases.filter { !$0.isFace }.map { .metric($0) }
+        + Metric.allCases.filter { !$0.isFace }.map { .metric($0) } + [.voiceOn]
+
+    /// 普段と比べた違いか（目を閉じている・声が出たは事実だけ）
+    var isFact: Bool { if case .metric = self { false } else { true } }
 
     /// 画面に出す名前
     var label: String {
         switch self {
         case .metric(let m): m.label
         case .eyesClosed: Self.eyesClosedLabel
+        case .voiceOn: Self.voiceOnLabel
         }
     }
 
-    /// 記録・見る側に書く名前（"brow_down" / "eyes_closed"）
+    /// 記録・見る側に書く名前（"brow_down" / "eyes_closed" / "voice_on"）
     var key: String {
         switch self {
         case .metric(let m): m.rawValue
         case .eyesClosed: Self.eyesClosedKey
+        case .voiceOn: Self.voiceOnKey
         }
+    }
+
+    init?(key: String) {
+        if key == Self.eyesClosedKey { self = .eyesClosed }
+        else if key == Self.voiceOnKey { self = .voiceOn }
+        else if let m = Metric(rawValue: key) { self = .metric(m) }
+        else { return nil }
     }
 }
 
@@ -146,7 +167,11 @@ struct DiffSegment: Identifiable, Equatable {
         target = .eyesClosed; above = true; self.startT = startT; self.endT = endT; peakZ = .nan
     }
 
-    /// 指標の違いならその指標（目を閉じているは nil）
+    init(voiceOnFrom startT: Double, to endT: Double) {
+        target = .voiceOn; above = true; self.startT = startT; self.endT = endT; peakZ = .nan
+    }
+
+    /// 指標の違いならその指標（目を閉じている・声が出たは nil）
     var metric: Metric? { if case .metric(let m) = target { m } else { nil } }
 
     var seconds: Double { endT - startT }
@@ -155,15 +180,21 @@ struct DiffSegment: Identifiable, Equatable {
     /// 目を閉じているは、状態の名前を付けずに「目を閉じている」だけ（秒数は呼ぶ側が足す）
     var message: String {
         switch metric {
-        case nil: DiffTarget.eyesClosedLabel
+        case nil: target.label
         case .rmsDb?: "声が、いつもより\(above ? "大きい" : "小さい")"
         case .f0Hz?: "声が、いつもより\(above ? "高い" : "低い")"
         case let m?: "\(m.label)動きが、いつもより\(above ? "強い" : "弱い")"
         }
     }
 
-    /// 記録の change に書く形（"brow_down:above"、目を閉じているは "eyes_closed:closed"）
-    var key: String { metric == nil ? "\(target.key):closed" : "\(target.key):\(above ? "above" : "below")" }
+    /// 記録の change に書く形（"brow_down:above"、目を閉じているは "eyes_closed:closed"、声が出たは "voice_on:on"）
+    var key: String {
+        switch target {
+        case .eyesClosed: "\(target.key):closed"
+        case .voiceOn: "\(target.key):on"
+        case .metric: "\(target.key):\(above ? "above" : "below")"
+        }
+    }
 
     /// 画面に出すか。表情の「いつもより弱い」は出さない（criteria.json の face_below_counts: false）
     var shown: Bool { above || !(metric?.isFace ?? true) }
@@ -207,6 +238,7 @@ struct DiffEngine {
     private var smooth: [Metric: (v: Double, t: Double)] = [:]
     private var det: [Metric: Detector] = [:]
     private var closedDet = ClosedDetector()
+    private var voiceOnDet = VoiceOnDetector()
 
     /// 今の z（判定できたコマのもの。判定できないときは入れない）
     private(set) var z: [Metric: Double] = [:]
@@ -224,7 +256,7 @@ struct DiffEngine {
     /// 普段を決めた・取り直した（nil で両方を消す）。この時刻より後のコマから使う。
     /// part が face / voice なら、その部分だけ変える（v1.6〜）
     mutating func setBaseline(_ b: [Metric: Stat]?, part: BaselinePart = .all) {
-        queue.append(.baseline(b, b == nil ? .all : part))
+        queue.append(.baseline(b, part))
     }
 
     /// 1コマ足す。0.2秒より前のコマを判定する
@@ -335,6 +367,53 @@ struct DiffEngine {
         } else if let cur = closedDet.seg, var seg = active[.eyesClosed] {
             seg.endT = cur.end
             active[.eyesClosed] = seg
+        }
+
+        // 声が出た：普段が無くても、すべてのコマで判定する（本人の声のコマかどうかだけを見る）
+        let (vStarted, vEnded) = voiceOnDet.step(t: x.t, on: x.voiceSelf == true)
+        if let e = vEnded {
+            var seg = active[.voiceOn] ?? DiffSegment(voiceOnFrom: e.start, to: e.end)
+            seg.endT = e.end; seg.open = false
+            finished.append(seg)
+            active[.voiceOn] = nil
+        }
+        if let s = vStarted {
+            active[.voiceOn] = DiffSegment(voiceOnFrom: s.start, to: s.end)
+        } else if let cur = voiceOnDet.seg, var seg = active[.voiceOn] {
+            seg.endT = cur.end
+            active[.voiceOn] = seg
+        }
+    }
+
+    /// 声が出た（review.py の detect_voice_on を1コマずつにしたもの）。
+    /// 本人の声のコマ（on）を、前の on のコマとの間が 0.5秒未満ならひとまとまりにする。まとまりの最初の on から今の on までが 0.3秒以上になったら始まり。
+    /// on のコマが来ないまま、最後の on から 0.5秒たったコマで終わり（終わりの時刻は最後の on のコマ）
+    struct VoiceOnDetector {
+        struct Seg { var start: Double; var end: Double }
+        private var first: Double?
+        private var lastOn: Double?
+        private(set) var seg: Seg?
+
+        mutating func step(t: Double, on: Bool) -> (Seg?, Seg?) {
+            var ended: Seg?
+            if let l = lastOn, t - l >= DiffCriteria.voiceOnGapS - 1e-9 {   // 切れ目
+                if var s = seg { s.end = l; ended = s }
+                seg = nil; first = nil; lastOn = nil
+            }
+            guard on else { return (nil, ended) }
+            if first == nil { first = t }
+            lastOn = t
+            if var s = seg {
+                s.end = t
+                seg = s
+                return (nil, ended)
+            }
+            if let f = first, t - f >= DiffCriteria.voiceOnMinS - 1e-9 {
+                let new = Seg(start: f, end: t)
+                seg = new
+                return (new, ended)
+            }
+            return (nil, ended)
         }
     }
 

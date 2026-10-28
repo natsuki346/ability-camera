@@ -43,7 +43,10 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
     let faceRatio: Double?
     let selfVoiceS: Double                       // 本人の声の時間（v1.6〜）
     let otherVoiceS: Double                      // 本人の声と言えない声の時間
-    var diffCount: Int { segments.count }
+    /// いつもとの違いの数（声が出たは普段と比べたものではないので入れない。sessions.jsonl の segments と同じ）
+    var diffCount: Int { segments.filter { $0.target != .voiceOn }.count }
+    var voiceOnCount: Int { segments.filter { $0.target == .voiceOn }.count }   // 声が出た回数（v1.7〜）
+    var voiceOnS: Double { segments.filter { $0.target == .voiceOn }.reduce(0) { $0 + $1.seconds } }
     var markCount: Int { marks.count }
     let notes: [String]
 
@@ -165,7 +168,10 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             }
             bItems.append((bt, stats, BaselinePart.of(b["part"] as? String)))
         }
-        for e in evs where e["kind"] as? String == "baseline_restart" { bItems.append((ms(e)!, nil, .all)) }
+        // カメラを変えたときの取り直し（part: "face"、v1.7〜）は表情の普段だけ消す（声の普段は続ける。review.py の restart_times と同じ）
+        for e in evs where e["kind"] as? String == "baseline_restart" {
+            bItems.append((ms(e)!, nil, (e["part"] as? String) == "face" ? .face : .all))
+        }
         bItems.sort { $0.t < $1.t }
         if baselines.isEmpty { notes.append("この記録には普段（baseline 行）が無いので、いつもとの違いは出せません") }
 

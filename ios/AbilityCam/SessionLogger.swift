@@ -68,10 +68,11 @@ struct EventRecord: Encodable {
     var savedCamera: String?    // saved_baseline_skipped：保存した普段のカメラ
     var mirrorCorrected: Bool?  // camera：解析に渡す映像が鏡のようになっていて、記録の値（左右の表情・yaw・roll・顔の枠）を背面と同じ意味に直した（v1.6.1〜）
     var orientationVersion: Int? // camera：解析に渡す映像の向きの決め方（camera_orientation_version、v1.6.1〜は 2）
+    var part: String?           // baseline_restart：face＝表情の普段だけ取り直した（カメラを変えたとき、v1.7〜。声の普段は続ける）。無ければ両方
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
-        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version"
+        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part
     }
 }
 
@@ -102,10 +103,14 @@ struct BaselineRecord: Encodable {
     var faceBox: FaceBoxStats?  // 普段の間の顔の位置と大きさ（v1.2〜）
     var part: String?           // face：表情の普段 / voice：声の普段（v1.6〜。無い行は両方）
     var voiceValidS: Double?    // voice：声の普段に数えた本人の声の秒数（v1.6〜）
+    var voiceSessions: Int?     // voice：声の普段を集めたセッションの数（v1.7〜。前のセッションから続けて集めたら 2 以上）
+    var voiceDays: Int?         // voice：集めた日の数（v1.7〜）
+    var voiceCarriedS: Double?  // voice：前のセッションまでに集めていた本人の声の秒数（v1.7〜）
     var eyesClosedS: Double?    // 普段の間に目を閉じていた秒数（v1.4〜。目を閉じているの決まりで、数えたコマから。保存した普段には無い）
 
     enum CodingKeys: String, CodingKey {
         case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", eyesClosedS = "eyes_closed_s", part, voiceValidS = "voice_valid_s"
+        case voiceSessions = "voice_sessions", voiceDays = "voice_days", voiceCarriedS = "voice_carried_s"
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
         case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics
     }

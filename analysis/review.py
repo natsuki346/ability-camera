@@ -40,11 +40,16 @@ UNIT = {"rms_db": " dB", "f0_hz": " Hz"}
 EYES = "eyes_closed"
 LABEL[EYES] = "目を閉じている"
 EYES_COLOR = "#5E4B8B"   # 墨紫（docs/wording-guide.md）
-# 区間の種類の並び（アプリの画面と同じ：表情4つ・目を閉じている・声2つ）
-SEG_KINDS = ["mouth_smile", "brow_down", "eye_squint", "jaw_open", EYES, "rms_db", "f0_hz"]
+# 声が出た（v1.7〜）：普段とは比べず、本人の声のコマがあったという事実だけ（criteria.json の voice_on）
+VOICE_ON = "voice_on"
+LABEL[VOICE_ON] = "声が出た"
+VOICE_ON_COLOR = "#6B4E3D"   # 焦げ茶（docs/wording-guide.md）
+FACTS = (EYES, VOICE_ON)     # 普段と比べない区間（z が無い）
+# 区間の種類の並び（アプリの画面と同じ：表情4つ・目を閉じている・声2つ・声が出た）
+SEG_KINDS = ["mouth_smile", "brow_down", "eye_squint", "jaw_open", EYES, "rms_db", "f0_hz", VOICE_ON]
 # 向きの言い方（docs/wording-guide.md）
 DIRECTION = {"rms_db": ("いつもより大きい", "いつもより小さい"), "f0_hz": ("いつもより高い", "いつもより低い"),
-             EYES: ("閉じている", "閉じている")}
+             EYES: ("閉じている", "閉じている"), VOICE_ON: ("声が出た", "声が出た")}
 
 
 def direction(m: str, sign: int) -> str:
@@ -53,8 +58,13 @@ def direction(m: str, sign: int) -> str:
 
 
 def seg_text(m: str, sign: int) -> str:
-    """区間を短く言う（「眉を寄せるがいつもより強い」「目を閉じている」）"""
-    return LABEL[EYES] if m == EYES else f"{LABEL[m]}が{direction(m, sign)}"
+    """区間を短く言う（「眉を寄せるがいつもより強い」「目を閉じている」「声が出た」）"""
+    return LABEL[m] if m in FACTS else f"{LABEL[m]}が{direction(m, sign)}"
+
+
+def is_difference(m: str) -> bool:
+    """普段と比べた「いつもとの違い」の数に入れるか（声が出たは普段と比べた違いではないので入れない。目を閉じているは v1.4 から入れている）"""
+    return m != VOICE_ON
 CRITERIA_KEYS = ["smooth_s", "start_z", "start_min_s", "end_z", "end_min_s"]
 # 口の動きを見る表情の数値の候補（どれを使うかは criteria.json の voice_self.keys）
 MOUTH_KEYS_ALL = ["jawOpen", "mouthClose", "mouthFunnel", "mouthPucker", "mouthRollLower", "mouthRollUpper", "mouthShrugLower", "mouthShrugUpper"]
@@ -241,11 +251,17 @@ def covers(b: dict, part: str) -> bool:
     return baseline_part(b) in ("all", part)
 
 
+def restart_times(rec: Recording, part: str = "face") -> list[float]:
+    """「普段を取り直す」（baseline_restart）の時刻。カメラを変えたときの行（part: "face"、v1.7〜）は表情だけ取り直し、声の普段は続ける"""
+    return [e["t_ms"] / 1000 for e in rec.events
+            if e.get("kind") == "baseline_restart" and (part == "face" or e.get("part") != "face")]
+
+
 def baseline_index(rec: Recording, part: str = "face") -> np.ndarray:
     """各コマで使う普段（その部分を含む直前の baseline）。「普段を取り直す」から次の baseline までは無し（アプリと同じ）。
     part は face（表情・目を閉じている）か voice（声）。v1.6〜の記録は、声の普段を表情とは別の行（part: "voice"）に書く"""
     marks = [(b["t_ms"] / 1000, i) for i, b in enumerate(rec.baselines) if covers(b, part)]
-    marks += [(e["t_ms"] / 1000, -1) for e in rec.events if e.get("kind") == "baseline_restart"]
+    marks += [(t, -1) for t in restart_times(rec, part)]
     marks.sort()
     out = np.full(len(rec.t), -1)
     times = np.array([m[0] for m in marks]) if marks else np.zeros(0)
@@ -349,7 +365,7 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
     声は、そのコマに書かれている値を使う（アプリは新しく計算した音だけを数えるので、n は少しずれることがある）"""
     t = rec.t
     processed, valid_arr, start0 = baseline_candidates(rec)
-    starts = sorted([start0] + [e["t_ms"] / 1000 for e in rec.events if e.get("kind") == "baseline_restart"])
+    starts = sorted([start0] + restart_times(rec, "face"))
     blinked = blink_mask(rec, c)
     split = bool(c and c.get("voice_self") and c.get("voice_baseline"))   # v1.6〜：声の普段は別に集める
     face_only = [m for m in METRICS if m in FACE_METRICS] if split else METRICS
@@ -390,10 +406,12 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
 
 def rebuild_voice_baselines(rec: Recording, c: dict) -> list[dict]:
     """声の普段（アプリと同じ決まり、v1.6〜）：記録の始まりと「普段を取り直す」から、開いてから warmup 秒より後の本人の声のコマを集め、
-    数えた時間（前のコマからの幅、0.5秒で切る）が voice_baseline.target_s になったら1行（part: "voice"）。値はそのコマの rms_db・f0_hz"""
+    数えた時間（前のコマからの幅、0.5秒で切る）が voice_baseline.target_s になったら1行（part: "voice"）。値はそのコマの rms_db・f0_hz。
+    アプリは v1.7 から、前のセッションまでに途中まで集めた声を続きから足す（baseline 行の voice_carried_s）が、その値は記録に無いので、
+    作り直すときはこの記録の中の声だけで集める"""
     t = rec.t
     _, _, start0 = baseline_candidates(rec)
-    starts = sorted([start0] + [e["t_ms"] / 1000 for e in rec.events if e.get("kind") == "baseline_restart"])
+    starts = sorted([start0] + restart_times(rec, "voice"))
     vs = voice_self_values(rec, c, face_valid(rec, c))
     target = c["voice_baseline"]["target_s"]
     out: list[dict] = []
@@ -548,6 +566,36 @@ def detect_eyes_closed(t: np.ndarray, blink: np.ndarray, ok: np.ndarray, ec: dic
     return segs
 
 
+def detect_voice_on(t: np.ndarray, vs: np.ndarray, vc: dict) -> list[Segment]:
+    """声が出た（アプリの DiffEngine.VoiceOnDetector と同じ決まり、v1.7〜）。普段とは比べない。
+    本人の声のコマ（vs == 1）を、前の本人の声のコマとの間が gap_s 未満ならひとまとまりにし、最初から最後までが min_s 以上になったら始まり。
+    本人の声のコマが来ないまま gap_s たったら終わり（終わりは最後の本人の声のコマ）。記録の終わりまで続いたものは、最後の本人の声のコマまで"""
+    min_s, gap = vc["min_s"], vc["gap_s"]
+    segs: list[Segment] = []
+    first = last_on = None
+    seg: Segment | None = None
+    for i in range(len(t)):
+        if last_on is not None and t[i] - t[last_on] >= gap - 1e-9:
+            if seg is not None:
+                seg.i1 = last_on
+                segs.append(seg)
+            seg = None
+            first = last_on = None
+        if vs[i] != 1:
+            continue
+        if first is None:
+            first = i
+        last_on = i
+        if seg is not None:
+            seg.i1 = i
+        elif t[i] - t[first] >= min_s - 1e-9:
+            seg = Segment(VOICE_ON, 1, first, i, first, float("nan"))
+    if seg is not None:
+        seg.truncated = "記録の終わりで打ち切り"
+        segs.append(seg)
+    return segs
+
+
 def closed_mask(n: int, segs: list[Segment]) -> np.ndarray:
     out = np.zeros(n, bool)
     for s in segs:
@@ -678,6 +726,11 @@ def analyze(rec: Recording, c: dict) -> Analysis:
         segs = detect_eyes_closed(t, rec.blink, ok, c["eyes_closed"])
         a.segments += segs
         a.closed = closed_mask(len(t), segs)
+    # 声が出た（v1.7〜）：普段が無くても、すべてのコマで判定する
+    a.shorts[VOICE_ON] = []
+    if c.get("voice_on"):
+        a.judge[VOICE_ON] = np.ones(len(t), bool)
+        a.segments += detect_voice_on(t, a.voice_self, c["voice_on"])
     a.segments.sort(key=lambda s: (t[s.i0], SEG_KINDS.index(s.metric)))
     a.weak_segments.sort(key=lambda s: (t[s.i0], SEG_KINDS.index(s.metric)))
     return a
@@ -951,7 +1004,7 @@ def segment_rows(a: Analysis, segs: list[Segment] | None = None, kind: str = "�
     rows = []
     for s in (a.segments if segs is None else segs):
         t0, t1 = t[s.i0], t[s.i1]
-        eyes = s.metric == EYES
+        eyes = s.metric in FACTS   # 普段と比べない区間（z・普段の平均が無い）
         idx = a.vbidx if s.metric in VOICE_METRICS else a.bidx
         b = None if eyes else rec.baselines[idx[s.i0]]["metrics"][s.metric]
         sl = slice(s.i0, s.i1 + 1)
@@ -996,6 +1049,11 @@ def criteria_lines(c: dict) -> list[str]:
         out.append(f"目を閉じている（eyes_closed、普段とは比べない）：eyeBlink 左右平均が {ec['threshold']:g} 以上が {ec['start_min_s']:g}秒以上続いたら"
                    f"（それより短いのはまばたき）、{ec['threshold']:g} 未満が {ec['end_open_s']:g}秒続いたら終わり。秒数は閉じ始めた時刻から。"
                    "普段がある間の、表情を判定できるコマだけ。通知候補には入れない")
+    vo = c.get("voice_on")
+    if vo:
+        out.append(f"声が出た（voice_on、普段とは比べない）：本人の声のコマを、間が {vo['gap_s']:g}秒未満ならひとまとまりにし、"
+                   f"最初から最後までが {vo['min_s']:g}秒以上なら区間（最初の本人の声のコマから最後のコマまで）。普段が無くても判定する。"
+                   "いつもとの違いの数・通知候補には入れない")
     bm = c["metrics"]["eye_squint"].get("blink_mask")
     if bm:
         out.append(f"目を細める（eye_squint）：まばたき（eyeBlinkLeft/Right の平均）が {bm['threshold']:g} 以上のコマと前後 {bm['pad_s']:g}秒は"
@@ -1050,7 +1108,7 @@ def candidates(a: Analysis) -> list[Candidate]:
         return Candidate(ts, rule, detail, sc or "なし", sc in n["scene_separate"])
 
     out = []
-    segs = [s for s in a.segments if s.metric != EYES]   # 目を閉じているは通知候補に入れない（v1.4〜、まだ決めていない）
+    segs = [s for s in a.segments if s.metric not in FACTS]   # 目を閉じている・声が出たは通知候補に入れない（v1.4〜・v1.7〜）
     face_on, voice_on = np.zeros(len(t), bool), np.zeros(len(t), bool)
     for s in segs:
         (face_on if s.metric in FACE_METRICS else voice_on)[s.i0:s.i1 + 1] = True
@@ -1112,6 +1170,15 @@ def quality(a: Analysis, calm: bool) -> dict:
             sel = np.isfinite(rec.raw["f0_hz"]) & rec.face & a.fvalid & (cnt >= 2)
             x = rng[sel]
             q["voice"]["mouth"] = (tuple(float(np.percentile(x, p)) for p in (10, 50, 90)), int(len(x))) if len(x) else None
+            # 本人の声の見分けを見直すため（v1.7〜）。顔が読めていて、口の数値の窓に顔のコマが2つ以上あるコマだけで数える
+            #   声が出ているのに「口が動いていない」と判定されたコマ（口があまり動かずに声を出す人だと、本人の声を取りこぼしているかもしれない）
+            #   声が出ていないのに口が動いているコマ（声の高さが取れていない・声を出さずに口を動かしている）
+            judged = rec.face & a.fvalid & (cnt >= 2)
+            voiced = np.isfinite(rec.raw["f0_hz"])
+            moving = rng >= vc["min_range"] - 1e-9
+            nv, nq = int((judged & voiced).sum()), int((judged & ~voiced).sum())
+            q["voice"]["voiced_no_mouth"] = (int((judged & voiced & ~moving).sum()), nv)
+            q["voice"]["mouth_no_voice"] = (int((judged & ~voiced & moving).sum()), nq)
 
     # 声の高さ（v1.6.2〜）：求め方の版と、取れたコマ・範囲の外で使わなかった値
     q["pitch"] = {"version": rec.header.get("f0_version", 1), "floor_db": rec.header.get("f0_floor_db"),
@@ -1132,6 +1199,17 @@ def quality(a: Analysis, calm: bool) -> dict:
                      for k in HEAD_ORDER}
         q["head_states"] = states
 
+    # 声が出た（v1.7〜）：回数・長さの合計・家族の印の前後 mark_window_s 秒に声が出ていたか
+    vo = c.get("voice_on")
+    if vo:
+        vsegs = [(float(t[s.i0]), float(t[s.i1])) for s in a.segments if s.metric == VOICE_ON]
+        w = vo["mark_window_s"]
+        overlap = lambda a0, a1: sum(max(0.0, min(a1, s1) - max(a0, s0)) for s0, s1 in vsegs)
+        touches = lambda a0, a1: any(s0 <= a1 and s1 >= a0 for s0, s1 in vsegs)
+        q["voice_on"] = {"count": len(vsegs), "total_s": sum(s1 - s0 for s0, s1 in vsegs), "window_s": w,
+                         "marks": [(m_t, v, touches(m_t - w, m_t), overlap(m_t - w, m_t), touches(m_t, m_t + w), overlap(m_t, m_t + w))
+                                   for m_t, v in marks(rec)]}
+
     # 区間の数：普段がある時間（判定した時間）あたり。--calm（何もしていない記録）では10分あたりも出す（比べる目安は置かない）
     minutes = q["judged_s"] / 60
     per = {}
@@ -1139,7 +1217,7 @@ def quality(a: Analysis, calm: bool) -> dict:
         n = sum(1 for s in a.segments if s.metric == m)
         ns = len(a.shorts.get(m, []))
         per[m] = (n, ns, sum(1 for s in a.weak_segments if s.metric == m))
-    total = sum(v[0] for v in per.values())
+    total = sum(v[0] for m, v in per.items() if is_difference(m))   # 声が出たは違いの数に入れない
     q["rates"] = {"minutes": minutes, "per_metric": per, "total": total,
                   "per_min": total / minutes if minutes > 0 else None,
                   "per_10min": total / minutes * 10 if minutes > 0 else None,
@@ -1150,6 +1228,8 @@ def quality(a: Analysis, calm: bool) -> dict:
     for m_t, v in marks(rec):
         best = None
         for s in a.segments:
+            if not is_difference(s.metric):
+                continue
             t0, t1 = t[s.i0], t[s.i1]
             d = 0.0 if t0 <= m_t <= t1 else (m_t - t1 if m_t > t1 else m_t - t0)
             if best is None or abs(d) < abs(best[0]):
@@ -1173,7 +1253,7 @@ def compare_baselines(rec: Recording, c: dict, lengths: list[float]) -> list[dic
         a = analyze(r, c)
         dt = frame_dt(r.t)
         judged = float(dt[a.bidx >= 0].sum())
-        total = len(a.segments)
+        total = sum(1 for x in a.segments if is_difference(x.metric))
         rows.append({"label": label, "length_s": None if r is rec else label,
                      "baselines": "、".join(jst(b["t_ms"] / 1000) for b in r.baselines) or "作れなかった（数えた時間が足りない）",
                      "judged_s": judged, "total": total, "shorts": sum(len(v) for v in a.shorts.values()),
@@ -1213,7 +1293,7 @@ def compare_saved(rec: Recording, c: dict) -> dict:
         r.baselines = rows[k]
         an = analyze(r, c)
         judged = float(frame_dt(r.t)[an.bidx >= 0].sum())
-        out["runs"][k] = {"total": len(an.segments), "judged_s": judged,
+        out["runs"][k] = {"total": sum(1 for x in an.segments if is_difference(x.metric)), "judged_s": judged,
                           "per_metric": {m: sum(1 for x in an.segments if x.metric == m) for m in SEG_KINDS},
                           "from": rows[k][0]["t_ms"] / 1000}
     return out
@@ -1340,6 +1420,29 @@ def eyes_track(a: Analysis, scene_color: dict) -> Track:
     return Track(LABEL[EYES], draw, height=1.2)
 
 
+def voice_on_track(a: Analysis, scene_color: dict) -> Track:
+    """声が出た（v1.7〜）：本人の声のコマ（細い線）と、声が出た区間（焦げ茶の塗り）"""
+    rec, t = a.rec, a.rec.t
+
+    def draw(ax):
+        for s in a.segments:
+            if s.metric == VOICE_ON:
+                ax.axvspan(to_num(t[s.i0]), to_num(t[s.i1]), color=VOICE_ON_COLOR, alpha=0.35, lw=0)
+        for t0, t1, name in scene_intervals(rec, t[-1]):
+            ax.axvspan(to_num(t0), to_num(t1), ymin=0.93, ymax=1.0, color=scene_color[name], lw=0)
+        vs = a.voice_self if a.voice_self is not None else np.full(len(t), np.nan)
+        step = max(1, len(t) // 20000)
+        ax.plot(to_num(t)[::step], np.where(vs == 1, 1.0, np.where(vs == 0, 0.0, np.nan))[::step], lw=0.8, color=LINE)
+        for m_t, v in marks(rec):
+            ax.axvline(to_num(m_t), color="#7570b3", lw=1)
+        ax.set_ylim(-0.1, 1.1)
+        ax.set_yticks([0, 1], ["本人の声と言えない", "本人の声"], fontsize=7)
+        n = sum(1 for s in a.segments if s.metric == VOICE_ON)
+        ax.set_title(f"{LABEL[VOICE_ON]}（{VOICE_ON}、普段とは比べない）：{n}件", loc="left", fontsize=10)
+
+    return Track(LABEL[VOICE_ON], draw, height=1.0)
+
+
 def head_track(a: Analysis, states: np.ndarray) -> Track:
     t = a.rec.t
 
@@ -1377,11 +1480,12 @@ def figure_tracks(a: Analysis, tracks: list[Track]) -> str:
                Patch(color=UP, alpha=0.3, label="区間（いつもより上）"),
                Patch(color=DOWN, alpha=0.3, label="区間（いつもより下）"),
                Patch(color=EYES_COLOR, alpha=0.35, label="目を閉じていた"),
+               Patch(color=VOICE_ON_COLOR, alpha=0.35, label="声が出た"),
                Patch(color="#9e9e9e", alpha=0.45, label="判定対象外（表情）"),
                Patch(color="#e6e6e6", label="普段が無い時間"),
                Line2D([], [], color="#7570b3", label="家族の印"),
                Line2D([], [], color=LINE, label="z（ならした今の値）")]
-    fig.legend(handles=handles, loc="lower center", ncol=8, fontsize=8, frameon=False)
+    fig.legend(handles=handles, loc="lower center", ncol=9, fontsize=8, frameon=False)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     return fig_to_data(fig, plt)
 
@@ -1463,6 +1567,10 @@ def baseline_time_row(b: dict) -> list:
     else:
         cond = (f"本人の声のコマ、開いてから {b.get('warmup_s', 5):g}秒より後" if baseline_part(b) == "voice" else
                 f"顔が読めていて |yaw| < {b.get('yaw_limit_deg', 35):g}°、開いてから {b.get('warmup_s', 5):g}秒より後")
+    if b.get("voice_sessions"):   # v1.7〜：途中まで集めた声の普段を、セッションをまたいで続けた
+        cond += (f"。{b['voice_sessions']}回のセッション・{b.get('voice_days', 1)}日にまたがって集めた"
+                 + (f"（前のセッションまでの分 {b.get('voice_carried_s', 0):g}秒。集め始め {jst(b['started_ms'] / 1000)}"
+                    f" {datetime.fromtimestamp(b['started_ms'] / 1000, JST):%m/%d}）" if b.get("voice_carried_s") else ""))
     target = b.get("target_s")
     target = f"{target:g}秒" if target is not None else ("60秒（書かれていない v0.9 より前の記録）" if valid is not None else "–")
     closed = b.get("eyes_closed_s")
@@ -1522,6 +1630,10 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
             (p10, p50, p90), n = v["mouth"]
             qrows.append(["声が出ていて顔が読めているコマの口の動き（直近0.3秒の変化、10% / 中央値 / 90%）",
                           f"{p10:.3f} / {p50:.3f} / {p90:.3f}（{n}コマ。しきい値 {c['voice_self']['min_range']:g}）"])
+        ratio = lambda k: (lambda x, n: "–（コマがありません）" if n == 0 else f"{x / n:.0%}（{x}/{n}コマ）")(*v[k]) if k in v else "–"
+        qrows.append(["声が出ていて顔が読めているのに、口が動いていないと判定されたコマの割合（v1.7〜。多いときは、口があまり動かずに声を出す人の声を取りこぼしているかもしれない）",
+                      ratio("voiced_no_mouth")])
+        qrows.append(["声が出ていない（声の高さが無い）のに、口が動いているコマの割合（顔が読めているコマのうち、v1.7〜）", ratio("mouth_no_voice")])
     p = q["pitch"]
     qrows.append(["声の高さ（f0）が取れたコマ",
                   f"{p['f0_frames']}コマ（求め方 {p['version']}："
@@ -1600,9 +1712,10 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     # 区間の数（--calm では、何もしていない記録として10分あたりも出す）
     r = q["rates"]
     weak_on = not c.get("face_below_counts", False)
-    rrows = [[m, LABEL[m], r["per_metric"][m][0], "–" if m == EYES else r["per_metric"][m][1]]
+    rrows = [[m, LABEL[m] + ("（違いの合計には入れない）" if not is_difference(m) else ""), r["per_metric"][m][0],
+              "–" if m in FACTS else r["per_metric"][m][1]]
              + ([r["per_metric"][m][2] if m in FACE_METRICS else "–"] if weak_on else []) for m in SEG_KINDS]
-    rrows.append(["合計", "", r["total"], sum(v[1] for v in r["per_metric"].values())]
+    rrows.append(["合計（いつもとの違い）", "", r["total"], sum(v[1] for v in r["per_metric"].values())]
                  + ([sum(v[2] for v in r["per_metric"].values())] if weak_on else []))
     head = "<h2>区間の数" + ("（何もしていない記録）" if r["calm"] else "") + "</h2>"
     rate = ("–" if r["per_min"] is None else
@@ -1657,6 +1770,17 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                 mrows.append([jst(m_t), v, f"{seg_text(s.metric, s.sign)}（{jst(rec.t[s.i0])}〜）", where])
         parts.append("<h2>家族の印と区間（一番近い区間）</h2>" + table(["時刻", "家族の印", "区間", "時間差"], mrows))
 
+    # 声が出た（v1.7〜）
+    if "voice_on" in q:
+        vq = q["voice_on"]
+        w = vq["window_s"]
+        yn = lambda hit, sec: f"出ていた（{sec:.1f}秒）" if hit else "出ていない"
+        parts.append("<h2>声が出た（普段とは比べない）</h2>"
+                     f"<p>{vq['count']}回、長さの合計 {fmt_s(vq['total_s'])}。本人の声のコマのまとまりで、気持ちや状態は判断していません。</p>"
+                     + (table(["時刻", "家族の印", f"前 {w:g}秒に声が", f"後 {w:g}秒に声が"],
+                              [[jst(m_t), v, yn(b, bs), yn(af, as_)] for m_t, v, b, bs, af, as_ in vq["marks"]])
+                        if vq["marks"] else "<p>家族の印はありません。</p>"))
+
     # 通知候補
     n = c["notify"]
     cr = q["cand_rate"]
@@ -1679,8 +1803,8 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
     scene_names = list(dict.fromkeys(n for _, _, n in scene_intervals(rec, rec.t[-1])))
     scene_color = {n: SCENE_COLORS[i % len(SCENE_COLORS)] for i, n in enumerate(scene_names)}
     tracks = ([head_track(a, q["head_states"])] if "head_states" in q else []) + [
-        (eyes_track(a, scene_color) if m == EYES else metric_track(a, m, scene_color))
-        for m in SEG_KINDS if m != EYES or c.get("eyes_closed")]
+        (eyes_track(a, scene_color) if m == EYES else voice_on_track(a, scene_color) if m == VOICE_ON else metric_track(a, m, scene_color))
+        for m in SEG_KINDS if (m != EYES or c.get("eyes_closed")) and (m != VOICE_ON or c.get("voice_on"))]
     # ここに手首の記録の Track を足せば、同じ時間軸に並ぶ（今は未実装）
     img = figure_tracks(a, tracks)
     legend = "".join(f"<span class=chip style='background:{col}'>{e(n)}</span>" for n, col in scene_color.items())

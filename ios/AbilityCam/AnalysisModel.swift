@@ -102,6 +102,7 @@ final class AnalysisModel: ObservableObject {
     private var diffCount = 0                                 // このセッションで違いが出た回数（segments と同じ数え方）
     private var head = HeadTurnTracker()                      // 顔を向ける・そむける（0.5秒続いたら記録）
     private var boxStats = (cx: Welford(), cy: Welford(), w: Welford())   // 普段の間の顔の位置と大きさ
+    private var poseStats: [String: Welford] = [:]            // 普段の間の顔の向き（yaw_deg・pitch_deg・roll_deg、本人から見て。v1.8〜。記録と振り返りレポートだけ）
     private var baselineClosed = DiffEngine.ClosedDetector()  // 普段の間に目を閉じていたか（判定と同じ決まり）
     private var baselineClosedS = 0.0                         // 普段の間に目を閉じていた秒数（終わったものの合計）
     static let baselineEyesClosedMinS = 10.0                  // 数えた時間がこれを超えてから
@@ -473,6 +474,7 @@ final class AnalysisModel: ObservableObject {
         meterZ = [:]; diffMetrics = [:]; baselineStats = nil
         comparing = nil; savedFromMs = nil; askResave = false
         boxStats = (Welford(), Welford(), Welford())
+        poseStats = [:]
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
         usedFace = nil
         guard !keepVoice else { return }
@@ -585,7 +587,7 @@ final class AnalysisModel: ObservableObject {
                                  yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                  minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: faceMetrics)
         row.source = BaselineSource.saved.rawValue; row.compared = true; row.part = BaselinePart.face.rawValue
-        row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox
+        row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose
         logger.write(row)
         engine.setBaseline(Self.engineBaseline(faceMetrics), part: .face)
         comparing = .saved
@@ -665,6 +667,10 @@ final class AnalysisModel: ObservableObject {
             FaceBoxStats.S(n: w.n, mean: (w.mean * 10000).rounded() / 10000, std: (w.std * 10000).rounded() / 10000)
         }
         let faceBox = boxStats.cx.n > 0 ? FaceBoxStats(cx: box(boxStats.cx), cy: box(boxStats.cy), w: box(boxStats.w)) : nil
+        // 顔の向きの普段（v1.8〜）：比べるのには使わない。記録と振り返りレポートだけ
+        let pose: [String: BaselineRecord.Stat]? = poseStats.isEmpty ? nil : poseStats.mapValues { w in
+            BaselineRecord.Stat(n: w.n, mean: (w.mean * 100).rounded() / 100, std: (w.std * 100).rounded() / 100, insufficient: w.n < Self.minSamples)
+        }
         let useToday = comparing == nil   // 保存した普段で比べているときは、比べる相手を自動では切り替えない
         var row = BaselineRecord(tMs: Self.nowMs(), startedMs: baselineStartMs,
                                  wallS: ((now - baselineStartHost) * 10).rounded() / 10,
@@ -675,6 +681,7 @@ final class AnalysisModel: ObservableObject {
         row.part = BaselinePart.face.rawValue
         row.eyesClosedS = (baselineEyesClosedS * 10).rounded() / 10
         row.camera = (lensInUse ?? camera.lens).rawValue
+        row.pose = pose
         logger.write(row)
         if useToday {
             engine.setBaseline(Self.engineBaseline(out), part: .face)
@@ -687,7 +694,7 @@ final class AnalysisModel: ObservableObject {
         baselineReady = true
         todayShown = useToday
         todayBaseline = SavedBaseline(metrics: out, camera: (lensInUse ?? camera.lens).rawValue, targetS: baselineTarget,
-                                      savedMs: Self.nowMs(), faceBox: faceBox)
+                                      savedMs: Self.nowMs(), faceBox: faceBox, pose: pose)
         saveTodayIfNew()   // 人を選んでいて、保存した普段がまだ無ければ保存する（あれば、画面に出して取ったときだけ保存し直すか聞く）
     }
 
@@ -886,6 +893,12 @@ final class AnalysisModel: ObservableObject {
                 }
             }
             if let b = r.box { boxStats.cx.add(b.cx); boxStats.cy.add(b.cy); boxStats.w.add(b.w) }
+            // 顔の向き：記録に書くのと同じ 0.1° に丸めた値（振り返りレポートが記録のコマから数え直したものと同じになるように）
+            if let p = r.pose {
+                for (k, v) in [("yaw_deg", p.yaw), ("pitch_deg", p.pitch), ("roll_deg", p.roll)] {
+                    poseStats[k, default: Welford()].add((v * 10).rounded() / 10)
+                }
+            }
         }
         if faceReadable != readable { faceReadable = readable }
         faceShape = readable && !shapeSmooth.isEmpty ? shapeSmooth : nil

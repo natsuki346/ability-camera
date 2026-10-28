@@ -90,6 +90,8 @@ class Recording:
     pairs: dict[str, np.ndarray] = field(default_factory=dict)   # 表情の数値 52種を左右平均したもの（browDown など。顔が無いコマは NaN）
     bs_raw: dict[str, np.ndarray] = field(default_factory=dict)  # 口の動きを見る表情の数値（左右の無いもの。顔が無い・値が無いコマは NaN）
     voice_self_rec: np.ndarray | None = None                     # 記録の voice_self（1 / 0 / NaN＝null、キーが無いコマは -1）。v1.6〜
+    pitch: np.ndarray | None = None                              # 顔の向き（上が +）。v1.8〜で読む
+    roll: np.ndarray | None = None                               # 頭の傾き（本人から見て右が +）
     direction_flipped: bool = False                              # v1.6.1 までの記録（direction_version が無い）の左右を、本人から見た右・左に入れ替えた
     f0_dropped: int = 0                                          # 範囲（F0_RANGE）の外で使わなかった f0 の数（v1.6.1 までの記録の取り違え）
 
@@ -134,7 +136,7 @@ def load(path: Path) -> Recording:
 
     n = len(frames)
     raw = {m: np.full(n, np.nan) for m in METRICS}
-    yaw, lat, proc, blink = (np.full(n, np.nan) for _ in range(4))
+    yaw, lat, proc, blink, pitch, roll = (np.full(n, np.nan) for _ in range(6))
     face = np.zeros(n, bool)
     pairs: dict[str, np.ndarray] = {}
     bs_raw = {k: np.full(n, np.nan) for k in MOUTH_KEYS_ALL}
@@ -173,23 +175,28 @@ def load(path: Path) -> Recording:
                 f0_dropped += 1
         if o.get("yaw_deg") is not None:
             yaw[i] = o["yaw_deg"]
+        if o.get("pitch_deg") is not None:
+            pitch[i] = o["pitch_deg"]
+        if o.get("roll_deg") is not None:
+            roll[i] = o["roll_deg"]
         lat[i] = o.get("lat_ms", np.nan)
         p = o.get("proc_ms", -1)
         proc[i] = p if p is not None and p >= 0 else np.nan
     # 顔の向きの左右（v1.7.1〜、direction_version 2）：本人から見た右・左。それより前の記録は映像で見た右・左なので入れ替える（アプリのリプレイと同じ）
     flipped = int(header.get("direction_version") or 1) < 2
     if flipped:
-        yaw = -yaw
+        yaw, roll = -yaw, -roll
         events = [swap_head_event(e) if e.get("kind") == "head_turn" else e for e in events]
     t = np.array([o["t_ms"] for o in frames], float) / 1000
     # v1.2〜：保存した普段（source: "saved"）で比べたときは、今日の普段の行も compared: false で書かれる。
     # 区間はアプリと同じく、比べるのに使った行（compared が false でないもの）で判定する
     used = [b for b in baselines if b.get("compared", True) is not False]
     return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines,
-                     bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped, direction_flipped=flipped)
+                     bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped, direction_flipped=flipped, pitch=pitch, roll=roll)
 
 
 DIRECTION_VERSION = 2   # アプリの FaceDirection.version
+POSE_KEYS = ["yaw_deg", "pitch_deg", "roll_deg"]   # baseline 行の pose（顔の向きの普段、v1.8〜）
 SIDE_NOTE = "本人から見て"
 
 
@@ -407,7 +414,7 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
         ti = float(t[i])
         p = int(np.searchsorted(starts, ti, side="right")) - 1
         if p != period:
-            period, vals, valid_s, last, done = p, {m: [] for m in face_only}, 0.0, None, False
+            period, vals, valid_s, last, done = p, {m: [] for m in face_only + POSE_KEYS}, 0.0, None, False
         if done or p < 0 or not processed[i]:
             continue
         valid = bool(valid_arr[i])
@@ -419,12 +426,16 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
                 v = rec.raw[m][i]
                 if v == v and not (m == "eye_squint" and blinked[i]):
                     vals[m].append(float(v))
+            for k, arr in zip(POSE_KEYS, (rec.yaw, rec.pitch, rec.roll)):   # 顔の向きの普段（v1.8〜）
+                if arr is not None and arr[i] == arr[i]:
+                    vals[k].append(float(arr[i]))
         if valid_s >= target_s:
             out.append({"type": "baseline", "t_ms": int(round(ti * 1000)), "started_ms": int(round(starts[p] * 1000)),
                         "wall_s": round(ti - starts[p], 1), "valid_s": round(valid_s, 1),
                         "yaw_limit_deg": BASELINE_YAW_LIMIT, "warmup_s": BASELINE_WARMUP_S, "min_n": BASELINE_MIN_N,
                         "target_s": target_s, "rebuilt": True, "blink_masked": blink_mask_on(c),
                         "metrics": {m: baseline_stat(np.array(vals[m])) for m in face_only},
+                        "pose": {k: baseline_stat(np.array(vals[k])) for k in POSE_KEYS},
                         **({"part": "face"} if split else {})})
             done = True
     if split:
@@ -1705,6 +1716,10 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                                HEAD_LABEL.get(x.get("from"), x.get("from") or "")] for x in hev]))
     else:
         parts.append("<p>head_turn の記録はありません（v0.8 より前の記録、または向きが変わらなかった）。</p>")
+
+    # 顔の向きの普段と特徴（v1.8〜、記録とレポートだけ）
+    import pose
+    parts.append(pose.html_section(a, e))
 
     # 普段
     if rec.baselines:

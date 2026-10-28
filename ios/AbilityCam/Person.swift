@@ -16,6 +16,7 @@ struct SavedBaseline: Codable, Equatable {
     let targetS: Double                          // 普段の長さ
     let savedMs: Int64                           // 保存した日時
     var faceBox: FaceBoxStats?
+    var pose: [String: BaselineRecord.Stat]?     // 普段の間の顔の向き（yaw_deg・pitch_deg・roll_deg、本人から見て。v1.8〜。比べるのには使わない）
     var voice: SavedVoice?                       // 声の普段（v1.6〜。それより前に保存したものには無い）
 
     var savedDate: Date { Date(timeIntervalSince1970: Double(savedMs) / 1000) }

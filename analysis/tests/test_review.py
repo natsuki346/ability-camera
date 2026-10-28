@@ -1028,3 +1028,111 @@ class DirectionTest(unittest.TestCase):
         import re
         src = (review.HERE.parent / "ios" / "AbilityCam" / "HeadTurn.swift").read_text(encoding="utf-8")
         self.assertEqual(int(re.search(r"static let version = (\d+)", src).group(1)), review.DIRECTION_VERSION)
+
+
+def _pose_record(path, direction_version=2, with_pose=True):
+    """顔の向きの確かめ用の作り物の記録（v1.8〜）。普段は 0〜20秒（yaw 0±2°、pitch・roll 0±1°）
+      25–32 頭を右へ 15° 傾ける（本人から見て）→ いつもより右に傾いていた 7秒
+      35–38 左へ 15° 向く                       → 3秒なので出さない
+      40–44 右へ 30° 向く（0.5秒で 30° 変わる） → 急な向きの変化 2回（向いたとき・戻ったとき）
+    場面：24 食事 → 33 なし。印：28 不快"""
+    import json
+    import math
+    t0 = 1_800_000_000_000
+    h = {"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "camera": "wide"}
+    if direction_version:
+        h["direction_version"] = direction_version
+    lines = [json.dumps(h)]
+    for k in range(60 * 30):
+        s = k / 30
+        yaw = 2 * math.sin(s * 1.3)
+        pitch = math.sin(s * 0.7)
+        roll = math.sin(s * 0.9)
+        if 25 <= s < 32:
+            roll = 15
+        if 35 <= s < 38:
+            yaw = -15
+        if 40 <= s < 44:
+            yaw = 30
+        sign = 1 if direction_version == 2 else -1   # 古い記録は映像で見た右・左で書いてある
+        lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(s * 1000), "face": True, "bs": {"jawOpen": 0.1},
+                                 "yaw_deg": round(sign * yaw, 1), "pitch_deg": round(pitch, 1), "roll_deg": round(sign * roll, 1)}))
+    b = {"type": "baseline", "t_ms": t0 + 20000, "started_ms": t0, "valid_s": 15, "part": "face", "target_s": 15,
+         "metrics": {"jaw_open": {"n": 100, "mean": 0.1, "std": 0.01, "insufficient": False}}}
+    if with_pose:
+        b["pose"] = {"yaw_deg": {"n": 400, "mean": 0.0, "std": 1.4, "insufficient": False},
+                     "pitch_deg": {"n": 400, "mean": 0.0, "std": 0.7, "insufficient": False},
+                     "roll_deg": {"n": 400, "mean": 0.0, "std": 0.7, "insufficient": False}}
+    lines.append(json.dumps(b))
+    for ms, kind, v in ((24000, "scene", "食事"), (33000, "scene", "なし"), (28000, "mark", "不快")):
+        lines.append(json.dumps({"type": "event", "t_ms": t0 + ms, "kind": kind, "value": v}, ensure_ascii=False))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class PoseTest(unittest.TestCase):
+    """顔の向きの普段と特徴（v1.8〜、振り返りレポートだけ）"""
+
+    def analyze(self, **kw):
+        import pose
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "pose.jsonl"
+            _pose_record(p, **kw)
+            a = review.analyze(review.load(p), review.load_criteria(review.HERE / "criteria.json", []))
+            return a, pose.analyze_pose(a)
+
+    def test_deviations(self):
+        _, p = self.analyze()
+        devs = p["deviations"]
+        self.assertEqual([(d.key, d.sign) for d in devs], [("roll_deg", 1)])   # 3秒の左は出さない。30° の右は 4秒なので出さない
+        self.assertAlmostEqual(devs[0].seconds, 7, delta=0.3)
+        self.assertIn("いつもより右に傾いていた", devs[0].text())
+        self.assertTrue(devs[0].text().endswith("（本人から見て）"))
+
+    def test_floor(self):
+        # 普段の標準偏差 0.7° でも下限 5° をかけるので、いつもの範囲は ±10°（±1° の揺れでは出さない）
+        _, p = self.analyze()
+        self.assertFalse(any(d.key == "pitch_deg" for d in p["deviations"]))
+
+    def test_quick_and_dwell(self):
+        _, p = self.analyze()
+        self.assertEqual(len(p["quick"]), 2)
+        self.assertEqual({k for _, _, k in p["quick"]}, {"yaw_deg"})
+        self.assertEqual(p["changes"], 0)                 # 35° を超えないので、顔の向きの段はずっと正面
+        self.assertEqual(p["dwell"]["n"], 1)
+
+    def test_scene_and_marks(self):
+        _, p = self.analyze()
+        scenes = dict(p["by_scene"])
+        self.assertAlmostEqual(scenes["食事"]["seconds"], 9, delta=0.2)
+        self.assertGreater(scenes["食事"]["mean"]["roll_deg"], 10)
+        (m_t, v, before, after), = p["by_mark"]
+        self.assertEqual(v, "不快")
+        self.assertAlmostEqual(after["mean"]["roll_deg"], 15 * 4 / 10, delta=0.5)   # 28〜38 のうち 28〜32 が 15°
+        self.assertEqual(before["ratio"]["front"], 1.0)
+
+    def test_old_record_is_swapped(self):
+        _, p = self.analyze(direction_version=None)
+        self.assertEqual([(d.key, d.sign) for d in p["deviations"]], [("roll_deg", 1)])   # 映像で見た向きで書いてあっても、本人から見て右
+
+    def test_recount_without_pose(self):
+        _, p = self.analyze(with_pose=False)
+        (b, st, src), = p["baselines"]
+        self.assertIn("数え直した", src)
+        self.assertLess(abs(st["yaw_deg"]["mean"]), 1)
+        self.assertGreater(st["yaw_deg"]["n"], 100)
+
+    def test_html_words(self):
+        import pose
+        a, _ = self.analyze()
+        doc = pose.html_section(a, __import__("html").escape)
+        self.assertIn("いつもより右に傾いていた", doc)
+        for bad in ("そむけ", "嫌が", "疲れ"):
+            self.assertNotIn(bad, doc)
+
+    def test_rebuilt_baseline_has_pose(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "pose.jsonl"
+            _pose_record(p)
+            rows = review.rebuild_baselines(review.load(p), 10.0, review.load_criteria(review.HERE / "criteria.json", []))
+        self.assertIn("pose", rows[0])
+        self.assertLess(abs(rows[0]["pose"]["roll_deg"]["mean"]), 1)

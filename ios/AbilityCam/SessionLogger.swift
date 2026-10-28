@@ -101,6 +101,7 @@ struct BaselineRecord: Encodable {
     var savedMs: Int64?         // saved：保存した日時
     var camera: String?         // saved：保存したときのカメラ
     var faceBox: FaceBoxStats?  // 普段の間の顔の位置と大きさ（v1.2〜）
+    var pose: [String: Stat]?   // 普段の間の顔の向き（yaw_deg・pitch_deg・roll_deg の n・平均・標準偏差、本人から見て。v1.8〜。アプリは比べるのに使わず、振り返りレポートだけ）
     var part: String?           // face：表情の普段 / voice：声の普段（v1.6〜。無い行は両方）
     var voiceValidS: Double?    // voice：声の普段に数えた本人の声の秒数（v1.6〜）
     var voiceSessions: Int?     // voice：声の普段を集めたセッションの数（v1.7〜。前のセッションから続けて集めたら 2 以上）
@@ -109,7 +110,7 @@ struct BaselineRecord: Encodable {
     var eyesClosedS: Double?    // 普段の間に目を閉じていた秒数（v1.4〜。目を閉じているの決まりで、数えたコマから。保存した普段には無い）
 
     enum CodingKeys: String, CodingKey {
-        case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", eyesClosedS = "eyes_closed_s", part, voiceValidS = "voice_valid_s"
+        case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", pose, eyesClosedS = "eyes_closed_s", part, voiceValidS = "voice_valid_s"
         case voiceSessions = "voice_sessions", voiceDays = "voice_days", voiceCarriedS = "voice_carried_s"
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
         case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics

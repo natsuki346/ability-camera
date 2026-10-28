@@ -28,10 +28,22 @@
 ```sh
 brew install xcodegen cocoapods
 cd ios
-TEAM_ID=あなたのチームID ./setup.sh   # モデルの取得 → xcodegen → pod install
+TEAM_ID=あなたのチームID ./setup.sh   # 古い複製をゴミ箱へ → モデルの取得 → xcodegen → ワークスペースを作り直して pod install → 確かめる
 open AbilityCam.xcworkspace           # .xcodeproj ではなくこちらを開く
 ```
 iPhone をつないで実行。初回は、iPhone の 設定 > 一般 > VPNとデバイス管理 で開発元を信頼する。
+
+`setup.sh` は何度動かしてもよい（v1.6.3〜）。
+- `ios/` に「AbilityCam 2.xcodeproj」のような古い複製（名前に空白と数字が付いたもの）があれば、名前を出してゴミ箱（`~/.Trash`）に移す。
+- `AbilityCam.xcworkspace` は消してから作り直し、参照が `AbilityCam.xcodeproj` と `Pods/Pods.xcodeproj` の2つだけかを確かめる（違えばエラーで止まる）。
+- 2回目からは `TEAM_ID` を省くと、前に作ったプロジェクトのチームIDを使う。
+- 使うプロジェクトは `Podfile` の `project 'AbilityCam.xcodeproj'` で決めてある。
+
+**「Cannot find 'PitchTracker' in scope」のように「Cannot find 〜 in scope」でビルドが失敗したとき**は、Xcode が古いプロジェクトを開いていて、新しいファイルが入っていない。次の順で直す。
+1. Xcode を ⌘Q で閉じる
+2. `cd ios && ./setup.sh`
+3. `open AbilityCam.xcworkspace` で開き直す
+4. ⇧⌘K（Product > Clean Build Folder）してからビルドする
 
 ## 役割と通信（v0.5〜v0.8）
 同じアプリに2つの役割がある。最初の画面で選び、次からは覚えておく（右上の歯車の設定で変えられる。撮る側から見る側に変えると、今の記録を閉じて整理する）。

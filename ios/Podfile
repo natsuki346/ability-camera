@@ -1,4 +1,6 @@
 platform :ios, '17.0'
+# 使うプロジェクトを決めておく（ios/ に .xcodeproj が2つあると pod install が止まるため）
+project 'AbilityCam.xcodeproj'
 
 target 'AbilityCam' do
   use_frameworks!

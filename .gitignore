@@ -18,6 +18,9 @@ sessions.html
 ios/Pods/
 ios/*.xcodeproj/
 ios/*.xcworkspace/
+# 古い複製（Finder の複製などで「AbilityCam 2.xcodeproj」のようにできたもの。setup.sh がゴミ箱に移す）
+ios/AbilityCam *.xcodeproj
+ios/AbilityCam *.xcworkspace
 ios/Podfile.lock
 ios/AbilityCam/Info.plist
 ios/AbilityCam/Resources/*.task

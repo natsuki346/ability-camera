@@ -1,8 +1,20 @@
 #!/bin/bash
 # 使い方: TEAM_ID=あなたのチームID ./setup.sh
 # （チームIDは Xcode > Settings > Accounts、または developer.apple.com の Membership で確認）
+# 何度動かしても同じ結果になる（2回目は、前に作ったプロジェクトのチームIDをそのまま使う）
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# 1. 古い複製（「AbilityCam 2.xcodeproj」のように、名前に空白と数字が付いたもの）をゴミ箱へ。
+#    残っていると Xcode やワークスペースがそちらを開き、新しいファイルが入っていないためビルドが失敗する
+shopt -s nullglob
+for dup in "AbilityCam "*.xcodeproj "AbilityCam "*.xcworkspace; do
+  dest="$HOME/.Trash/$dup"
+  [ -e "$dest" ] && dest="$HOME/.Trash/${dup%.*} $(date +%Y%m%d-%H%M%S).${dup##*.}"
+  echo "古い複製をゴミ箱に移します: ios/${dup}"
+  mv "$dup" "$dest"
+done
+shopt -u nullglob
 
 MODEL=AbilityCam/Resources/face_landmarker.task
 if [ ! -f "$MODEL" ]; then
@@ -14,9 +26,29 @@ fi
 command -v xcodegen >/dev/null || { echo "xcodegen がありません: brew install xcodegen"; exit 1; }
 command -v pod >/dev/null      || { echo "CocoaPods がありません: brew install cocoapods"; exit 1; }
 
-export TEAM_ID="${TEAM_ID:-}"
+# 2. チームID：指定が無ければ、前に作ったプロジェクトのものを使う（空のまま作り直して署名が外れないように）
+TEAM_ID="${TEAM_ID:-}"
+if [ -z "$TEAM_ID" ] && [ -f AbilityCam.xcodeproj/project.pbxproj ]; then
+  TEAM_ID=$(grep -m1 -o 'DEVELOPMENT_TEAM = [A-Z0-9]*' AbilityCam.xcodeproj/project.pbxproj | sed 's/.*= //' || true)
+  [ -n "$TEAM_ID" ] && echo "チームID: 前のプロジェクトの ${TEAM_ID} を使います"
+fi
+export TEAM_ID
 [ -z "$TEAM_ID" ] && echo "注意: TEAM_ID が空です。Xcode の Signing & Capabilities でチームを選んでください。"
 
+# 3. プロジェクトとワークスペースを作り直す（ワークスペースは消してから作るので、古い参照が残らない）
 xcodegen generate
+rm -rf AbilityCam.xcworkspace
 pod install
-echo "完了: open AbilityCam.xcworkspace"
+
+# 4. ワークスペースが参照しているのが AbilityCam.xcodeproj と Pods/Pods.xcodeproj の2つだけか
+DATA=AbilityCam.xcworkspace/contents.xcworkspacedata
+[ -f "$DATA" ] || { echo "エラー: $DATA がありません（pod install が失敗しています）"; exit 1; }
+refs=$(sed -n 's/.*location = "\([^"]*\)".*/\1/p' "$DATA" | sort | tr '\n' ' ')
+want="group:AbilityCam.xcodeproj group:Pods/Pods.xcodeproj "
+if [ "$refs" != "$want" ]; then
+  echo "エラー: ワークスペースの参照が違います: ${refs}（期待: ${want}）"
+  exit 1
+fi
+
+echo "完了: ワークスペースの参照は AbilityCam.xcodeproj と Pods/Pods.xcodeproj の2つです"
+echo "Xcode を開いていたら ⌘Q で閉じてから open AbilityCam.xcworkspace"

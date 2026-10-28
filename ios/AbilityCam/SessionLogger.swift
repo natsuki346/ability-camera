@@ -34,6 +34,15 @@ struct FrameRecord: Encodable {
     }
 }
 
+/// 映像のコマごと（約33ms）の声の大きさ（v1.9.1〜）。音の塊（約0.1秒）ごとに1行。音声そのものではない
+struct AudioRecord: Encodable {
+    let type = "audio"
+    let tMs: Int64              // 塊の始まりの時刻（epoch ms）
+    let blockMs: Double         // 1つの区切りの長さ（ms、約33.3）
+    let rmsDb: [Double]         // 区切りごとの声の大きさ（dBFS）
+    enum CodingKeys: String, CodingKey { case type, tMs = "t_ms", blockMs = "block_ms", rmsDb = "rms_db" }
+}
+
 /// nil のときも null と書く値（書いていない古い記録と見分けるため）
 struct Nullable<T: Encodable>: Encodable {
     let value: T?
@@ -90,6 +99,8 @@ struct BaselineRecord: Encodable {
         let mean: Double?
         let std: Double?
         let insufficient: Bool  // サンプルが足りず、比べるのに使わない
+        var median: Double? = nil   // 声の高さ（f0_hz）だけ：中央値と四分位範囲（v1.9.1〜。声の高さの範囲に使う）
+        var iqr: Double? = nil
     }
 
     let type = "baseline"

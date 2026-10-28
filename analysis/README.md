@@ -81,6 +81,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回だ
   声が出ていて顔が読めているコマの「口の動き」（直近0.3秒の変化の 10% / 中央値 / 90%）を出す（しきい値 `min_range` を決めるため）
 - **声の普段（voice_baseline）**：v1.6〜の記録は、表情の普段（`part: "face"`）と声の普段（`part: "voice"`）が別の行。区間は指標ごとに、その部分を含む直前の行で判定する（古い行は両方を含む）。
   `--baseline-s` で作り直すときも、声はアプリと同じく本人の声が10秒たまった所で別の行にする
+- **v1.9.1〜**：`sync.enabled: false`（タイミングは判定に使わず、記録の質に「口の開きと声の大きさの相関の中央値」を出すだけ）。相関は `type: "audio"` の映像のコマごとの声の大きさを ±`lag_s` 秒ずらして求める
+  （無い記録はコマの `rms_db`）。声の高さの範囲は 中央値 ± `k_spread` × ばらつき（四分位範囲÷1.349、下限 `spread_floor_hz`）。中央値の無い保存した声の普段は使わない。
+  保存した声の普段のばらつきを記録の質に出し、`warn_spread_hz` を超えたら「取り直せます」。`RobustPitchTest`・`AudioLagTest`・`VoiceCheckSpansTest`
 - **本人の声の見分け（voice_self.sync・pitch_range、v1.9〜）**：声のコマを pitch（保存した声の普段の範囲の外）→ no_face → no_mouth → timing（直近1秒の jawOpen と rms_db の相関が min_corr 未満）の順に見る。
   記録に `voice_self` があるコマはその値（と `voice_self_reason`・`voice_corr`・`voice_match`）を使い、無い古い記録は同じ決まりで決め直す。
   `check_app.py` は区間に加えて、声のコマごとの判定・理由・相関・どの顔の口と合っていたかも、アプリ（DiffCheck `--voice`）と比べる。`VoiceSyncTest` が作り物の記録で確かめる

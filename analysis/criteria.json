@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-28.6",
+  "version": "2026-10-28.7",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -48,6 +48,10 @@
     {
       "date": "2026-10-28",
       "reason": "v1.9：voice_self に sync（口の動きと声のタイミング）と pitch_range（声の高さの範囲）を足した。2026-10-28 20:25 の記録（前面）で、本人が黙っているときも口の数値の直近0.3秒の変化は中央値 0.12（90% は 0.61）あり、しきい値 0.04 ではほかの人の声（約320Hz）が全部本人の声になっていたため。sync：直近1秒の jawOpen と rms_db の相関が 0.3 以上（10コマ以上）。pitch_range：保存した声の普段があるとき、f0 が 平均 ± 3 × 標準偏差（下限 20Hz）の外なら本人の声と言わない。どちらも仮の値で、本人の声の区間・ほかの人の声の区間を分けた記録で voice_check.py を使って決める。理由は記録の voice_self_reason。声紋は作らない。アプリ（v1.9）と同じ値。"
+    },
+    {
+      "date": "2026-10-28",
+      "reason": "v1.9.1：2026-10-28 20:25 の記録（前面、本人 4〜16秒・ほかの人 42〜51秒）を voice_check.py で見た結果に合わせた。タイミング（min_corr 0.3）は本人 45% / ほかの人 41% で見分けられず、本人の声の半分以上を捨てたので、判定には使わない（sync.enabled: false。相関は記録とレポートにだけ）。相関の求め方は、声の大きさを映像のコマごと（約33ms、記録の type: \"audio\"）にし、口の開きから ±0.2秒（lag_s）ずらしていちばん高いものを取る形に変えた。声の高さの範囲は 平均 ± 3 × 標準偏差で、保存した声の普段が 151 ± 61Hz と広すぎ（ほかの人 76% を本人と言った）たので、外れ値に強い 中央値 ± 2.5 × ばらつき（四分位範囲 ÷ 1.349、下限 20Hz）にした。中央値の無い声の普段（v1.9 まで）は声の高さの範囲に使わない。ばらつきが 40Hz を超える声の普段は「声の普段のばらつきが大きいです（取り直せます）」。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -134,11 +138,15 @@
       "key": "jawOpen",
       "window_s": 1.0,
       "min_frames": 10,
-      "min_corr": 0.3
+      "min_corr": 0.3,
+      "enabled": false,
+      "lag_s": 0.2
     },
     "pitch_range": {
-      "k_sd": 3.0,
-      "std_floor_hz": 20.0
+      "center": "median",
+      "k_spread": 2.5,
+      "spread_floor_hz": 20.0,
+      "warn_spread_hz": 40.0
     }
   },
   "voice_baseline": {

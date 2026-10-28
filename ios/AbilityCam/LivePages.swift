@@ -130,6 +130,9 @@ struct NowPage: View {
                     Text("声の普段が増えない理由：\(w)").font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
                 }
             }
+            if model.voiceSpreadWide, model.voiceSec == nil {   // 保存した声の普段で比べているとき（v1.9.1〜）
+                Text("声の普段のばらつきが大きいです（取り直せます）").font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+            }
             if model.otherVoice {
                 Text("声：本人以外の声が入っています").font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }

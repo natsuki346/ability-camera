@@ -28,9 +28,33 @@ enum DiffCriteria {
     static let syncWindowS = 1.0
     static let syncMinFrames = 10
     static let syncMinCorr = 0.3
-    // 声の高さの範囲（v1.9〜、criteria.json の voice_self.pitch_range）：保存した声の普段があるとき、f0 が 平均 ± pitchRangeK × 標準偏差（下限 pitchStdFloorHz）の外なら本人の声と言わない
-    static let pitchRangeK = 3.0
-    static let pitchStdFloorHz = 20.0
+    /// v1.9.1〜：タイミングの決まりは判定に使わない（実際の記録で本人 45% / ほかの人 41% と見分けられず、本人の声の半分以上を捨てたため）。
+    /// 相関は振り返りレポートで、映像のコマごとの声の大きさ（記録の type: "audio"）と ±0.2秒のずれを探して求める
+    static let syncEnabled = false
+    // 声の高さの範囲（v1.9.1〜、criteria.json の voice_self.pitch_range）：保存した声の普段があるとき、f0 が 中央値 ± pitchRangeK × ばらつき（下限 pitchSpreadFloorHz）の外なら
+    // 本人の声と言わない。ばらつき＝四分位範囲 ÷ 1.349（外れ値に強い。平均・標準偏差は使わない。v1.9 は 平均 ± 3 × 標準偏差で、151 ± 61Hz と広すぎた）
+    static let pitchRangeK = 2.5
+    static let pitchSpreadFloorHz = 20.0
+    /// 保存した声の普段の声の高さのばらつきがこれを超えたら「声の普段のばらつきが大きいです（取り直せます）」
+    static let voiceSpreadWarnHz = 40.0
+
+    /// 四分位（numpy の percentile の linear と同じ：並べた値の (n−1)×p 番目を、前後で比例して求める）
+    static func quantile(_ sorted: [Double], _ p: Double) -> Double {
+        guard !sorted.isEmpty else { return .nan }
+        let pos = Double(sorted.count - 1) * p
+        let lo = Int(pos.rounded(.down)), hi = min(lo + 1, sorted.count - 1)
+        return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - Double(lo))
+    }
+
+    /// 声の高さの中央値と四分位範囲（0.1 に丸める）。値が無ければ nil
+    static func robustPitch(_ values: [Double]) -> (median: Double, iqr: Double)? {
+        guard !values.isEmpty else { return nil }
+        let s = values.sorted()
+        let r = { (x: Double) in (x * 10).rounded() / 10 }
+        return (r(quantile(s, 0.5)), r(quantile(s, 0.75) - quantile(s, 0.25)))
+    }
+
+    static func spread(iqr: Double) -> Double { iqr / 1.349 }
     // 声の普段（v1.6〜、criteria.json の voice_baseline）：本人の声のコマが合計これだけたまったら
     static let voiceBaselineS = 10.0
     // 途中まで集めた声の普段は人ごとに保存して、次のセッションで続きから足す（v1.7〜）。集め始めてからこの日数たったら捨てる
@@ -60,7 +84,7 @@ struct VoiceSelfTracker {
     private var lastYaw: (v: Double, t: Double)?
     private var mouth: [(t: Double, v: [String: Double])] = []
     private var sync: [(t: Double, jaw: Double?, rms: Double?, other: Double?)] = []
-    private var pitchRange: (mean: Double, sd: Double, fromT: Double)?
+    private var pitchRange: (center: Double, spread: Double, fromT: Double)?
 
     /// 顔が読めているか（DiffEngine の faceValid と同じ：直近1秒で顔が映るコマが半分以上、|yaw| < 35°）
     private(set) var faceValid = false
@@ -70,9 +94,9 @@ struct VoiceSelfTracker {
     private(set) var corrOther: Double?     // もう1つの顔の相関（2つ映っているとき）
     private(set) var match: Match?
 
-    /// 保存した声の普段の声の高さ（平均・標準偏差）を、この時刻のコマから使う（nil で使わない）
-    mutating func setPitchRange(mean: Double?, sd: Double?, fromT: Double) {
-        pitchRange = mean.map { ($0, sd ?? 0, fromT) }
+    /// 保存した声の普段の声の高さ（中央値・四分位範囲）を、この時刻のコマから使う（nil で使わない。中央値の無い v1.9 までの声の普段は使わない）
+    mutating func setPitchRange(median: Double?, iqr: Double?, fromT: Double) {
+        pitchRange = median.map { ($0, DiffCriteria.spread(iqr: iqr ?? 0), fromT) }
     }
 
     /// 相関（ピアソン）。どちらかがほとんど動いていなければ nil
@@ -121,14 +145,18 @@ struct VoiceSelfTracker {
 
         reason = nil; corr = nil; corrOther = nil; match = nil
         guard let f0 else { return nil }
-        corr = correlation(other: false)
-        corrOther = otherJaw == nil ? nil : correlation(other: true)
+        if DiffCriteria.syncEnabled {
+            corr = correlation(other: false)
+            corrOther = otherJaw == nil ? nil : correlation(other: true)
+        }
         let okSelf = (corr ?? -.infinity) >= DiffCriteria.syncMinCorr - 1e-9
         let okOther = (corrOther ?? -.infinity) >= DiffCriteria.syncMinCorr - 1e-9
-        match = okSelf && (corrOther == nil || corr! >= corrOther!) ? .selfFace : okOther ? .other : Match.none
+        if DiffCriteria.syncEnabled {
+            match = okSelf && (corrOther == nil || corr! >= corrOther!) ? .selfFace : okOther ? .other : Match.none
+        }
 
         if let p = pitchRange, t >= p.fromT - 1e-9,
-           abs(f0 - p.mean) > DiffCriteria.pitchRangeK * max(p.sd, DiffCriteria.pitchStdFloorHz) + 1e-9 {
+           abs(f0 - p.center) > DiffCriteria.pitchRangeK * max(p.spread, DiffCriteria.pitchSpreadFloorHz) + 1e-9 {
             reason = .pitch; return false
         }
         guard face, faceValid, mouth.count >= 2 else { reason = .noFace; return false }
@@ -138,7 +166,7 @@ struct VoiceSelfTracker {
             if let lo = xs.min(), let hi = xs.max() { range = max(range, hi - lo) }
         }
         guard range >= DiffCriteria.mouthMinRange - 1e-9 else { reason = .noMouth; return false }
-        guard okSelf else { reason = .timing; return false }
+        guard okSelf || !DiffCriteria.syncEnabled else { reason = .timing; return false }
         return true
     }
 }

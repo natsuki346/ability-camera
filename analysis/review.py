@@ -90,6 +90,8 @@ class Recording:
     pairs: dict[str, np.ndarray] = field(default_factory=dict)   # 表情の数値 52種を左右平均したもの（browDown など。顔が無いコマは NaN）
     bs_raw: dict[str, np.ndarray] = field(default_factory=dict)  # 口の動きを見る表情の数値（左右の無いもの。顔が無い・値が無いコマは NaN）
     voice_self_rec: np.ndarray | None = None                     # 記録の voice_self（1 / 0 / NaN＝null、キーが無いコマは -1）。v1.6〜
+    audio_t: np.ndarray | None = None                            # 映像のコマごと（約33ms）の声の大きさの区切りの始まりの時刻（v1.9.1〜、type: "audio"）
+    audio_db: np.ndarray | None = None
     other_jaw: np.ndarray | None = None                          # もう1つの顔の jawOpen（v1.9〜、2つ映っているとき）
     voice_extra: dict = field(default_factory=dict)              # 記録の voice_self_reason・voice_corr・voice_corr_other・voice_match（v1.9〜）
     pitch: np.ndarray | None = None                              # 顔の向き（上が +）。v1.8〜で読む
@@ -114,7 +116,7 @@ def face_values(bs: dict) -> dict[str, float]:
 
 def load(path: Path) -> Recording:
     header: dict = {}
-    frames, baselines, events = [], [], []
+    frames, baselines, events, audio = [], [], [], []
     with open(path, encoding="utf-8") as f:
         for n, line in enumerate(f):
             line = line.strip()
@@ -128,6 +130,8 @@ def load(path: Path) -> Recording:
                 baselines.append(o)
             elif kind == "event":
                 events.append(o)
+            elif kind == "audio":
+                audio.append(o)
             elif kind == "frame" or (kind is None and "face" in o):
                 frames.append(o)
     if not frames:
@@ -206,7 +210,20 @@ def load(path: Path) -> Recording:
     used = [b for b in baselines if b.get("compared", True) is not False]
     return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines,
                      bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped, direction_flipped=flipped, pitch=pitch, roll=roll,
-                     other_jaw=other_jaw, voice_extra=extra)
+                     other_jaw=other_jaw, voice_extra=extra, **audio_blocks(audio))
+
+
+def audio_blocks(rows: list[dict]) -> dict:
+    """type: "audio" の行（v1.9.1〜）を、区切りごとの (始まりの時刻, dB) に並べる"""
+    if not rows:
+        return {}
+    ts, dbs = [], []
+    for r in sorted(rows, key=lambda o: o["t_ms"]):
+        step = r.get("block_ms", 1000 / 30) / 1000
+        for k, v in enumerate(r.get("rms_db") or []):
+            ts.append(r["t_ms"] / 1000 + k * step)
+            dbs.append(v)
+    return {"audio_t": np.array(ts), "audio_db": np.array(dbs, float)}
 
 
 DIRECTION_VERSION = 2   # アプリの FaceDirection.version
@@ -491,6 +508,9 @@ def rebuild_voice_baselines(rec: Recording, c: dict) -> list[dict]:
                         "wall_s": round(ti - starts[p], 1), "voice_valid_s": round(valid_s, 1), "part": "voice",
                         "warmup_s": BASELINE_WARMUP_S, "min_n": BASELINE_MIN_N, "target_s": target, "rebuilt": True,
                         "blink_masked": True, "metrics": {m: baseline_stat(np.array(vals[m])) for m in VOICE_METRICS}})
+            rp = robust_pitch(vals["f0_hz"])   # 声の高さの中央値と四分位範囲（v1.9.1〜、アプリと同じ）
+            if rp:
+                out[-1]["metrics"]["f0_hz"].update(median=rp[0], iqr=rp[1])
             done = True
     return out
 
@@ -725,47 +745,87 @@ def pearson(xs: list[float], ys: list[float]) -> float | None:
     return sxy / math.sqrt(sxx * syy)
 
 
-def sync_corr(rec: Recording, vc: dict) -> tuple[np.ndarray, np.ndarray]:
-    """口の動きと声のタイミング（v1.9〜、voice_self.sync）：各コマの、直近 window_s 秒の口の開き（key）と rms_db の相関。
-    本人として選んだ顔と、もう1つの顔（other_jaw_open）。数えるコマが min_frames より少なければ NaN"""
+def robust_pitch(values) -> tuple[float, float] | None:
+    """声の高さの中央値と四分位範囲（0.1 に丸める。アプリの DiffCriteria.robustPitch と同じ：numpy の linear）"""
+    x = np.asarray(values, float)
+    if not len(x):
+        return None
+    q1, med, q3 = np.percentile(x, [25, 50, 75])
+    return round(float(med), 1), round(float(q3 - q1), 1)
+
+
+def spread_of(iqr: float) -> float:
+    """ばらつき（四分位範囲 ÷ 1.349、正規分布なら標準偏差と同じ大きさ）"""
+    return iqr / 1.349
+
+
+def rms_at(rec: Recording, ts: np.ndarray) -> np.ndarray:
+    """その時刻の声の大きさ。映像のコマごとの区切り（type: "audio"、v1.9.1〜）があればそれ、無ければいちばん近いコマの rms_db"""
+    if rec.audio_t is not None and len(rec.audio_t):
+        step = float(np.median(np.diff(rec.audio_t))) if len(rec.audio_t) > 1 else 1 / 30
+        i = np.searchsorted(rec.audio_t, ts, side="right") - 1
+        ok = (i >= 0) & (ts - rec.audio_t[np.clip(i, 0, None)] < step * 1.5)
+        return np.where(ok, rec.audio_db[np.clip(i, 0, None)], np.nan)
+    j = np.clip(np.searchsorted(rec.t, ts), 1, len(rec.t) - 1)
+    j = np.where(np.abs(rec.t[j - 1] - ts) <= np.abs(rec.t[j] - ts), j - 1, j)
+    out = rec.raw["rms_db"][j]
+    return np.where(np.abs(rec.t[j] - ts) <= 0.05, out, np.nan)
+
+
+def sync_corr(rec: Recording, vc: dict, only: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """口の動きと声のタイミング（voice_self.sync、v1.9.1〜は記録とレポートだけ）：各コマの、直近 window_s 秒の口の開き（key）と声の大きさの相関。
+    声の大きさは映像のコマごと（約33ms、type: "audio"）の値を、口の開きから lag_s 秒までずらして（1/30 秒ごと）いちばん高い相関を取る。
+    本人として選んだ顔と、もう1つの顔（other_jaw_open）。数えるコマが min_frames より少なければ NaN。only を渡したコマだけ求める。
+    返り値：(本人の顔の相関, もう1つの顔の相関, 本人の顔でいちばん合ったずれ（秒、+ は声が口より後）)"""
     sc = vc["sync"]
     t, n = rec.t, len(rec.t)
     jaw = rec.bs_raw.get(sc["key"], np.full(n, np.nan))
-    rms = rec.raw["rms_db"]
     oj = rec.other_jaw if rec.other_jaw is not None else np.full(n, np.nan)
-    out, out_o = np.full(n, np.nan), np.full(n, np.nan)
+    lag_max = sc.get("lag_s", 0.0)
+    lags = np.round(np.arange(-lag_max, lag_max + 1e-9, 1 / 30), 4) if lag_max > 0 else np.array([0.0])
+    shifted = {float(L): rms_at(rec, t + L) for L in lags}
+    out, out_o, best_lag = np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
     lo = 0
     for i in range(n):
         while t[i] - t[lo] > sc["window_s"] + 1e-9:
             lo += 1
-        for arr, dst in ((jaw, out), (oj, out_o)):
-            if arr is oj and not np.isfinite(oj[i]):
+        if only is not None and not only[i]:
+            continue
+        for arr, dst, face_only in ((jaw, out, True), (oj, out_o, False)):
+            if not face_only and not np.isfinite(oj[i]):
                 continue
-            xs, ys = [], []
-            for j in range(lo, i + 1):
-                x, r = arr[j], rms[j]
-                if arr is jaw and not rec.face[j]:
-                    continue
-                if x == x and r == r:
-                    xs.append(float(x))
-                    ys.append(float(r))
-            if len(xs) >= sc["min_frames"]:
-                v = pearson(xs, ys)
-                if v is not None:
-                    dst[i] = v
-    return out, out_o
+            best, bl = None, None
+            for L, rms in shifted.items():
+                xs, ys = [], []
+                for j in range(lo, i + 1):
+                    if face_only and not rec.face[j]:
+                        continue
+                    x, r = arr[j], rms[j]
+                    if x == x and r == r:
+                        xs.append(float(x))
+                        ys.append(float(r))
+                if len(xs) >= sc["min_frames"]:
+                    v = pearson(xs, ys)
+                    if v is not None and (best is None or v > best):
+                        best, bl = v, L
+            if best is not None:
+                dst[i] = best
+                if face_only:
+                    best_lag[i] = bl
+    return out, out_o, best_lag
 
 
 def pitch_ranges(rec: Recording) -> list[tuple[float, float, float]]:
-    """保存した声の普段の行（source: saved、声を含む行）の (時刻, f0 の平均, 標準偏差)。アプリはこの行の時刻のコマから使う"""
+    """保存した声の普段の行（source: saved、声を含む行）の (時刻, f0 の中央値, ばらつき＝四分位範囲÷1.349)。アプリはこの行の時刻のコマから使う。
+    中央値の無い行（v1.9 までに保存した声の普段）は使わない（平均・標準偏差は外れ値に弱いため、v1.9.1〜）"""
     out = []
     for b in rec.all_baselines:
         if baseline_kind(b) != "saved" or baseline_part(b) == "face":
             continue
         st = b.get("metrics", {}).get("f0_hz") or {}
-        if st.get("insufficient") is True or st.get("mean") is None:
+        if st.get("insufficient") is True or st.get("median") is None:
             continue
-        out.append((b["t_ms"] / 1000, float(st["mean"]), float(st.get("std") or 0)))
+        out.append((b["t_ms"] / 1000, float(st["median"]), spread_of(float(st.get("iqr") or 0))))
     return sorted(out)
 
 
@@ -780,10 +840,11 @@ class VoiceSelf:
 
 def voice_self_details(rec: Recording, c: dict, fvalid: np.ndarray, use_recorded: bool = True) -> VoiceSelf:
     """本人の声か（criteria.json の voice_self、アプリの VoiceSelfTracker と同じ決まり）。声が出ている（f0 がある）コマを、次の順に見る：
-    1. 保存した声の普段があれば（その行の時刻から）、f0 が 平均 ± pitch_range.k_sd × 標準偏差（下限 std_floor_hz）の外 → pitch
+    1. 保存した声の普段があれば（その行の時刻から）、f0 が 中央値 ± pitch_range.k_spread × ばらつき（下限 spread_floor_hz）の外 → pitch
     2. 顔が読めていない・そのコマに顔が無い → no_face
     3. 口の数値の直近 window_s 秒の変化が min_range より小さい → no_mouth
-    4. 口の開きと声の大きさの直近 sync.window_s 秒の相関が sync.min_corr より小さい（数えられない） → timing（v1.9〜）
+    4. 口の開きと声の大きさの直近 sync.window_s 秒の相関が sync.min_corr より小さい（数えられない） → timing（v1.9〜。v1.9.1〜は sync.enabled が false で使わない）
+    1 の範囲は v1.9.1〜 中央値 ± k_spread × ばらつき（四分位範囲÷1.349、下限 spread_floor_hz）
     どれでもなければ本人の声。use_recorded なら、記録に voice_self が書いてあるコマ（v1.6〜）はその値を使う（理由・相関も記録のもの）"""
     n = len(rec.t)
     voiced = np.isfinite(rec.raw["f0_hz"])
@@ -798,7 +859,8 @@ def voice_self_details(rec: Recording, c: dict, fvalid: np.ndarray, use_recorded
         out = np.full(n, np.nan)
         sync = vc.get("sync")
         if sync:
-            corr, corr_o = sync_corr(rec, vc)
+            corr, corr_o, _ = sync_corr(rec, vc, only=voiced)
+        judge_sync = bool(sync and sync.get("enabled", True))   # v1.9.1〜：off（相関は記録とレポートにだけ）
         pr = vc.get("pitch_range")
         ranges = pitch_ranges(rec) if pr else []
         ri, cur = 0, None
@@ -813,13 +875,13 @@ def voice_self_details(rec: Recording, c: dict, fvalid: np.ndarray, use_recorded
                 ok_s = corr[i] == corr[i] and corr[i] >= sync["min_corr"] - 1e-9
                 ok_o = corr_o[i] == corr_o[i] and corr_o[i] >= sync["min_corr"] - 1e-9
                 match[i] = "self" if ok_s and not (corr_o[i] == corr_o[i] and corr_o[i] > corr[i]) else "other" if ok_o else "none"
-            if cur is not None and abs(f0[i] - cur[1]) > pr["k_sd"] * max(cur[2], pr["std_floor_hz"]) + 1e-9:
+            if cur is not None and abs(f0[i] - cur[1]) > pr["k_spread"] * max(cur[2], pr["spread_floor_hz"]) + 1e-9:
                 reason[i] = "pitch"
             elif not (rec.face[i] and fvalid[i] and cnt[i] >= 2):
                 reason[i] = "no_face"
             elif rng[i] < vc["min_range"] - 1e-9:
                 reason[i] = "no_mouth"
-            elif sync and not ok_s:
+            elif judge_sync and not ok_s:
                 reason[i] = "timing"
             out[i] = 0.0 if reason[i] else 1.0
     if use_recorded and rec.voice_self_rec is not None:
@@ -1210,8 +1272,11 @@ def criteria_lines(c: dict) -> list[str]:
     if vc:
         if vc.get("sync"):
             sc, pr = vc["sync"], vc.get("pitch_range") or {}
-            out.append(f"本人の声の見分け（v1.9〜）：直近 {sc['window_s']:g}秒の {sc['key']} と rms_db の相関が {sc['min_corr']:g} 以上（{sc['min_frames']}コマ以上）"
-                       + (f"。保存した声の普段があるときは、f0 が 平均 ± {pr['k_sd']:g} × 標準偏差（下限 {pr['std_floor_hz']:g}Hz）の外なら本人の声と言わない" if pr else "")
+            timing = (f"直近 {sc['window_s']:g}秒の {sc['key']} と声の大きさの相関が {sc['min_corr']:g} 以上（{sc['min_frames']}コマ以上、±{sc.get('lag_s', 0):g}秒のずれを探す）"
+                      if sc.get("enabled", True) else
+                      f"口の動きと声のタイミング（直近 {sc['window_s']:g}秒の {sc['key']} と声の大きさの相関、±{sc.get('lag_s', 0):g}秒のずれを探す）は判定に使わず、記録の質に出すだけ（v1.9.1〜）")
+            out.append(f"本人の声の見分け：{timing}"
+                       + (f"。保存した声の普段があるときは、f0 が 中央値 ± {pr['k_spread']:g} × ばらつき（四分位範囲÷1.349、下限 {pr['spread_floor_hz']:g}Hz）の外なら本人の声と言わない" if pr else "")
                        + "（仮の値）。声紋は作らない")
         out.append(f"声（rms_db・f0_hz）：本人の声のコマだけで判定する。本人の声＝声が出ていて（f0 がある）、表情を判定できるコマで、"
                    f"{'・'.join(vc['keys'])} のどれかの直近 {vc['window_s']:g}秒の変化が {vc['min_range']:g} 以上"
@@ -1358,6 +1423,16 @@ def quality(a: Analysis, calm: bool) -> dict:
             from collections import Counter
             q["voice"]["reasons"] = Counter(r for r, v in zip(det.reason, det.values) if v == 0 and r)
             q["voice"]["matches"] = Counter(m for m in det.match if m)
+            # 口の開きと声の大きさの相関（判定には使わない、v1.9.1〜）：本人の声・本人の声と言えない声のコマの中央値
+            q["voice"]["corr"] = {k: (float(np.nanmedian(det.corr[sel])) if np.isfinite(det.corr[sel]).any() else None)
+                                  for k, sel in (("self", det.values == 1), ("other", det.values == 0))}
+            # 保存した声の普段の声の高さのばらつき（v1.9.1〜）：大きすぎると、声の高さの範囲が広くなる
+            pr = vc.get("pitch_range") or {}
+            q["voice"]["saved_spread"] = [(b["t_ms"] / 1000, spread_of(st["iqr"]) if st.get("iqr") is not None else st.get("std"),
+                                           st.get("iqr") is not None)
+                                          for b in rec.all_baselines if baseline_kind(b) == "saved" and baseline_part(b) != "face"
+                                          for st in [b.get("metrics", {}).get("f0_hz") or {}] if st.get("mean") is not None]
+            q["voice"]["warn_spread_hz"] = pr.get("warn_spread_hz")
             q["voice"]["mouth_no_voice"] = (int((judged & ~voiced & moving).sum()), nq)
 
     # 声の高さ（v1.6.2〜）：求め方の版と、取れたコマ・範囲の外で使わなかった値
@@ -1819,6 +1894,18 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         qrows.append(["声が出ていない（声の高さが無い）のに、口が動いているコマの割合（顔が読めているコマのうち、v1.7〜）", ratio("mouth_no_voice")])
         names = {"pitch": "声の高さが保存した声の普段の範囲の外", "no_face": "顔が読めていない", "no_mouth": "口がほとんど動いていない",
                  "timing": "口の開きと声の大きさのタイミングが合っていない"}
+        cr = v.get("corr") or {}
+        if any(x is not None for x in cr.values()):
+            f2 = lambda x: "–" if x is None else f"{x:.2f}"
+            qrows.append(["口の開きと声の大きさの相関の中央値（本人の声 / 本人の声と言えない声、判定には使わない、v1.9.1〜）",
+                          f"{f2(cr.get('self'))} / {f2(cr.get('other'))}"])
+        for t_s, sp, robust in v.get("saved_spread") or []:
+            if sp is None:
+                continue
+            wide = v.get("warn_spread_hz") is not None and sp > v["warn_spread_hz"]
+            qrows.append([f"保存した声の普段の声の高さのばらつき（{jst(t_s)}）",
+                          f"{sp:.0f}Hz（{'四分位範囲から' if robust else '標準偏差。v1.9 までの声の普段で、声の高さの範囲には使わない'}）"
+                          + ("。声の普段のばらつきが大きいです（取り直せます）" if wide else "")])
         if v.get("reasons"):
             qrows.append(["本人の声と言えなかった理由（声のコマ、v1.9〜）",
                           "、".join(f"{names.get(k, k)} {n}コマ" for k, n in v["reasons"].most_common())])

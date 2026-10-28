@@ -185,11 +185,12 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var engine = DiffEngine()
         var voiceTracker = VoiceSelfTracker()
         // 保存した声の普段の行（source: saved、声を含む行）の時刻と f0 の平均・標準偏差（データ不足なら使わない）
-        let pitchRanges: [(t: Double, mean: Double, sd: Double)] = baselines.compactMap { b in
+        // 中央値の無い行（v1.9 までに保存した声の普段）は使わない（review.py の pitch_ranges と同じ）
+        let pitchRanges: [(t: Double, median: Double, iqr: Double)] = baselines.compactMap { b in
             guard (b["source"] as? String) == "saved", BaselinePart.of(b["part"] as? String) != .face, let bt = ms(b),
                   let st = (b["metrics"] as? [String: [String: Any]])?[Metric.f0Hz.rawValue],
-                  (st["insufficient"] as? Bool) != true, let m = (st["mean"] as? NSNumber)?.doubleValue else { return nil }
-            return (bt, m, (st["std"] as? NSNumber)?.doubleValue ?? 0)
+                  (st["insufficient"] as? Bool) != true, let m = (st["median"] as? NSNumber)?.doubleValue else { return nil }
+            return (bt, m, (st["iqr"] as? NSNumber)?.doubleValue ?? 0)
         }.sorted { $0.t < $1.t }
         var pi = 0
         var detail: [(t: Double, voiceSelf: Bool, reason: String?, corr: Double?, corrOther: Double?, match: String?)] = []
@@ -220,7 +221,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             if let f = f0[i] { voice[.f0Hz] = f }
             // 本人の声か：記録に書いてあればそれを、無い古い記録は撮る側と同じ決まりで決め直す（review.py と同じ）
             while pi < pitchRanges.count, pitchRanges[pi].t <= t[i] {   // 保存した声の普段の範囲（v1.9〜、review.py の pitch_ranges と同じ）
-                voiceTracker.setPitchRange(mean: pitchRanges[pi].mean, sd: pitchRanges[pi].sd, fromT: pitchRanges[pi].t)
+                voiceTracker.setPitchRange(median: pitchRanges[pi].median, iqr: pitchRanges[pi].iqr, fromT: pitchRanges[pi].t)
                 pi += 1
             }
             let computed = voiceTracker.add(t: t[i], face: face[i], yaw: yaw[i], bs: bsList[i], rms: rms[i], f0: f0[i], otherJaw: otherJaw[i])

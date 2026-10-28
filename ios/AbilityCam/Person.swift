@@ -27,6 +27,15 @@ struct SavedVoice: Codable, Equatable {
     let metrics: [String: BaselineRecord.Stat]   // rms_db / f0_hz
     let validS: Double                           // 数えた本人の声の秒数
     let savedMs: Int64
+
+    /// 声の高さのばらつき（四分位範囲 ÷ 1.349、v1.9.1〜）。中央値の無い v1.9 までの声の普段は標準偏差（注意を出すかを決めるだけ）
+    var f0Spread: Double? {
+        guard let st = metrics[Metric.f0Hz.rawValue], !st.insufficient else { return nil }
+        if let q = st.iqr { return DiffCriteria.spread(iqr: q) }
+        return st.std
+    }
+    /// ばらつきが大きすぎる（声の普段を集める間に、高い声・低い声も出していた）
+    var spreadWide: Bool { (f0Spread ?? 0) > DiffCriteria.voiceSpreadWarnHz }
 }
 
 /// 人：名前だけ。この端末の中にだけ保存し、外には送らない（見る側にも、記録にも名前は書かない。記録には id だけ）
@@ -270,14 +279,24 @@ struct PersonEditView: View {
             } header: { Text("保存した表情の普段（カメラごと）") } footer: {
                 Text("このカメラで今日の普段を記録し終えると、そのカメラの普段として自動で保存します（ほかのカメラの普段は変えません）")
             }
-            Section("保存した声の普段（どのカメラでも使う）") {
+            Section {
                 if let v = p?.voice {
                     LabeledContent("保存した日時", value: PersonPickerView.date(Date(timeIntervalSince1970: Double(v.savedMs) / 1000)))
                     LabeledContent("本人の声", value: String(format: "%.0f秒", v.validS))
+                    if let m = v.metrics[Metric.f0Hz.rawValue], let med = m.median {
+                        LabeledContent("声の高さ（中央値・ばらつき）", value: String(format: "%.0f Hz・%.0f Hz", med, v.f0Spread ?? 0))
+                    }
+                    if v.spreadWide {
+                        Text("声の普段のばらつきが大きいです（取り直せます）").foregroundStyle(ContentView.navyText)
+                    }
+                    // 取り直す：保存した声の普段と途中まで集めた分を消し、次に記録を始めたときから集め直す
+                    Button("声の普段を取り直す") { store.setVoice(id, nil); store.setVoicePartial(id, nil) }
                     Button("声の普段を消す") { store.setVoice(id, nil) }
                 } else {
                     Text("ありません（本人の声が10秒たまると、自動で保存します）").foregroundStyle(.secondary)
                 }
+            } header: { Text("保存した声の普段（どのカメラでも使う）") } footer: {
+                Text("「取り直す」と、保存した声の普段と途中まで集めた声を消し、次に記録を始めたときから集め直します")
             }
             Section {
                 Button("この人を消す") { confirmDelete = true }

@@ -46,6 +46,7 @@ final class AnalysisModel: ObservableObject {
     @Published var baselineEyesClosedLong = false   // 普段の間に目を閉じていた時間が、数えた時間の2割を超えた（v1.4〜）
     @Published var voiceSec: Int?             // 声の普段を集めている：本人の声の秒数（画面に出すときだけ。v1.6〜）
     @Published var otherVoice = false         // 本人以外の声（と言えない声）だけが入っている（直近1秒）
+    @Published var voiceSpreadWide = false    // 比べている保存した声の普段の声の高さのばらつきが大きい（v1.9.1〜、取り直せます）
     @Published var voiceWait: String?         // 声の普段の進み具合が3秒増えていない理由（v1.6.2〜、VoiceWaitTracker）
     @Published var pitchRatio: Double?        // 「数字」：声の高さが取れた割合（直近10秒、声が出ていたときのうち。v1.6.2〜）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
@@ -123,6 +124,7 @@ final class AnalysisModel: ObservableObject {
     private var voiceCarry: VoicePartial?                     // このセッションの始め（・人を選んだとき）に読んだもの
     private var voiceCarryOwner: String?                      // voiceCarry を読んだ人（人を変えたら、その人の分を元に戻す）
     private var voiceSessionFirstMs: Int64?                   // このセッションで初めて本人の声を数えた時刻
+    private var voiceF0Values: [Double] = []                  // このセッションで数えた声の高さ（v1.9.1〜、中央値・四分位範囲を求める）
     private var voiceSavedSec = -1                            // 最後に保存した秒（1秒ごとに保存する）
     private var pitchCoverage = PitchCoverage()
     private var lastAudioAtCoverage: CFTimeInterval = 0
@@ -219,7 +221,7 @@ final class AnalysisModel: ObservableObject {
         sessionStartMs = Self.nowMs()
         face.setPreferred(nil)
         voiceCarry = nil; voiceCarryOwner = nil
-        voiceBox.setPitchRange(mean: nil, sd: nil, fromT: 0)   // 保存した声の普段の範囲は、applySaved で使い始める
+        voiceBox.setPitchRange(median: nil, iqr: nil, fromT: 0)   // 保存した声の普段の範囲は、applySaved で使い始める
         resetBaseline()   // 普段（設定の長さ）も自動で始める
         loadVoiceCarry()  // 途中まで集めた声の普段があれば、続きから（v1.7〜）
         applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
@@ -246,7 +248,7 @@ final class AnalysisModel: ObservableObject {
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false
-            voiceWait = nil
+            voiceWait = nil; voiceSpreadWide = false
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
             if let s = logger.finish() {
@@ -330,6 +332,7 @@ final class AnalysisModel: ObservableObject {
             let reason = dec.reason
             Task { @MainActor in self?.update(r, audio: a, tMs: tMs, voiceSelf: voiceSelf, voiceFaceValid: voiceFaceValid, voiceReason: reason) }
         }
+        audio.onBlocks = { [weak logger] t, step, db in logger?.write(AudioRecord(tMs: t, blockMs: step, rmsDb: db), notBefore: t) }
         let video = self.video, link = self.link
         video.onJPEG = { [weak link] d in link?.sendVideo(d) }
         camera.onFrame = { [weak face, weak video] sb in
@@ -491,7 +494,7 @@ final class AnalysisModel: ObservableObject {
         guard !keepVoice else { return }
         // 声の普段も、表情とは別に初めから集め直す（v1.6〜）。前のセッションまでに途中まで集めた分（voiceCarry）は残す（v1.7〜）
         voiceStats = [:]; voiceValidS = 0; voicePrevT = nil; voiceStartMs = Self.nowMs(); voiceDone = false
-        voiceSessionFirstMs = nil; voiceSavedSec = -1
+        voiceSessionFirstMs = nil; voiceSavedSec = -1; voiceF0Values = []; voiceSpreadWide = false
         voiceSec = Int(voiceCarry?.validS ?? 0); comparingVoice = nil; usedVoice = nil; todayVoice = nil
         voiceWaitTracker.reset(); voiceWait = nil
     }
@@ -530,6 +533,9 @@ final class AnalysisModel: ObservableObject {
         return out
     }
 
+    /// 前のセッションまでの分とこのセッションの分の声の高さ（v1.9.1〜）
+    private var voiceMergedF0: [Double] { (voiceCarry?.f0Values ?? []) + voiceF0Values }
+
     private static func dayString(_ ms: Int64) -> String {
         let f = DateFormatter()
         f.calendar = Calendar(identifier: .gregorian)
@@ -544,7 +550,7 @@ final class AnalysisModel: ObservableObject {
         let days = Set((voiceCarry?.days ?? []) + [Self.dayString(first)]).sorted()
         return VoicePartial(startedMs: voiceCarry?.startedMs ?? first, updatedMs: Self.nowMs(), validS: (voiceTotalS * 10).rounded() / 10,
                             stats: Dictionary(uniqueKeysWithValues: voiceMergedStats.map { ($0.key.rawValue, $0.value) }),
-                            sessions: (voiceCarry?.sessions ?? 0) + 1, days: days)
+                            sessions: (voiceCarry?.sessions ?? 0) + 1, days: days, f0Values: voiceMergedF0)
     }
 
     /// 選んだ人に、途中まで集めた声の普段を保存する（声の普段がまだ無い人だけ。集め終えたら setVoice で消える）
@@ -619,7 +625,8 @@ final class AnalysisModel: ObservableObject {
             engine.setBaseline(Self.engineBaseline(v.metrics), part: .voice)
             // 声の高さの範囲（v1.9〜）：この行の時刻のコマから、保存した声の普段の範囲の外の声は本人の声と言わない（review.py と同じ）
             let f0 = v.metrics[Metric.f0Hz.rawValue]
-            voiceBox.setPitchRange(mean: f0?.insufficient == false ? f0?.mean : nil, sd: f0?.std, fromT: Double(now) / 1000)
+            voiceBox.setPitchRange(median: f0?.insufficient == false ? f0?.median : nil, iqr: f0?.iqr, fromT: Double(now) / 1000)
+            voiceSpreadWide = v.spreadWide
             comparingVoice = .saved
             usedVoice = v.metrics
             voiceSec = nil; voiceWait = nil
@@ -723,7 +730,7 @@ final class AnalysisModel: ObservableObject {
         if counted {
             if voiceSessionFirstMs == nil { voiceSessionFirstMs = tMs }
             if let db = a.rmsDb { voiceStats[.rmsDb, default: Welford()].add(Double(db)) }
-            if let f0 = a.f0Hz { voiceStats[.f0Hz, default: Welford()].add(Double(f0)) }
+            if let f0 = a.f0Hz { voiceStats[.f0Hz, default: Welford()].add(Double(f0)); voiceF0Values.append((Double(f0) * 10).rounded() / 10) }
         }
         let total = voiceTotalS   // 前のセッションまでに途中まで集めた分も足す（v1.7〜）
         if total >= DiffCriteria.voiceBaselineS {
@@ -748,6 +755,11 @@ final class AnalysisModel: ObservableObject {
                                                   mean: w.n > 0 ? (w.mean * 10000).rounded() / 10000 : nil,
                                                   std: w.n > 0 ? (w.std * 10000).rounded() / 10000 : nil,
                                                   insufficient: w.n < Self.minSamples)
+        }
+        // 声の高さは中央値と四分位範囲も書く（v1.9.1〜、声の高さの範囲に使う。v1.9 までに途中まで集めた分には値が無いので、このセッションの分だけ）
+        if let rp = DiffCriteria.robustPitch(voiceMergedF0), var st = out[Metric.f0Hz.rawValue] {
+            st.median = rp.median; st.iqr = rp.iqr
+            out[Metric.f0Hz.rawValue] = st
         }
         let useToday = comparingVoice == nil   // 保存した声の普段で比べているときは切り替えない
         let started = voiceCarry?.startedMs ?? voiceStartMs   // 前のセッションから続けたなら、集め始めた日時
@@ -1094,8 +1106,8 @@ final class VoiceSelfBox: @unchecked Sendable {
     }
 
     /// 保存した声の普段の声の高さを、この時刻のコマから使う（v1.9〜。nil で使わない）
-    func setPitchRange(mean: Double?, sd: Double?, fromT: Double) {
+    func setPitchRange(median: Double?, iqr: Double?, fromT: Double) {
         lock.lock(); defer { lock.unlock() }
-        tracker.setPitchRange(mean: mean, sd: sd, fromT: fromT)
+        tracker.setPitchRange(median: median, iqr: iqr, fromT: fromT)
     }
 }

@@ -88,10 +88,13 @@ def compare_voice(path: Path, exe: Path, c: dict) -> list[str]:
     out = []
     for x, i in zip(app, idx):
         where = review.jst(float(rec.t[i]), ms=True)
-        rep = {"voice_self": bool(d.values[i] == 1), "reason": d.reason[i], "match": d.match[i]}
+        sync_on = (c["voice_self"].get("sync") or {}).get("enabled", True)
+        rep = {"voice_self": bool(d.values[i] == 1), "reason": d.reason[i], **({"match": d.match[i]} if sync_on else {})}
         for k, v in rep.items():
             if x.get(k) != v:
                 out.append(f"{where}：{k} が違います（アプリ {x.get(k)} / レポート {v}）")
+        if not (c["voice_self"].get("sync") or {}).get("enabled", True):
+            continue   # タイミングを判定に使わないとき（v1.9.1〜）、アプリは相関を求めない（レポートだけ）
         for k, arr in (("corr", d.corr), ("corr_other", d.corr_other)):
             a, b = x.get(k), arr[i]
             if (a is None) != (b != b) or (a is not None and abs(a - b) > 1e-9):

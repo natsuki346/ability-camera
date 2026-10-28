@@ -38,6 +38,8 @@ fixture_voice.jsonl（本人の声、v1.6〜の形：voice_self を書き、表�
 """
 import json
 import math
+
+import numpy as np
 from pathlib import Path
 
 T0_MS = 1_790_000_000_000   # 2026-09 ごろの適当な時刻
@@ -220,6 +222,9 @@ def build_voice():
                              "voice_valid_s": round(valid, 1), "min_n": 30, "target_s": 10.0, "blink_masked": True,
                              "source": "today", "compared": True, "part": "voice",
                              "metrics": {k: stat(x) for k, x in vals.items()}}
+                # 声の高さは中央値と四分位範囲も（v1.9.1〜、アプリと同じ：numpy の linear、0.1 に丸める）
+                q1, med, q3 = np.percentile(np.array(vals["f0_hz"]), [25, 50, 75])
+                voice_row["metrics"]["f0_hz"].update(median=round(float(med), 1), iqr=round(float(q3 - q1), 1))
                 rows.append((t, voice_row))
     rows += [(10.0, face_row)] + frames
     rows.sort(key=lambda r: r[0])

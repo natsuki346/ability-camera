@@ -11,7 +11,10 @@
   python voice_check.py 記録.jsonl --self 25-37 --self 50-52 --other 42-51        記録の始まりからの秒（13:42:05-13:42:20 のような時刻も可）
   python voice_check.py 記録.jsonl --self-hz 100-200 --other-hz 250-400            時間が分からないときは、声の高さで分けて代わりにする
                                                                                    （声の高さの範囲の決まりはこの分け方と重なるので、タイミングの決まりだけを見る）
-  --pitch-mean 150 --pitch-sd 15   保存した声の普段の代わり（記録に保存した声の普段の行が無いとき、声の高さの範囲の決まりを試す）
+  --other 35-38,42-51              カンマでつないだ時間も渡せる
+  --pitch-median 150 --pitch-spread 15   保存した声の普段の代わり（記録に保存した声の普段の行が無いとき、声の高さの範囲の決まりを試す）
+  --self-baseline                  本人の時間の声の高さから、アプリと同じ求め方（中央値・四分位範囲）で声の普段を作って試す
+タイミングの決まりは v1.9.1 から判定に使っていない（criteria.json の voice_self.sync.enabled: false）が、ここでは試すために入れる
 """
 from __future__ import annotations
 
@@ -43,20 +46,25 @@ def parse_span(s: str, t0: float) -> tuple[float, float]:
     return one(a), one(b)
 
 
+def spans(values) -> list[str]:
+    """--self 4-16 --other 35-38,42-51 のように、何度でも・カンマでつないで渡せる"""
+    return [p.strip() for v in (values or []) for p in v.split(",") if p.strip()]
+
+
 def labels(rec: review.Recording, args) -> np.ndarray:
     """各コマ：1＝本人の時間、0＝ほかの人の時間、NaN＝どちらでもない（声が出ていないコマも NaN）"""
     t, t0 = rec.t, float(rec.t[0])
     out = np.full(len(t), np.nan)
-    for s in args.self or []:
+    for s in spans(args.self):
         a, b = parse_span(s, t0)
         out[(t >= a) & (t < b)] = 1
-    for s in args.other or []:
+    for s in spans(args.other):
         a, b = parse_span(s, t0)
         out[(t >= a) & (t < b)] = 0
     f0 = rec.raw["f0_hz"]
-    for spans, v in ((args.self_hz, 1), (args.other_hz, 0)):
-        if spans:
-            lo, hi = (float(x) for x in spans.split("-"))
+    for hz, v in ((args.self_hz, 1), (args.other_hz, 0)):
+        if hz:
+            lo, hi = (float(x) for x in hz.split("-"))
             out[(f0 >= lo) & (f0 <= hi)] = v
     out[~np.isfinite(f0)] = np.nan
     return out
@@ -65,9 +73,8 @@ def labels(rec: review.Recording, args) -> np.ndarray:
 def variant(c: dict, sync: bool, pitch: bool, min_corr: float | None = None) -> dict:
     c = copy.deepcopy(c)
     vc = c["voice_self"]
-    if not sync:
-        vc.pop("sync", None)
-    elif min_corr is not None:
+    vc["sync"]["enabled"] = sync   # 判定には使っていない（v1.9.1〜）が、ここでは試すために入れる
+    if min_corr is not None:
         vc["sync"]["min_corr"] = min_corr
     if not pitch:
         vc.pop("pitch_range", None)
@@ -82,11 +89,12 @@ def rates(rec, c, lab) -> tuple[float | None, float | None, int, int]:
     return (float((vs[s] == 1).mean()) if ns else None, float((vs[o] == 1).mean()) if no else None, ns, no)
 
 
-def with_pitch(rec: review.Recording, mean: float, sd: float) -> review.Recording:
-    """保存した声の普段の行を、記録の始まりに足したもの（試すだけ）"""
+def with_pitch(rec: review.Recording, median: float, spread: float) -> review.Recording:
+    """保存した声の普段の行を、記録の始まりに足したもの（試すだけ）。spread はばらつき（四分位範囲÷1.349）"""
     r = copy.copy(rec)
     row = {"type": "baseline", "t_ms": int(rec.t[0] * 1000), "source": "saved", "compared": True, "part": "voice",
-           "metrics": {"f0_hz": {"n": 300, "mean": mean, "std": sd, "insufficient": False}}}
+           "metrics": {"f0_hz": {"n": 300, "mean": median, "std": spread, "median": median, "iqr": round(spread * 1.349, 1),
+                                 "insufficient": False}}}
     r.all_baselines = [row] + list(rec.all_baselines)
     return r
 
@@ -111,8 +119,10 @@ def main(argv=None) -> int:
     ap.add_argument("--other", action="append", help="ほかの人が話していた時間")
     ap.add_argument("--self-hz", help="本人の声の高さの範囲（例 100-200）で分けて代わりにする")
     ap.add_argument("--other-hz", help="ほかの人の声の高さの範囲（例 250-400）")
-    ap.add_argument("--pitch-mean", type=float)
-    ap.add_argument("--pitch-sd", type=float, default=15.0)
+    ap.add_argument("--pitch-median", type=float, help="保存した声の普段の代わり：声の高さの中央値（Hz）")
+    ap.add_argument("--pitch-spread", type=float, default=15.0, help="そのばらつき（Hz、四分位範囲÷1.349）")
+    ap.add_argument("--self-baseline", action="store_true",
+                    help="本人の時間の声の高さから、アプリと同じ求め方（中央値・四分位範囲）で声の普段を作って試す")
     args = ap.parse_args(argv)
     rec = review.load(Path(args.record))
     c = review.load_criteria(review.HERE / "criteria.json", [])
@@ -120,8 +130,13 @@ def main(argv=None) -> int:
     if not np.isfinite(lab).any():
         print("本人の時間・ほかの人の時間に、声が出ていたコマがありません（--self / --other か --self-hz / --other-hz を渡してください）")
         return 2
-    if args.pitch_mean is not None:
-        rec = with_pitch(rec, args.pitch_mean, args.pitch_sd)
+    if args.self_baseline:
+        rp = review.robust_pitch(rec.raw["f0_hz"][lab == 1])
+        if rp:
+            print(f"本人の時間の声の高さ：中央値 {rp[0]:g}Hz・ばらつき {review.spread_of(rp[1]):.1f}Hz（四分位範囲 {rp[1]:g}Hz）")
+            rec = with_pitch(rec, rp[0], review.spread_of(rp[1]))
+    elif args.pitch_median is not None:
+        rec = with_pitch(rec, args.pitch_median, args.pitch_spread)
     print(f"{rec.path.name}（基準 {c['version']}）")
     print("決まり\t本人を本人と言えた\tほかの人を本人と言ってしまった\t声のコマ（本人 / ほかの人）")
     for r in report(rec, c, lab):

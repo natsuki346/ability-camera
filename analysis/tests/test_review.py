@@ -1150,7 +1150,8 @@ def _voice_mix_record(path, saved_pitch=None, two_faces=False, length=34.0):
     lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "camera": "front", "direction_version": 2})]
     if saved_pitch:
         lines.append(json.dumps({"type": "baseline", "t_ms": t0 + 500, "source": "saved", "compared": True, "part": "voice",
-                                 "metrics": {"f0_hz": {"n": 300, "mean": saved_pitch[0], "std": saved_pitch[1], "insufficient": False},
+                                 "metrics": {"f0_hz": {"n": 300, "mean": saved_pitch[0], "std": saved_pitch[1], "median": saved_pitch[0],
+                                                       "iqr": round(saved_pitch[1] * 1.349, 1), "insufficient": False},
                                              "rms_db": {"n": 300, "mean": -45.0, "std": 4.0, "insufficient": False}}}))
     for k in range(int(length * 30)):
         s = k / 30
@@ -1206,8 +1207,15 @@ class VoiceSyncTest(unittest.TestCase):
         rec, d = self.details("plain", voice_check.variant(self.c, sync=False, pitch=False))
         self.assertGreater(self.rate(rec, d, 22, 32), 0.9)    # v1.8 までの決まりでは、ほかの人の声も本人の声になる
 
-    def test_timing(self):
+    def test_timing_is_not_used_by_default(self):
         rec, d = self.details("plain")
+        self.assertGreater(self.rate(rec, d, 22, 32), 0.9)    # v1.9.1〜：タイミングは判定に使わない
+        self.assertNotIn("timing", set(d.reason))
+        self.assertTrue(np.isfinite(d.corr[np.isfinite(d.values)]).any())   # 相関は求めてレポートに出す
+
+    def test_timing(self):
+        import voice_check
+        rec, d = self.details("plain", voice_check.variant(self.c, sync=True, pitch=False))
         self.assertGreater(self.rate(rec, d, 10.5, 20), 0.95)  # 本人の声は本人
         self.assertLess(self.rate(rec, d, 22, 32), 0.05)       # ほかの人の声は本人と言わない
         other = [d.reason[i] for i in range(len(rec.t)) if 22 <= rec.t[i] - rec.t[0] < 32 and d.values[i] == 0]
@@ -1216,11 +1224,12 @@ class VoiceSyncTest(unittest.TestCase):
     def test_pitch_range(self):
         rec, d = self.details("pitch")
         other = {d.reason[i] for i in range(len(rec.t)) if 22 <= rec.t[i] - rec.t[0] < 32}
-        self.assertEqual(other, {"pitch"})                     # 保存した声の普段（150 ± 3×20Hz）の外
+        self.assertEqual(other, {"pitch"})                     # 保存した声の普段（中央値 150 ± 2.5×20Hz）の外
         self.assertGreater(self.rate(rec, d, 10.5, 20), 0.95)  # 本人の声（130〜170Hz）は範囲の中
 
     def test_two_faces_match(self):
-        rec, d = self.details("two")
+        import voice_check
+        rec, d = self.details("two", voice_check.variant(self.c, sync=True, pitch=False))
         rel = rec.t - rec.t[0]
         m_other = [d.match[i] for i in range(len(rec.t)) if 23 <= rel[i] < 32]
         m_self = [d.match[i] for i in range(len(rec.t)) if 11 <= rel[i] < 20]
@@ -1246,7 +1255,7 @@ class VoiceSyncTest(unittest.TestCase):
         self.assertEqual(code, 0)
         rows = {ln.split("\t")[0]: ln.split("\t") for ln in buf.getvalue().splitlines()[2:]}
         self.assertEqual(rows["口の動きだけ（v1.8 まで）"][2], "100%")
-        self.assertEqual(rows["両方（v1.9）"][2], "0%")
+        self.assertLess(int(rows["両方（v1.9）"][2].rstrip("%")), 10)   # ずれを探すので、たまたま合うことがある（v1.9.1〜）
 
     def test_criteria_match_app(self):
         import re
@@ -1256,6 +1265,109 @@ class VoiceSyncTest(unittest.TestCase):
         self.assertEqual(val("syncWindowS"), vc["sync"]["window_s"])
         self.assertEqual(val("syncMinFrames"), vc["sync"]["min_frames"])
         self.assertEqual(val("syncMinCorr"), vc["sync"]["min_corr"])
-        self.assertEqual(val("pitchRangeK"), vc["pitch_range"]["k_sd"])
-        self.assertEqual(val("pitchStdFloorHz"), vc["pitch_range"]["std_floor_hz"])
+        self.assertEqual(val("pitchRangeK"), vc["pitch_range"]["k_spread"])
+        self.assertEqual(val("pitchSpreadFloorHz"), vc["pitch_range"]["spread_floor_hz"])
+        self.assertEqual(val("voiceSpreadWarnHz"), vc["pitch_range"]["warn_spread_hz"])
+        self.assertIn(f"static let syncEnabled = {'true' if vc['sync']['enabled'] else 'false'}", src)
         self.assertIn(f'static let syncKey = "{vc["sync"]["key"]}"', src)
+
+
+class RobustPitchTest(unittest.TestCase):
+    """声の高さの範囲（v1.9.1〜）：中央値と四分位範囲。外れ値（高い声・低い声）に強い"""
+
+    def test_outliers(self):
+        rng = np.random.default_rng(3)
+        x = list(150 + 10 * rng.standard_normal(300)) + [400.0] * 30 + [80.0] * 30
+        med, iqr = review.robust_pitch(x)
+        self.assertLess(abs(med - 150), 5)
+        self.assertLess(review.spread_of(iqr), 18)          # 平均・標準偏差なら 60Hz を超える
+        self.assertGreater(float(np.std(x, ddof=1)), 60)
+
+    def test_old_saved_voice_is_not_used(self):
+        """中央値の無い保存した声の普段（v1.9 まで）は、声の高さの範囲に使わない"""
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "v.jsonl"
+            _voice_mix_record(p, saved_pitch=(150.0, 15.0))
+            lines = p.read_text(encoding="utf-8").splitlines()
+            row = json.loads(lines[1])
+            del row["metrics"]["f0_hz"]["median"], row["metrics"]["f0_hz"]["iqr"]
+            lines[1] = json.dumps(row)
+            p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            rec = review.load(p)
+        self.assertEqual(review.pitch_ranges(rec), [])
+
+    def test_same_quantile_as_app(self):
+        import shutil
+        import subprocess
+        if not shutil.which("swiftc"):
+            self.skipTest("swiftc がありません")
+        app = review.HERE.parent / "ios"
+        src = [app / "AbilityCam" / n for n in ("Baseline.swift", "DiffEngine.swift", "Pitch.swift")] + [app / "Tools" / "VoiceCarryCheck" / "main.swift"]
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "voicecarry"
+            subprocess.run(["swiftc", "-o", str(exe), *map(str, src)], check=True, capture_output=True)
+            out = subprocess.run([str(exe), "--pitch", "151.2", "149.8", "400", "80", "155.5", "147.1", "152.0"],
+                                 capture_output=True, text=True).stdout.split()
+        self.assertEqual([float(v) for v in out], list(review.robust_pitch([151.2, 149.8, 400, 80, 155.5, 147.1, 152.0])))
+
+    def test_wide_saved_voice_note(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "w.jsonl"
+            _voice_mix_record(p, saved_pitch=(151.0, 61.0))
+            c = review.load_criteria(review.HERE / "criteria.json", [])
+            q = review.quality(review.analyze(review.load(p), c), calm=False)
+        (_, sp, robust), = q["voice"]["saved_spread"]
+        self.assertTrue(robust)
+        self.assertGreater(sp, c["voice_self"]["pitch_range"]["warn_spread_hz"])
+
+
+class VoiceCheckSpansTest(unittest.TestCase):
+    def test_comma_spans(self):
+        import voice_check
+        self.assertEqual(voice_check.spans(["35-38,42-51", "60-61"]), ["35-38", "42-51", "60-61"])
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "v.jsonl"
+            _voice_mix_record(p)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = voice_check.main([str(p), "--self", "10-15,15-20", "--other", "22-27,27-32", "--self-baseline"])
+        self.assertEqual(code, 0)
+        self.assertIn("本人の時間の声の高さ：中央値", buf.getvalue())
+
+
+class AudioLagTest(unittest.TestCase):
+    """映像のコマごとの声の大きさ（type: "audio"、v1.9.1〜）で、口の開きとのずれ（±0.2秒）を探して相関を取る"""
+
+    def write(self, d, lag):
+        import json
+        import math
+        t0 = 1_800_000_000_000
+        lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "direction_version": 2})]
+        for k in range(10 * 30):
+            s = k / 30
+            jaw = 0.15 + 0.08 * math.sin(2 * math.pi * 2.5 * s)
+            lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(s * 1000), "face": True, "yaw_deg": 0.0,
+                                     "bs": {"jawOpen": round(jaw, 3), "mouthFunnel": round(jaw, 3)}, "rms_db": -45.0, "f0_hz": 150.0}))
+        for b in range(100):   # 0.1秒ごとの塊を、1/30 秒ずつ3つに区切る。声は口より lag 秒あとに大きくなる
+            start = b * 0.1
+            db = [round(-45 + 6 * math.sin(2 * math.pi * 2.5 * (start + k / 30 - lag)), 1) for k in range(3)]
+            lines.append(json.dumps({"type": "audio", "t_ms": t0 + round(start * 1000), "block_ms": 33.33, "rms_db": db}))
+        p = Path(d) / "lag.jsonl"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def test_lag_found(self):
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            rec = review.load(self.write(d, 0.13))
+        self.assertIsNotNone(rec.audio_t)
+        corr, _, lag = review.sync_corr(rec, c["voice_self"])
+        self.assertGreater(np.nanmedian(corr[60:]), 0.9)
+        self.assertAlmostEqual(float(np.nanmedian(lag[60:])), 0.133, delta=0.04)
+        c0 = review.load_criteria(review.HERE / "criteria.json", [])
+        c0["voice_self"]["sync"]["lag_s"] = 0
+        corr0, _, _ = review.sync_corr(rec, c0["voice_self"])
+        self.assertLess(np.nanmedian(corr0[60:]), np.nanmedian(corr[60:]) - 0.1)   # ずれを探さないと低い

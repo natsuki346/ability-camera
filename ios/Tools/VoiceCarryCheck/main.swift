@@ -2,6 +2,13 @@
 // analysis/tests の VoiceCarryTest が swiftc でビルドして動かす（アプリには入らない）。合っていれば「OK」と出して 0 を返す
 import Foundation
 
+// --pitch 値… を渡すと、声の高さの中央値と四分位範囲（DiffCriteria.robustPitch、v1.9.1〜）を出す（review.robust_pitch と比べる）
+if CommandLine.arguments.count > 1, CommandLine.arguments[1] == "--pitch" {
+    let r = DiffCriteria.robustPitch(CommandLine.arguments.dropFirst(2).compactMap(Double.init))!
+    print(r.median, r.iqr)
+    exit(0)
+}
+
 var bad: [String] = []
 func check(_ ok: Bool, _ what: String) { if !ok { bad.append(what) } }
 

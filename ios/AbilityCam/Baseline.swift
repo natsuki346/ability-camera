@@ -127,9 +127,10 @@ struct VoicePartial: Codable, Equatable {
     var stats: [String: Welford]         // rms_db / f0_hz
     var sessions: Int                    // 本人の声を数えたセッションの数
     var days: [String]                   // 数えた日（yyyy-MM-dd、この端末の時刻）
+    var f0Values: [Double]? = nil        // 数えた声の高さそのもの（v1.9.1〜。中央値・四分位範囲を求めるため。v1.9 までに途中まで集めたものには無い）
 
     enum CodingKeys: String, CodingKey {
-        case startedMs = "started_ms", updatedMs = "updated_ms", validS = "valid_s", stats, sessions, days
+        case startedMs = "started_ms", updatedMs = "updated_ms", validS = "valid_s", stats, sessions, days, f0Values = "f0_values"
     }
 
     func expired(now: Int64) -> Bool {

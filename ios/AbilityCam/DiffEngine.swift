@@ -210,6 +210,21 @@ enum BaselinePart: String {
     case all, face, voice
 
     static func of(_ s: String?) -> BaselinePart { s.flatMap(BaselinePart.init(rawValue:)) ?? .all }
+
+    /// 記録の change のキー（"brow_down:above"・"eyes_closed:closed"・"rms_db:below"）がどの普段のものか。声が出た（voice_on）は普段と関係ないので nil
+    static func ofChangeKey(_ key: String) -> BaselinePart? {
+        let name = String(key.split(separator: ":").first ?? "")
+        if name == DiffTarget.eyesClosedKey { return .face }
+        return Metric(rawValue: name).map { $0.isFace ? .face : .voice }
+    }
+
+    /// 「普段を取り直す」（baseline_restart）のあとも続いているとみなす change のキー（v1.9.3〜）。
+    /// 違いの数（sessions.jsonl の segments）は、取り直した部分のキーだけを数え直す（表情だけ取り直しても、続いている声の違いを2回数えない）。
+    /// part が all（両方）なら全部数え直す（今まで通り）。sessions.py の keys_after_restart と同じ
+    static func keysAfterRestart(_ keys: [String], part: BaselinePart) -> [String] {
+        guard part != .all else { return [] }
+        return keys.filter { ofChangeKey($0) != part }
+    }
     func covers(_ m: Metric) -> Bool { self == .all || (self == .face) == m.isFace }
 }
 

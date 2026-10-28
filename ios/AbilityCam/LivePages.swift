@@ -131,6 +131,10 @@ struct NowPage: View {
             if let v = model.voiceSec {
                 Text("声の高さ：普段を集めています（本人の声 \(v)/\(Int(DiffCriteria.voiceBaselineS))秒）")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+                if model.voiceRetaking {   // 声の高さの範囲を外している（v1.9.3〜）
+                    Text("声の普段を集め直しています。この間は口の動きだけで本人の声を数えます")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(2).minimumScaleFactor(0.7)
+                }
                 if let w = model.voiceWait {   // 進み具合が3秒増えていないとき（v1.6.2〜）
                     Text("声の普段が増えない理由：\(w)").font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
                 }

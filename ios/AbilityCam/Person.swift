@@ -46,6 +46,7 @@ struct Person: Codable, Identifiable, Equatable {
     var savedByCamera: [String: SavedBaseline] = [:]   // カメラ（wide / ultra_wide / front）→ 表情の普段
     var voice: SavedVoice?                       // 声の普段（どのカメラでも使う）
     var voicePartial: VoicePartial?              // 途中まで集めた声の普段（v1.7〜。声の普段ができたら消す）
+    var voiceRetakePending = false               // 記録していないときに「声の普段を取り直す」を押した：次のセッションで集め直す（v1.9.3〜）
 
     /// 画面に出す名前（v1.3 から「さん」を付けない：「自分」「姉」）
     var displayName: String { name }
@@ -55,7 +56,7 @@ struct Person: Codable, Identifiable, Equatable {
 
     init(id: String, name: String) { self.id = id; self.name = name }
 
-    enum CodingKeys: String, CodingKey { case id, name, savedByCamera = "saved_by_camera", voice, saved, voicePartial = "voice_partial" }
+    enum CodingKeys: String, CodingKey { case id, name, savedByCamera = "saved_by_camera", voice, saved, voicePartial = "voice_partial", voiceRetakePending = "voice_retake_pending" }
 
     /// v1.6 までの persons.json（saved が1つ）は、そのカメラの普段として移す。声の普段は人ごとに移す
     init(from decoder: Decoder) throws {
@@ -65,6 +66,7 @@ struct Person: Codable, Identifiable, Equatable {
         savedByCamera = try c.decodeIfPresent([String: SavedBaseline].self, forKey: .savedByCamera) ?? [:]
         voice = try c.decodeIfPresent(SavedVoice.self, forKey: .voice)
         voicePartial = try c.decodeIfPresent(VoicePartial.self, forKey: .voicePartial)
+        voiceRetakePending = try c.decodeIfPresent(Bool.self, forKey: .voiceRetakePending) ?? false
         if var old = try c.decodeIfPresent(SavedBaseline.self, forKey: .saved) {
             if voice == nil { voice = old.voice }
             old.voice = nil
@@ -79,6 +81,7 @@ struct Person: Codable, Identifiable, Equatable {
         try c.encode(savedByCamera, forKey: .savedByCamera)
         try c.encodeIfPresent(voice, forKey: .voice)
         try c.encodeIfPresent(voicePartial, forKey: .voicePartial)
+        if voiceRetakePending { try c.encode(true, forKey: .voiceRetakePending) }
     }
 }
 
@@ -99,14 +102,21 @@ final class PersonStore: ObservableObject {
     /// 撮る側が、記録中ならその場で声の普段を集め直し始める（始めたら true）。AnalysisModel が入れる
     var onVoiceRestart: ((String) -> Bool)?
 
-    /// 「声の普段を取り直す」：保存した声の普段と途中まで集めた分を消し、記録中でその人を選んでいれば、その場で集め直し始める。
-    /// 返り値：その場で始めたか（false なら次に記録を始めたときから）
+    /// 「声の普段を取り直す」（v1.9.3〜）：記録中でその人を選んでいれば、その場で集め直し始める。そうでなければ、次のセッションで集め直す。
+    /// どちらも、本人の声が10秒たまって保存し直すまで、保存した古い声の普段は消さない（途中で閉じたら古い声の普段のまま。「いま」の「声だけ」と同じ）。
+    /// 返り値：その場で始めたか
     @discardableResult
     func restartVoice(_ id: String) -> Bool {
-        setVoice(id, nil); setVoicePartial(id, nil)
         let live = onVoiceRestart?(id) ?? false
         voiceRestarting = live ? id : nil
+        setVoiceRetakePending(id, !live)
         return live
+    }
+
+    func setVoiceRetakePending(_ id: String, _ on: Bool) {
+        guard let i = people.firstIndex(where: { $0.id == id }), people[i].voiceRetakePending != on else { return }
+        people[i].voiceRetakePending = on
+        save()
     }
 
     private static var url: URL {
@@ -271,7 +281,6 @@ struct PersonEditView: View {
     @ObservedObject var store = PersonStore.shared
     @State private var name = ""
     @State private var confirmDelete = false
-    @State private var voiceRetakeLater = false   // 記録していないときに取り直した（次に記録を始めたときから）
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -305,18 +314,22 @@ struct PersonEditView: View {
                     if v.spreadWide {
                         Text("声の普段のばらつきが大きいです（取り直せます）").foregroundStyle(ContentView.navyText)
                     }
-                    // 取り直す：保存した声の普段と途中まで集めた分を消し、記録中ならその場で集め直し始める（v1.9.2〜）
-                    Button("声の普段を取り直す") { voiceRetakeLater = !store.restartVoice(id) }
+                    // 取り直す：記録中ならその場で、そうでなければ次のセッションで集め直す。10秒たまって保存し直すまで、この声の普段は残す（v1.9.3〜）
+                    if store.voiceRestarting == id {
+                        Text("声の普段を集め直しています（本人の声が10秒たまったら保存し直します）").foregroundStyle(ContentView.navyText)
+                    } else if p?.voiceRetakePending == true {
+                        Text("次に記録を始めたときから、声の普段を集め直します").foregroundStyle(.secondary)
+                    } else {
+                        Button("声の普段を取り直す") { store.restartVoice(id) }
+                    }
                     Button("声の普段を消す") { store.setVoice(id, nil) }
                 } else if store.voiceRestarting == id {
                     Text("声の普段を集め直しています").foregroundStyle(ContentView.navyText)
-                } else if voiceRetakeLater {
-                    Text("次に記録を始めたときから、声の普段を集め直します").foregroundStyle(.secondary)
                 } else {
                     Text("ありません（本人の声が10秒たまると、自動で保存します）").foregroundStyle(.secondary)
                 }
             } header: { Text("保存した声の普段（どのカメラでも使う）") } footer: {
-                Text("「取り直す」と、保存した声の普段と途中まで集めた声を消して集め直します（記録中でこの人を選んでいればその場で、そうでなければ次に記録を始めたときから）")
+                Text("「取り直す」と、記録中でこの人を選んでいればその場で、そうでなければ次に記録を始めたときから声の普段を集め直します。本人の声が10秒たまって保存し直すまで、今の声の普段は残します（途中で閉じたら今の声の普段のまま）")
             }
             Section {
                 Button("この人を消す") { confirmDelete = true }

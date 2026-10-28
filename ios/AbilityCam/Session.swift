@@ -31,7 +31,7 @@ struct SessionStats {
         prev = (tMs, face, facing)
     }
 
-    mutating func addEvent(tMs: Int64, kind: String, value: [String]?) {
+    mutating func addEvent(tMs: Int64, kind: String, value: [String]?, part: String? = nil) {
         see(tMs)
         switch kind {
         case "mark": marks += 1
@@ -41,7 +41,9 @@ struct SessionStats {
             let keys = Set((value ?? []).filter { !$0.hasPrefix(DiffTarget.voiceOnKey + ":") })
             segments += keys.subtracting(activeKeys).count
             activeKeys = keys
-        case "baseline_restart": activeKeys = []
+        case "baseline_restart":
+            // 取り直した部分の違いだけを数え直す（v1.9.3〜。part: "face" / "voice"。無ければ両方。review.py の restart_times と同じ見分け方）
+            activeKeys = Set(BaselinePart.keysAfterRestart(Array(activeKeys), part: BaselinePart.of(part)))
         default: break
         }
     }
@@ -162,7 +164,7 @@ enum SessionStore {
             guard let t = r.tMs else { return }
             switch r.type {
             case "frame": stats.addFrame(tMs: t, face: r.face ?? false, yawDeg: r.yawDeg)
-            case "event": stats.addEvent(tMs: t, kind: r.kind ?? "", value: r.value)
+            case "event": stats.addEvent(tMs: t, kind: r.kind ?? "", value: r.value, part: r.part)
             default: break
             }
         }
@@ -188,9 +190,10 @@ enum SessionStore {
         let yawDeg: Double?
         let kind: String?
         let value: [String]?
+        let part: String?       // baseline_restart：face / voice（v1.7〜・v1.9.2〜）
 
         enum CodingKeys: String, CodingKey {
-            case type, face, kind, value, tMs = "t_ms", startedAtMs = "started_at_ms", yawDeg = "yaw_deg"
+            case type, face, kind, value, part, tMs = "t_ms", startedAtMs = "started_at_ms", yawDeg = "yaw_deg"
         }
 
         init(from decoder: Decoder) throws {
@@ -201,6 +204,7 @@ enum SessionStore {
             face = try c.decodeIfPresent(Bool.self, forKey: .face)
             yawDeg = try c.decodeIfPresent(Double.self, forKey: .yawDeg)
             kind = try c.decodeIfPresent(String.self, forKey: .kind)
+            part = try? c.decodeIfPresent(String.self, forKey: .part)
             if let a = try? c.decodeIfPresent([String].self, forKey: .value) { value = a }
             else if let s = try? c.decodeIfPresent(String.self, forKey: .value) { value = [s] }
             else { value = nil }

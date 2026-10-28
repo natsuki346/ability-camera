@@ -46,6 +46,7 @@ final class AnalysisModel: ObservableObject {
     @Published var baselineEyesClosedLong = false   // 普段の間に目を閉じていた時間が、数えた時間の2割を超えた（v1.4〜）
     @Published var voiceSec: Int?             // 声の普段を集めている：本人の声の秒数（画面に出すときだけ。v1.6〜）
     @Published var otherVoice = false         // 本人以外の声（と言えない声）だけが入っている（直近1秒）
+    @Published var voiceRetaking = false      // 声の普段だけを取り直している（v1.9.3〜：この間は声の高さの範囲を使わず、口の動きだけで本人の声を数える）
     @Published var voiceSpreadWide = false    // 比べている保存した声の普段の声の高さのばらつきが大きい（v1.9.1〜、取り直せます）
     @Published var voiceWait: String?         // 声の普段の進み具合が3秒増えていない理由（v1.6.2〜、VoiceWaitTracker）
     @Published var pitchRatio: Double?        // 「数字」：声の高さが取れた割合（直近10秒、声が出ていたときのうち。v1.6.2〜）
@@ -229,6 +230,11 @@ final class AnalysisModel: ObservableObject {
         applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
         running = true
         sessionStartedAt = Date()
+        // 記録していないときに設定の「人」で「声の普段を取り直す」を押していたら、このセッションで集め直す（1回だけ。途中で閉じたら古い声の普段のまま）
+        if let p = PersonStore.shared.selected, p.voiceRetakePending {
+            PersonStore.shared.setVoiceRetakePending(p.id, false)
+            if restartVoice() { PersonStore.shared.voiceRestarting = p.id }
+        }
         status = "記録しています: \(logger.fileName ?? "-")" + note
         UIApplication.shared.isIdleTimerDisabled = true
     }
@@ -250,7 +256,7 @@ final class AnalysisModel: ObservableObject {
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false
-            voiceWait = nil; voiceSpreadWide = false
+            voiceWait = nil; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false
             PersonStore.shared.voiceRestarting = nil
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
@@ -428,15 +434,19 @@ final class AnalysisModel: ObservableObject {
         var e = EventRecord(tMs: Self.nowMs(), kind: "baseline_restart", value: nil)
         e.part = BaselinePart.voice.rawValue
         logger.write(e)
+        lastChange = lastChange.map { (BaselinePart.keysAfterRestart($0.diffs, part: .voice), $0.faceReadable) }   // 声の違いだけ数え直す（v1.9.3〜）
         engine.setBaseline(nil, part: .voice)          // 声は集め直すまで比べない
+        // 声の高さの範囲は外す（古い声の普段の範囲は、取り直す理由そのもの）。この間は口の動き（と顔）だけで本人の声を決める。
+        // 撮る側の「いま」に「声の普段を集め直しています。この間は口の動きだけで本人の声を数えます」と出す（voiceRetaking）
         voiceBox.setPitchRange(median: nil, iqr: nil, fromT: 0)
         voiceCarry = nil                                  // 前のセッションまでに途中まで集めた分も使わない
         voiceStats = [:]; voiceValidS = 0; voicePrevT = nil; voiceStartMs = Self.nowMs(); voiceDone = false
         voiceSessionFirstMs = nil; voiceSavedSec = -1; voiceF0Values = []; voiceSpreadWide = false
         voiceSec = 0; comparingVoice = nil; usedVoice = nil; todayVoice = nil
         voiceWaitTracker.reset(); voiceWait = nil
-        voiceRetake = true
+        voiceRetake = true; voiceRetaking = true
         voiceCarryOwner = PersonStore.shared.selected?.id
+        // 取り直しは、10秒たまって保存し直すまで、保存した古い声の普段を残す（途中の分は saveVoicePartial しない。閉じたら次のセッションは古い声の普段のまま）
         publishBaseline(tMs: Self.nowMs())   // 声の「データ不足」を消して、集めている表示にする
         showMessage("声の普段を集め直しています")
         return true
@@ -523,7 +533,8 @@ final class AnalysisModel: ObservableObject {
         baselineValidS = 0; baselineLastT = nil; lastValidHost = -.infinity
         baselineTarget = Self.selectedBaselineSeconds
         baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []
-        lastChange = nil
+        // 違いの数：取り直した部分の違いだけを数え直す（v1.9.3〜、SessionStats と同じ）。表情だけなら、続いている声の違いは数え直さない
+        lastChange = keepVoice ? lastChange.map { (BaselinePart.keysAfterRestart($0.diffs, part: .face), $0.faceReadable) } : nil
         squintPending = []
         engine.setBaseline(nil, part: keepVoice ? .face : .all)   // 普段が無い間は比べない
         engine.finished = []
@@ -536,9 +547,10 @@ final class AnalysisModel: ObservableObject {
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
         usedFace = nil
         guard !keepVoice else { return }
+        voiceBox.setPitchRange(median: nil, iqr: nil, fromT: 0)   // 声も取り直すなら、声の高さの範囲も外す（v1.9.3〜、review.py の pitch_ranges と同じ）
         // 声の普段も、表情とは別に初めから集め直す（v1.6〜）。前のセッションまでに途中まで集めた分（voiceCarry）は残す（v1.7〜）
         voiceStats = [:]; voiceValidS = 0; voicePrevT = nil; voiceStartMs = Self.nowMs(); voiceDone = false
-        voiceSessionFirstMs = nil; voiceSavedSec = -1; voiceF0Values = []; voiceSpreadWide = false; voiceRetake = false
+        voiceSessionFirstMs = nil; voiceSavedSec = -1; voiceF0Values = []; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false
         voiceSec = Int(voiceCarry?.validS ?? 0); comparingVoice = nil; usedVoice = nil; todayVoice = nil
         voiceWaitTracker.reset(); voiceWait = nil
     }
@@ -599,7 +611,8 @@ final class AnalysisModel: ObservableObject {
 
     /// 選んだ人に、途中まで集めた声の普段を保存する（声の普段がまだ無い人だけ。集め終えたら setVoice で消える）
     private func saveVoicePartial() {
-        guard !voiceDone, let owner = voiceCarryOwner, let p = PersonStore.shared.selected, p.id == owner, p.voice == nil else { return }
+        // 声の普段を取り直している間は、途中の分を保存しない（v1.9.3〜：閉じたら捨てて、次のセッションは古い声の普段のまま）
+        guard !voiceDone, !voiceRetake, let owner = voiceCarryOwner, let p = PersonStore.shared.selected, p.id == owner, p.voice == nil else { return }
         PersonStore.shared.setVoicePartial(owner, voicePartialNow())
     }
 
@@ -832,7 +845,7 @@ final class AnalysisModel: ObservableObject {
             PersonStore.shared.setVoice(p.id, v)
             showMessage("\(p.displayName)の声の普段を\(replaced ? "保存し直しました" : "保存しました")")
         }
-        voiceRetake = false
+        voiceRetake = false; voiceRetaking = false
     }
 
     /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない

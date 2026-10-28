@@ -206,7 +206,7 @@ final class SessionLogger {
             case .list(let a): v = a
             case nil: v = nil
             }
-            stats.addEvent(tMs: e.tMs, kind: e.kind, value: v)
+            stats.addEvent(tMs: e.tMs, kind: e.kind, value: v, part: e.part)
         }
     }
 

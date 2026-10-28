@@ -30,6 +30,19 @@ BAND = "#DCE3EA"
 
 # ---------------------------------------------------------------- 読み込み
 
+
+FACE_KEYS = {"mouth_smile", "brow_down", "eye_squint", "jaw_open", "eyes_closed"}
+VOICE_KEYS = {"rms_db", "f0_hz"}
+
+
+def keys_after_restart(active: set, part: str | None) -> set:
+    """「普段を取り直す」（baseline_restart）のあとも続いているとみなす change のキー。part: "face" は表情だけ、"voice" は声だけ数え直す。
+    無ければ両方（今まで通り全部数え直す）。声が出た（voice_on）は違いの数に入れないので関係ない"""
+    if part not in ("face", "voice"):
+        return set()
+    drop = FACE_KEYS if part == "face" else VOICE_KEYS
+    return {k for k in active if k.split(":")[0] not in drop}
+
 def load_sessions(path: Path) -> list[dict]:
     """新しい順。同じファイルの要約が2つあれば後のものを使う"""
     out: dict[str, dict] = {}
@@ -103,7 +116,8 @@ def summarize_record(path: Path) -> dict:
                     segments += len(keys - active)
                     active = keys
                 elif kind == "baseline_restart":
-                    active = set()
+                    # 取り直した部分の違いだけを数え直す（v1.9.3〜。アプリの BaselinePart.keysAfterRestart と同じ）
+                    active = keys_after_restart(active, r.get("part"))
 
     start = started if started is not None else (first or 0)
     end = max(last if last is not None else start, start)

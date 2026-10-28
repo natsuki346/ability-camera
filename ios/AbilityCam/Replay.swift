@@ -187,12 +187,17 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var voiceTracker = VoiceSelfTracker()
         // 保存した声の普段の行（source: saved、声を含む行）の時刻と f0 の平均・標準偏差（データ不足なら使わない）
         // 中央値の無い行（v1.9 までに保存した声の普段）は使わない（review.py の pitch_ranges と同じ）
-        let pitchRanges: [(t: Double, median: Double, iqr: Double)] = baselines.compactMap { b in
+        // 声も取り直したとき（baseline_restart の part が face でないもの）は、範囲を外す（median が nil、v1.9.3〜）
+        var pitchRanges: [(t: Double, median: Double?, iqr: Double?)] = baselines.compactMap { b in
             guard (b["source"] as? String) == "saved", BaselinePart.of(b["part"] as? String) != .face, let bt = ms(b),
                   let st = (b["metrics"] as? [String: [String: Any]])?[Metric.f0Hz.rawValue],
                   (st["insufficient"] as? Bool) != true, let m = (st["median"] as? NSNumber)?.doubleValue else { return nil }
             return (bt, m, (st["iqr"] as? NSNumber)?.doubleValue ?? 0)
-        }.sorted { $0.t < $1.t }
+        }
+        for e in evs where e["kind"] as? String == "baseline_restart" && BaselinePart.of(e["part"] as? String) != .face {
+            pitchRanges.append((ms(e)!, nil, nil))
+        }
+        pitchRanges.sort { $0.t < $1.t }
         var pi = 0
         var detail: [(t: Double, voiceSelf: Bool, reason: String?, corr: Double?, corrOther: Double?, match: String?)] = []
         var selfS = 0.0, otherS = 0.0

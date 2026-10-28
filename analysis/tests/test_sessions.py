@@ -94,3 +94,32 @@ class SummarizeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RestartPartTest(unittest.TestCase):
+    """baseline_restart の part（v1.9.3〜）：取り直した部分の違いだけを数え直す（アプリの BaselinePart.keysAfterRestart と同じ）"""
+
+    def count(self, part):
+        import json
+        import tempfile
+        t0 = 1_800_000_000_000
+        rows = [{"schema": "ability-cam.ios.v0.2", "started_at_ms": t0},
+                {"type": "frame", "t_ms": t0, "face": True},
+                {"type": "event", "t_ms": t0 + 1000, "kind": "change", "value": ["brow_down:above", "rms_db:above"]},
+                {"type": "event", "t_ms": t0 + 2000, "kind": "baseline_restart", "value": None, **({"part": part} if part else {})},
+                {"type": "event", "t_ms": t0 + 3000, "kind": "change", "value": ["brow_down:above", "rms_db:above"]},
+                {"type": "frame", "t_ms": t0 + 4000, "face": True}]
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ability-cam-x.jsonl"
+            p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            return sessions.summarize_record(p)["segments"]
+
+    def test_parts(self):
+        self.assertEqual(self.count(None), 4)      # 両方：全部数え直す（今まで通り）
+        self.assertEqual(self.count("face"), 3)    # 表情だけ：眉だけ数え直し、続いている声の違いは数えない
+        self.assertEqual(self.count("voice"), 3)   # 声だけ：声だけ数え直す
+
+    def test_keys(self):
+        self.assertEqual(sessions.keys_after_restart({"eyes_closed:closed", "f0_hz:below", "voice_on:on"}, "face"),
+                         {"f0_hz:below", "voice_on:on"})
+        self.assertEqual(sessions.keys_after_restart({"eyes_closed:closed", "f0_hz:below"}, "voice"), {"eyes_closed:closed"})

@@ -1409,3 +1409,28 @@ class VoiceRestartTest(unittest.TestCase):
         self.assertTrue((a.vbidx[-10:] >= 0).all())
         self.assertTrue((a.bidx[-10:] < 0).all())
         self.assertIn("rms_db", [s.metric for s in a.segments])
+
+
+class PitchRangeRestartTest(unittest.TestCase):
+    """声も取り直したら（baseline_restart、part が face でない、v1.9.3〜）、そこから声の高さの範囲を外す（アプリと同じ）"""
+
+    def test_cleared(self):
+        import json
+        import check_app
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "r.jsonl"
+            _voice_mix_record(p, saved_pitch=(150.0, 15.0))
+            t0 = review.load(p).t[0]
+            for part, want in (("voice", False), ("face", True), (None, False)):
+                lines = p.read_text(encoding="utf-8").splitlines()
+                e = {"type": "event", "t_ms": int(t0 * 1000) + 21000, "kind": "baseline_restart", "value": None}
+                if part:
+                    e["part"] = part
+                q = Path(d) / f"r_{part}.jsonl"
+                q.write_text("\n".join(lines + [json.dumps(e)]) + "\n", encoding="utf-8")
+                rec = review.load(q)
+                det = review.voice_self_details(rec, c, review.face_valid(rec, c), use_recorded=False)
+                pitch = any(det.reason[i] == "pitch" for i in range(len(rec.t)) if 22 <= rec.t[i] - t0 < 32)
+                self.assertEqual(pitch, want, part)
+                self.assertEqual(check_app.compare_voice(q, check_app.build(), c), [], part)

@@ -817,7 +817,7 @@ def sync_corr(rec: Recording, vc: dict, only: np.ndarray | None = None) -> tuple
 
 
 def pitch_ranges(rec: Recording) -> list[tuple[float, float, float]]:
-    """保存した声の普段の行（source: saved、声を含む行）の (時刻, f0 の中央値, ばらつき＝四分位範囲÷1.349)。アプリはこの行の時刻のコマから使う。
+    """保存した声の普段の行（source: saved、声を含む行）の (時刻, f0 の中央値, ばらつき＝四分位範囲÷1.349)。声も取り直した時刻は (時刻, None, None)。アプリはこの行の時刻のコマから使う。
     中央値の無い行（v1.9 までに保存した声の普段）は使わない（平均・標準偏差は外れ値に弱いため、v1.9.1〜）"""
     out = []
     for b in rec.all_baselines:
@@ -827,7 +827,9 @@ def pitch_ranges(rec: Recording) -> list[tuple[float, float, float]]:
         if st.get("insufficient") is True or st.get("median") is None:
             continue
         out.append((b["t_ms"] / 1000, float(st["median"]), spread_of(float(st.get("iqr") or 0))))
-    return sorted(out)
+    # 声も取り直したとき（part が face でない baseline_restart、v1.9.3〜）は、そこから範囲を外す（アプリと同じ）
+    out += [(t, None, None) for t in restart_times(rec, "voice")]
+    return sorted(out, key=lambda x: x[0])
 
 
 @dataclass
@@ -868,7 +870,7 @@ def voice_self_details(rec: Recording, c: dict, fvalid: np.ndarray, use_recorded
         f0 = rec.raw["f0_hz"]
         for i in range(n):
             while ri < len(ranges) and ranges[ri][0] <= rec.t[i]:
-                cur = ranges[ri]
+                cur = ranges[ri] if ranges[ri][1] is not None else None
                 ri += 1
             if not voiced[i]:
                 continue

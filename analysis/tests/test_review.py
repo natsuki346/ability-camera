@@ -707,7 +707,73 @@ class AppMatchTest(unittest.TestCase):
         import check_app
         c = review.load_criteria(review.HERE / "criteria.json", [])
         exe = check_app.build()
-        for p, n in ((FIXTURE, 5), (EYES_FIXTURE, 5)):
+        for p, n in ((FIXTURE, 5), (EYES_FIXTURE, 5), (VOICE_FIXTURE, 2)):
             diffs, count = check_app.compare(p, exe, c)
             self.assertEqual(diffs, [], p.name)
             self.assertEqual(count, n)
+
+
+VOICE_FIXTURE = HERE / "fixture_voice.jsonl"
+
+
+class VoiceSelfTest(unittest.TestCase):
+    """本人の声（v1.6〜）：声の違いは本人の声のコマだけで判定し、声の普段は本人の声が10秒たまったら作る"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = review.load_criteria(review.HERE / "criteria.json", [])
+        cls.rec = review.load(VOICE_FIXTURE)
+        cls.a = review.analyze(cls.rec, cls.c)
+
+    def sec(self, i):
+        return round(float(self.rec.t[i]) - T0, 3)
+
+    def test_criteria(self):
+        vc = self.c["voice_self"]
+        self.assertEqual((vc["keys"], vc["window_s"], vc["min_range"]), (["jawOpen", "mouthClose", "mouthFunnel", "mouthPucker"], 0.3, 0.04))
+        self.assertEqual(self.c["voice_baseline"]["target_s"], 10.0)
+
+    def test_computed_matches_recorded(self):
+        rec = review.load(VOICE_FIXTURE)
+        rec.voice_self_rec = None                                   # 記録の値を使わずに決め直す
+        got = review.voice_self_values(rec, self.c, review.face_valid(rec, self.c))
+        want = self.rec.voice_self_rec
+        same = (np.isnan(got) & np.isnan(want)) | (got == want)
+        self.assertTrue(same.all())
+        self.assertEqual(int((want == 0).sum()), 12 * 30)  # 本人以外の声 10秒 ＋ 横向き 2秒
+
+    def test_segments_only_self_voice(self):
+        got = [(s.metric, s.sign, self.sec(s.i0)) for s in self.a.segments]
+        self.assertEqual(got, [("f0_hz", 1, 50.0), ("rms_db", 1, 80.0)])   # 本人以外の声（12–20・60–62）と横向き（70–72）は区間なし
+        rows = review.segment_rows(self.a)
+        self.assertEqual(rows[0]["普段の平均"], 200.0)                         # 声の普段の行（part: voice）を使う
+
+    def test_voice_baseline_rows(self):
+        self.assertEqual([b.get("part") for b in self.rec.baselines], ["face", "voice"])
+        rebuilt = review.rebuild_voice_baselines(self.rec, self.c)
+        app = self.rec.baselines[1]
+        self.assertEqual(len(rebuilt), 1)
+        self.assertEqual(rebuilt[0]["t_ms"], app["t_ms"])                   # 本人の声が10秒たまった所（34.97秒）
+        self.assertEqual(rebuilt[0]["metrics"], app["metrics"])
+        self.assertTrue(np.isnan(self.a.z["f0_hz"][int(np.searchsorted(self.rec.t, T0 + 30))]))   # 集めている間は比べない
+        both = review.rebuild_baselines(self.rec, 10.0, self.c)
+        self.assertEqual(sorted(b.get("part") for b in both), ["face", "voice"])
+
+    def test_quality_and_report(self):
+        q = review.quality(self.a, False)
+        self.assertAlmostEqual(q["voice"]["self_s"], 16.0, delta=0.1)       # 25–37・50–52・80–82
+        self.assertAlmostEqual(q["voice"]["other_s"], 12.0, delta=0.1)      # 12–20・60–62・横向きの 70–72
+        self.assertTrue(q["voice"]["recorded"])
+        with tempfile.TemporaryDirectory() as d:
+            review.main([str(VOICE_FIXTURE), "--out-dir", d])
+            doc = (Path(d) / "fixture_voice.html").read_text(encoding="utf-8")
+        self.assertIn("本人の声の時間 / 本人の声と言えない声の時間", doc)
+        self.assertIn("声：本人の声のコマ", doc)
+        self.assertIn("本人の声のコマだけで判定する", doc)
+
+    def test_old_record_uses_rule(self):
+        # voice_self の無い記録（fixture_basic）は決め直す：口が動いている声（70–71.5・80–81.5）だけ本人の声
+        rec = review.load(FIXTURE)
+        a = review.analyze(rec, self.c)
+        on = [self_t for self_t in (70.5, 80.5, 30.0) if a.voice_self[int(np.searchsorted(rec.t, T0 + self_t))] == 1]
+        self.assertEqual(on, [70.5, 80.5])

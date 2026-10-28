@@ -16,8 +16,16 @@ struct SavedBaseline: Codable, Equatable {
     let targetS: Double                          // 普段の長さ
     let savedMs: Int64                           // 保存した日時
     var faceBox: FaceBoxStats?
+    var voice: SavedVoice?                       // 声の普段（v1.6〜。それより前に保存したものには無い）
 
     var savedDate: Date { Date(timeIntervalSince1970: Double(savedMs) / 1000) }
+}
+
+/// 保存した声の普段（v1.6〜）：本人の声のコマだけで集めた声の大きさ・高さ
+struct SavedVoice: Codable, Equatable {
+    let metrics: [String: BaselineRecord.Stat]   // rms_db / f0_hz
+    let validS: Double                           // 数えた本人の声の秒数
+    let savedMs: Int64
 }
 
 /// 人：名前だけ。この端末の中にだけ保存し、外には送らない（見る側にも、記録にも名前は書かない。記録には id だけ）

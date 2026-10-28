@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-28.1",
+  "version": "2026-10-28.2",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -28,9 +28,13 @@
     {
       "date": "2026-10-28",
       "reason": "eyes_closed（目を閉じている）を足した：eyeBlink 左右平均が 0.5 以上が 0.5秒以上続いたら区間（それより短いのはまばたき）、0.5 未満が 0.2秒続いたら終わり、秒数は閉じ始めた時刻から。普段とは比べず（z を使わない）、普段がある間の、表情を判定できるコマ（顔が読めて |yaw| < 35°）だけで判定する。区間の一覧・時系列・--calm の10分あたりに入れ、通知候補には入れない。アプリ（DiffEngine、v1.4）と同じ値。research_composite の「目を閉じている」もこの決まりに揃え、research_composite.eye_closed を外した（前は終わりの 0.2秒が無く、普段が無い時間や表情の判定対象外の時間も数えていた）。目を細めるの blink_mask は変えない。"
+    },
+    {
+      "date": "2026-10-28",
+      "reason": "voice_self と voice_baseline を足した（v1.6）：声の大きさ・声の高さの違いは、本人の声のコマ（f0 が取れていて、顔が読めていて、jawOpen・mouthClose・mouthFunnel・mouthPucker のどれかの直近0.3秒の変化が 0.04 以上）だけで判定し、本人の声と言えない声のコマでは判定しない。胸に着けた iPhone のマイクには介助する人の声が一番大きく入り、本人以外の声で違いが出ていたため。声の普段は、表情の30秒とは別に、本人の声が合計10秒たまったら作る（30秒の間に声を出さず、声の高さがいつもデータ不足だったため）。min_range 0.04 は仮の値で、記録の「口の動き」の分布を見て決める。アプリ（v1.6）と同じ値。"
     }
   ],
-  "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
+  "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
   "std_floor": {
     "mouth_smile": 0.03,
     "brow_down": 0.03,
@@ -98,6 +102,22 @@
     "threshold": 0.5,
     "start_min_s": 0.5,
     "end_open_s": 0.2
+  },
+  "voice_self": {
+    "_note": "本人の声（v1.6〜）。声が出ている（f0 がある）コマのうち、face_valid で、そのコマに顔があり、keys のどれかの直近 window_s 秒の変化（最大 − 最小）が min_range 以上のもの。声の違いは本人の声のコマだけで判定する。min_range は仮の値",
+    "provisional": true,
+    "keys": [
+      "jawOpen",
+      "mouthClose",
+      "mouthFunnel",
+      "mouthPucker"
+    ],
+    "window_s": 0.3,
+    "min_range": 0.04
+  },
+  "voice_baseline": {
+    "_note": "声の普段（v1.6〜）。表情の普段とは別に、開いてから warmup 秒より後の本人の声のコマが合計 target_s 秒たまったら作る（baseline 行の part: \"voice\"）",
+    "target_s": 10.0
   },
   "stale_s": 1.0,
   "mark_window_s": 10.0,

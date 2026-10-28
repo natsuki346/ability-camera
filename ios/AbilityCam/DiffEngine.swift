@@ -18,6 +18,55 @@ enum DiffCriteria {
     static let eyesClosedThreshold = 0.5   // eyeBlink 左右平均がこれ以上が
     static let eyesClosedMinS = 0.5        //   0.5秒以上続いたら「目を閉じている」（短いのはまばたき）
     static let eyesOpenEndS = 0.2          // これ未満が 0.2秒続いたら終わり。秒数は閉じ始めた時刻から
+    // 本人の声（v1.6〜、criteria.json の voice_self）：声が出ていて（f0 がある）、顔が読めていて、口が動いているコマ
+    static let mouthKeys = ["jawOpen", "mouthClose", "mouthFunnel", "mouthPucker"]
+    static let mouthWindowS = 0.3          // 直近 0.3秒の
+    static let mouthMinRange = 0.04        //   変化（最大 − 最小）が、どれかでこれ以上なら口が動いている（仮の値）
+    // 声の普段（v1.6〜、criteria.json の voice_baseline）：本人の声のコマが合計これだけたまったら
+    static let voiceBaselineS = 10.0
+}
+
+/// 本人の声か（review.py の voice_self と同じ決まり）。1コマずつ流す。
+/// 返り値：nil＝声が出ていない（f0 が無い）、true＝本人の声、false＝本人の声と言えない（顔が読めない・横を向きすぎ・口が動いていない）
+struct VoiceSelfTracker {
+    private var recentFace: [(t: Double, face: Bool)] = []
+    private var lastYaw: (v: Double, t: Double)?
+    private var mouth: [(t: Double, v: [String: Double])] = []
+
+    /// 顔が読めているか（DiffEngine の faceValid と同じ：直近1秒で顔が映るコマが半分以上、|yaw| < 35°）
+    private(set) var faceValid = false
+
+    mutating func add(t: Double, face: Bool, yaw: Double?, bs: [String: Double], voiced: Bool) -> Bool? {
+        recentFace.append((t, face))
+        while let f = recentFace.first, f.t <= t - DiffCriteria.faceWindowS { recentFace.removeFirst() }
+        let ratio = Double(recentFace.filter(\.face).count) / Double(recentFace.count)
+        if let y = yaw { lastYaw = (y, t) }
+        let yawNow = lastYaw.flatMap { t - $0.t <= DiffCriteria.staleS ? $0.v : nil }
+        faceValid = ratio >= DiffCriteria.minFaceRatio && !(yawNow.map { abs($0) >= DiffCriteria.maxAbsYaw } ?? false)
+
+        if face {
+            var v: [String: Double] = [:]
+            for k in DiffCriteria.mouthKeys { if let x = bs[k] { v[k] = x } }
+            mouth.append((t, v))
+        }
+        while let m = mouth.first, t - m.t > DiffCriteria.mouthWindowS + 1e-9 { mouth.removeFirst() }
+        guard voiced else { return nil }
+        guard face, faceValid, mouth.count >= 2 else { return false }
+        var range = 0.0
+        for k in DiffCriteria.mouthKeys {
+            let xs = mouth.compactMap { $0.v[k] }
+            if let lo = xs.min(), let hi = xs.max() { range = max(range, hi - lo) }
+        }
+        return range >= DiffCriteria.mouthMinRange - 1e-9
+    }
+}
+
+/// baseline 行のどの部分か（v1.6〜）。古い記録の行は all（表情も声も）
+enum BaselinePart: String {
+    case all, face, voice
+
+    static func of(_ s: String?) -> BaselinePart { s.flatMap(BaselinePart.init(rawValue:)) ?? .all }
+    func covers(_ m: Metric) -> Bool { self == .all || (self == .face) == m.isFace }
 }
 
 /// 違いの種類：指標（普段の z で比べる）か、目を閉じている（事実だけ、v1.4〜）
@@ -98,6 +147,7 @@ struct DiffInput {
     var faceValues: [Metric: Double]  // 顔があるときの表情の値（左右平均）
     var blink: Double?                // eyeBlink 左右平均
     var voice: [Metric: Double]       // 声の大きさ・高さ（このコマで新しく来た値）
+    var voiceSelf: Bool? = nil        // 本人の声か（v1.6〜、VoiceSelfTracker）。声の違いは本人の声のコマだけで判定する
 }
 
 /// 撮る側のその場の判定と、リプレイ（記録のファイルから計算し直す）で同じものを使う。
@@ -114,7 +164,7 @@ struct DiffEngine {
 
     private enum Item {
         case frame(DiffInput, faceValid: Bool)
-        case baseline([Metric: Stat]?)
+        case baseline([Metric: Stat]?, BaselinePart)
     }
 
     private var queue: [Item] = []
@@ -122,7 +172,8 @@ struct DiffEngine {
     private var blinkTimes: [Double] = []
     private var recentFace: [(t: Double, face: Bool)] = []
     private var lastYaw: (v: Double, t: Double)?
-    private var baseline: [Metric: Stat]?
+    private var faceBaseline: [Metric: Stat]?    // 表情の普段（目を閉じているもこれがある間だけ判定）
+    private var voiceBaseline: [Metric: Stat]?   // 声の普段（v1.6〜は表情とは別に集める）
     private var smooth: [Metric: (v: Double, t: Double)] = [:]
     private var det: [Metric: Detector] = [:]
     private var closedDet = ClosedDetector()
@@ -140,9 +191,10 @@ struct DiffEngine {
     /// 最後に判定したコマで、目を閉じているかを判定できたか（普段があり、顔が読めて |yaw| < 35°）
     private(set) var eyesJudgeable = false
 
-    /// 普段を決めた・取り直した（nil）。この時刻より後のコマから使う
-    mutating func setBaseline(_ b: [Metric: Stat]?) {
-        queue.append(.baseline(b))
+    /// 普段を決めた・取り直した（nil で両方を消す）。この時刻より後のコマから使う。
+    /// part が face / voice なら、その部分だけ変える（v1.6〜）
+    mutating func setBaseline(_ b: [Metric: Stat]?, part: BaselinePart = .all) {
+        queue.append(.baseline(b, b == nil ? .all : part))
     }
 
     /// 1コマ足す。0.2秒より前のコマを判定する
@@ -175,8 +227,9 @@ struct DiffEngine {
     private mutating func drain(until limit: Double) {
         while let first = queue.first {
             switch first {
-            case .baseline(let b):
-                baseline = b
+            case .baseline(let b, let part):
+                if part != .voice { faceBaseline = b.map { $0.filter { $0.key.isFace } } }
+                if part != .face { voiceBaseline = b.map { $0.filter { !$0.key.isFace } } }
                 queue.removeFirst()
             case .frame(let x, let valid):
                 guard x.t <= limit else { return }
@@ -198,6 +251,7 @@ struct DiffEngine {
             // 生の値（目を細めるは、まばたきのコマを入れない）
             var raw: Double? = m.isFace ? (x.face ? x.faceValues[m] : nil) : x.voice[m]
             if m == .eyeSquint && blink { raw = nil }
+            if !m.isFace && x.voiceSelf != true { raw = nil }   // 声は本人の声のコマの値だけ使う（v1.6〜）
             // ならす（review.py の smooth：1秒より空いたら今の値から）
             if let r = raw {
                 if let s = smooth[m], x.t - s.t <= DiffCriteria.staleS {
@@ -209,10 +263,11 @@ struct DiffEngine {
             }
             var zz: Double?
             value[m] = smooth[m].flatMap { x.t - $0.t <= DiffCriteria.staleS ? $0.v : nil }
-            if let s = smooth[m], x.t - s.t <= DiffCriteria.staleS, let b = baseline?[m] {
+            if let s = smooth[m], x.t - s.t <= DiffCriteria.staleS, let b = (m.isFace ? faceBaseline : voiceBaseline)?[m] {
                 zz = (s.v - b.mean) / b.sd
             }
             if m.isFace && !faceValid { zz = nil }
+            if !m.isFace && x.voiceSelf == false { zz = nil }   // 本人以外の声（と言えない声）のコマでは判定しない
             if m == .eyeSquint && blink { zz = nil }
             z[m] = zz
 
@@ -235,7 +290,7 @@ struct DiffEngine {
         }
 
         // 目を閉じている：普段とは比べないが、ほかの違いと同じく普段がある間だけ、顔が読めて |yaw| < 35° のコマで判定する
-        let judgeable = baseline != nil && faceValid
+        let judgeable = faceBaseline != nil && faceValid
         eyesJudgeable = judgeable
         let (cStarted, cEnded) = closedDet.step(t: x.t, judgeable: judgeable,
                                                closed: x.face ? x.blink.map { $0 >= DiffCriteria.eyesClosedThreshold } : nil)

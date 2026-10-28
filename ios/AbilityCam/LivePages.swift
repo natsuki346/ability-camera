@@ -112,6 +112,20 @@ struct NowPage: View {
                 }
             }
             if model.running, model.comparing == .today { eyesClosedNote }   // 画面に出して取った普段を、取り終えたあとも
+            voiceNote
+        }
+    }
+
+    /// 声の普段を集めている間と、本人以外の声だけが入っているとき（v1.6〜。小さく出す。違いには数えない）
+    @ViewBuilder private var voiceNote: some View {
+        if model.running {
+            if let v = model.voiceSec {
+                Text("声の高さ：普段を集めています（本人の声 \(v)/\(Int(DiffCriteria.voiceBaselineS))秒）")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+            }
+            if model.otherVoice {
+                Text("声：本人以外の声が入っています").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
         }
     }
 

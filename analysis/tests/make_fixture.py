@@ -8,8 +8,9 @@
   40–42  brow_down を高く、41–41.3 だけ z≈1.7 に下げる → ヒステリシスで 区間 1件のまま
   50–52  brow_down を高く、ただし yaw 50°   → 判定対象外（区間なし）
   60–62  顔が映らない                        → 判定対象外（区間なし）
-  70–71.5 rms_db を大きく（f0 も高く）       → rms_db 区間（上）、f0 は insufficient なので無し
-  80–81.5 rms_db を小さく                   → rms_db 区間（下）
+  70–71.5 rms_db を大きく（f0 も高く）、口が動く → rms_db 区間（上）、f0 は insufficient なので無し
+  80–81.5 rms_db を小さく（声あり）、口が動く   → rms_db 区間（下）
+  （v1.6〜：声は本人の声のコマだけで判定する。口が動いていない声（ほかの時間の f0）は本人の声と言えないので判定しない）
   90     普段を取り直す。90–95 brow_down を高くしても普段が無いので区間なし。100 で baseline 行
   105–106 jaw_open を高く                   → 区間 1件（上）
   （50–52 の直後に z が2を超えて残るが、始まりが見えていないので短い動きには数えない）
@@ -25,6 +26,15 @@ fixture_eyes.jsonl（目を閉じている、v1.4〜）：同じ普段（10秒�
   60–60.45 閉じる                            → 0.5秒に届かず区間なし
   70     普段を取り直す。72–75 閉じても普段が無いので区間なし。80 で baseline 行
   85–90  閉じたまま記録の終わり               → 区間 1件（記録の終わりで打ち切り）
+
+fixture_voice.jsonl（本人の声、v1.6〜の形：voice_self を書き、表情と声の普段を別の行にする）：声が出ているのは下の時間だけ
+  10     表情の普段（part: "face"）
+  12–20  本人以外の声（大きく高い声、口は動かない） → voice_self: false、区間なし
+  25–37  本人の声（口が動く）                    → 本人の声が10秒たまった所で声の普段（part: "voice"）
+  50–52  本人の声で高い声                         → 声の高さ 区間 1件（上）
+  60–62  本人以外の声で高い声                     → 区間なし
+  70–72  本人の声だが横を向いている（yaw 50°）     → voice_self: false、区間なし
+  80–82  本人の声で大きな声                       → 声の大きさ 区間 1件（上）
 """
 import json
 import math
@@ -74,21 +84,25 @@ def frame(t):
         yaw = 50.0
     if 60 <= t < 62:
         face = False
+    mouth = 0.0
     if 70 <= t < 71.5:
         v["rms_db"], f0 = -30.0, 320.0
     if 80 <= t < 81.5:
-        v["rms_db"] = -65.0
+        v["rms_db"], f0 = -65.0, 190.0
+    if 70 <= t < 71.5 or 80 <= t < 81.5:
+        mouth = round(0.1 + 0.1 * math.sin(2 * math.pi * 4 * t), 3)   # 話している口の動き（mouthFunnel、指標には使わない）
     if 105 <= t < 106:
         v["jaw_open"] = 0.5
-    return frame_obj(t, v, face, yaw, f0)
+    return frame_obj(t, v, face, yaw, f0, mouth=mouth)
 
 
-def frame_obj(t, v, face, yaw, f0, blink=0.05):
+def frame_obj(t, v, face, yaw, f0, blink=0.05, mouth=0.0):
     o = {"type": "frame", "t_ms": T0_MS + int(round(t * 1000)), "face": face,
          "rms_db": v["rms_db"], "proc_ms": 12.0, "lat_ms": 60.0 + 10 * math.sin(t)}
     if face:
         o["bs"] = bs_from(v)
         o["bs"]["eyeBlinkLeft"] = o["bs"]["eyeBlinkRight"] = blink
+        o["bs"]["mouthFunnel"] = mouth
         o["pts"] = []
         o["yaw_deg"], o["pitch_deg"], o["roll_deg"] = yaw, -3.0, 1.0
     if f0 is not None:
@@ -142,6 +156,63 @@ def build_eyes():
     return lines + [r[1] for r in rows]
 
 
+VOICE_END = 90.0
+SELF = [(25, 37), (50, 52), (70, 72), (80, 82)]
+OTHER = [(12, 20), (60, 62)]
+
+
+def voice_at(t):
+    """(f0, rms, 口の動き, yaw, 記録に書く voice_self)"""
+    inside = lambda spans: any(a <= t < b for a, b in spans)
+    if inside(SELF):
+        f0 = 260.0 if 50 <= t < 52 else 200.0 + 5 * math.sin(2 * math.pi * 1.3 * t)
+        rms = -20.0 if 80 <= t < 82 else -50.0 + 3 * math.sin(2 * math.pi * 0.7 * t)
+        yaw = 50.0 if 70 <= t < 72 else 2.0
+        return round(f0, 1), round(rms, 1), round(0.1 + 0.1 * math.sin(2 * math.pi * 4 * t), 3), yaw, yaw < 35
+    if inside(OTHER):
+        return (250.0 if t < 20 else 260.0), -30.0, 0.0, 2.0, False
+    return None, -60.0, 0.0, 2.0, None
+
+
+def build_voice():
+    lines = [{"schema": "ability-cam.ios.v0.2", "started_at_ms": T0_MS, "camera": "wide", "camera_label": "広角",
+              "note": "テスト用の作り物（本人の声）"}]
+    face_m = {k: {"n": 300, "mean": mu, "std": sd, "insufficient": False} for k, (mu, sd) in BASE.items() if k != "rms_db"}
+    face_row = {"type": "baseline", "t_ms": T0_MS + 10_000, "started_ms": T0_MS, "valid_s": 10.0, "min_n": 30, "target_s": 10.0,
+                "blink_masked": True, "source": "today", "compared": True, "part": "face", "metrics": face_m}
+    rows, frames = [], []
+    valid, last, vals, voice_row = 0.0, None, {"rms_db": [], "f0_hz": []}, None
+    for i in range(int(VOICE_END * FPS)):
+        t = i / FPS
+        f0, rms, mouth, yaw, vs = voice_at(t)
+        v = {k: mu for k, (mu, _) in BASE.items()}
+        o = frame_obj(t, v, True, yaw, f0, mouth=mouth)
+        o["rms_db"] = rms
+        o["voice_self"] = vs
+        frames.append((t, o))
+        # 撮る側と同じ数え方で、声の普段（本人の声が10秒たまった所）
+        if voice_row is None:
+            counted = vs is True and t >= 5
+            if counted and last is not None and t > last:
+                valid += min(t - last, 0.5)
+            last = t
+            if counted:
+                vals["rms_db"].append(rms); vals["f0_hz"].append(f0)
+            if valid >= 10.0:
+                def stat(x):
+                    import statistics
+                    return {"n": len(x), "mean": round(statistics.fmean(x), 4), "std": round(statistics.stdev(x), 4),
+                            "insufficient": len(x) < 30}
+                voice_row = {"type": "baseline", "t_ms": T0_MS + int(round(t * 1000)), "started_ms": T0_MS,
+                             "voice_valid_s": round(valid, 1), "min_n": 30, "target_s": 10.0, "blink_masked": True,
+                             "source": "today", "compared": True, "part": "voice",
+                             "metrics": {k: stat(x) for k, x in vals.items()}}
+                rows.append((t, voice_row))
+    rows += [(10.0, face_row)] + frames
+    rows.sort(key=lambda r: r[0])
+    return lines + [r[1] for r in rows]
+
+
 def write(name, objs):
     out = Path(__file__).with_name(name)
     out.write_text("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in objs), encoding="utf-8")
@@ -151,3 +222,4 @@ def write(name, objs):
 if __name__ == "__main__":
     write("fixture_basic.jsonl", build())
     write("fixture_eyes.jsonl", build_eyes())
+    write("fixture_voice.jsonl", build_voice())

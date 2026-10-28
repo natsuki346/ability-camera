@@ -30,6 +30,10 @@ struct LiveState: Codable {
     var head: String?                 // 顔の向き（HeadState：front / right / left / hidden / oblique）。0.5秒続いて決まったもの。まだ決まっていなければ nil
     // v1.4〜
     var eyesClosed: Bool?             // 目を閉じているか（判定していない・古い撮る側では nil）。続いている秒数は diffs の eyes_closed
+    // v1.6〜
+    var voiceSec: Int?                // 声の普段を集めている：本人の声の秒数（集め終えた・保存した声の普段で比べているときは nil）
+    var voiceTotal: Int?              // 声の普段に必要な本人の声の秒数（10）
+    var otherVoice: Bool?             // 本人以外の声（と言えない声）だけが入っている
 }
 
 /// いつもとの違い1つ

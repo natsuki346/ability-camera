@@ -44,6 +44,8 @@ final class AnalysisModel: ObservableObject {
     @Published var baselineTarget = AnalysisModel.selectedBaselineSeconds   // 今の普段の長さ（数えた時間の目標）
     @Published var baselineWait: String?      // 普段を数えていない理由（数えている間は nil）
     @Published var baselineEyesClosedLong = false   // 普段の間に目を閉じていた時間が、数えた時間の2割を超えた（v1.4〜）
+    @Published var voiceSec: Int?             // 声の普段を集めている：本人の声の秒数（画面に出すときだけ。v1.6〜）
+    @Published var otherVoice = false         // 本人以外の声（と言えない声）だけが入っている（直近1秒）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
     @Published var differences: [String] = []
     @Published var faceReadable = true
@@ -85,9 +87,9 @@ final class AnalysisModel: ObservableObject {
     private var baselineLastT: Double?        // 前に見たコマの撮影時刻（数えた時間の幅を出す）
     private var lastValidHost: CFTimeInterval = -.infinity
     private var sessionStartHost: CFTimeInterval = 0
+    private var sessionStartMs: Int64 = 0
     private var stats: [Metric: Welford] = [:]
     private var engine = DiffEngine()                         // いつもとの違い（振り返りレポートと同じ決まり）
-    private var lastAudioAt: CFTimeInterval = 0               // 普段に数えた最後の音
     private var lastAudioAtEngine: CFTimeInterval = 0         // 違いの判定に入れた最後の音
     private var lastBlinkT = -Double.infinity                 // 最後にまばたき（eyeBlink ≥ 0.3）があった撮影時刻
     private var squintPending: [(t: Double, x: Double)] = []  // 普段に数える前の目を細めるの値（後ろ 0.2秒にまばたきが無いか待つ）
@@ -102,6 +104,15 @@ final class AnalysisModel: ObservableObject {
     private var baselineClosedS = 0.0                         // 普段の間に目を閉じていた秒数（終わったものの合計）
     static let baselineEyesClosedRatio = 0.2                  // 目を閉じていた時間がこれを超えたら「取り直せます」と出す
     private var todayBaseline: SavedBaseline?                 // このセッションで記録し終えた今日の普段（保存・保存し直し用）
+    private var todayVoice: SavedVoice?                       // このセッションで集め終えた声の普段
+    private var resaveAccepted = false                        // このセッションで「保存し直す」を選んだ（あとで集め終えた声の普段も保存し直す）
+    private var comparingVoice: BaselineSource?               // 声を比べている普段（nil：まだ集めている）
+    private var usedFace: (startedMs: Int64, metrics: [String: BaselineRecord.Stat])?   // 今比べている表情の普段
+    private var usedVoice: [String: BaselineRecord.Stat]?     // 今比べている声の普段
+    private var voiceStats: [Metric: Welford] = [:]           // 声の普段（本人の声のコマだけ）
+    private var voiceValidS = 0.0, voicePrevT: Double?, voiceStartMs: Int64 = 0, voiceDone = false
+    private var lastSelfVoiceT = -Double.infinity, lastOtherVoiceT = -Double.infinity
+    private let voiceBox = VoiceSelfBox()                     // MediaPipe のスレッドの上でだけ触る
     private var todayShown = false                            // 今日の普段を画面に出して取った（保存した普段で比べながら、うしろで黙って取ったのではない）
     private var faceCount: Int?                               // 映っている顔の数（0.5秒続いたもの）
     private var faceCountPending: (n: Int, tMs: Int64)?
@@ -191,7 +202,8 @@ final class AnalysisModel: ObservableObject {
         graph.reset()
         link.headTurns = []   // 見る側の「直近の顔の向き」は、セッションごと
         sessionStartHost = CACurrentMediaTime()
-        todayBaseline = nil
+        todayBaseline = nil; todayVoice = nil; resaveAccepted = false
+        sessionStartMs = Self.nowMs()
         face.setPreferred(nil)
         resetBaseline()   // 普段（設定の長さ）も自動で始める
         applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
@@ -215,6 +227,7 @@ final class AnalysisModel: ObservableObject {
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
+            todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
             if let s = logger.finish() {
@@ -262,7 +275,7 @@ final class AnalysisModel: ObservableObject {
             return false
         }
 
-        let face = self.face, audio = self.audio, logger = self.logger
+        let face = self.face, audio = self.audio, logger = self.logger, voiceBox = self.voiceBox
         face.onResult = { [weak self] r in
             let a = audio.current
             // 撮影時刻（端末の起動からの時計）を、epoch ms に直す
@@ -270,6 +283,10 @@ final class AnalysisModel: ObservableObject {
             let tMs = Int64((Date().timeIntervalSince1970 - ageSec) * 1000)
             let round1 = { (x: Double) in (x * 10).rounded() / 10 }
             let round4 = { (x: Double) in (x * 10000).rounded() / 10000 }
+            // 本人の声か（記録に書いた値と同じもので決める：表情の数値は 0.001、yaw は 0.1 に丸めたもの）
+            let bsD = r.face ? r.blendshapes.mapValues { (Double($0) * 1000).rounded() / 1000 } : [:]
+            let (voiceSelf, voiceFaceValid) = voiceBox.add(t: Double(tMs) / 1000, face: r.face, yaw: r.pose.map { round1($0.yaw) },
+                                                           bs: bsD, voiced: a.f0Hz != nil)
             // ファイルが開いていないとき・記録の開始より前のコマは書かれない
             logger.write(FrameRecord(tMs: tMs, face: r.face,
                                      bs: r.face ? r.blendshapes : nil, pts: r.face ? r.keyPoints : nil,
@@ -277,9 +294,9 @@ final class AnalysisModel: ObservableObject {
                                      yawDeg: r.pose.map { round1($0.yaw) }, pitchDeg: r.pose.map { round1($0.pitch) },
                                      rollDeg: r.pose.map { round1($0.roll) },
                                      faceCx: r.box.map { round4($0.cx) }, faceCy: r.box.map { round4($0.cy) },
-                                     faceW: r.box.map { round4($0.w) }),
+                                     faceW: r.box.map { round4($0.w) }, voiceSelf: Nullable(voiceSelf)),
                          notBefore: tMs)
-            Task { @MainActor in self?.update(r, audio: a, tMs: tMs) }
+            Task { @MainActor in self?.update(r, audio: a, tMs: tMs, voiceSelf: voiceSelf, voiceFaceValid: voiceFaceValid) }
         }
         let video = self.video, link = self.link
         video.onJPEG = { [weak link] d in link?.sendVideo(d) }
@@ -311,7 +328,7 @@ final class AnalysisModel: ObservableObject {
         mesh = nil; meshLagMs = nil
         faceShape = nil; shapeSmooth = [:]; lastShapeT = -.infinity
         startHost = CACurrentMediaTime()
-        lastAudioAt = 0; lastAudioAtEngine = 0; recentFace = []
+        lastAudioAtEngine = 0; recentFace = []
         lastBlinkT = -.infinity; squintPending = []
         faceReadable = true
         faceCount = nil; faceCountPending = nil; facesCheck = nil; analyzedRatio = nil
@@ -430,6 +447,21 @@ final class AnalysisModel: ObservableObject {
         comparing = nil; savedFromMs = nil; askResave = false
         boxStats = (Welford(), Welford(), Welford())
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
+        // 声の普段も、表情とは別に初めから集め直す（v1.6〜）
+        voiceStats = [:]; voiceValidS = 0; voicePrevT = nil; voiceStartMs = Self.nowMs(); voiceDone = false
+        voiceSec = 0; comparingVoice = nil; usedFace = nil; usedVoice = nil; todayVoice = nil
+    }
+
+    /// 今比べている表情と声の普段を合わせて、画面（いつもの範囲・データ不足）と見る側に出す
+    private func publishBaseline(tMs: Int64) {
+        guard let f = usedFace else { return }
+        var merged = f.metrics.filter { Metric(rawValue: $0.key)?.isFace ?? false }
+        for (k, v) in usedVoice ?? [:] { merged[k] = v }
+        let b = Self.engineBaseline(merged)
+        baselineStats = b
+        // 声の普段を集めている間は、声を「データ不足」には入れない（集めていると別に出す）
+        insufficient = Metric.allCases.filter { m in (m.isFace || usedVoice != nil) && b[m] == nil }
+        link.baseline = LiveBaseline(startedMs: f.startedMs, tMs: tMs, metrics: merged)   // 見る側へ（名前は送らない）
     }
 
     /// 普段の間に目を閉じていた秒数（続いている分も入れる）
@@ -452,26 +484,41 @@ final class AnalysisModel: ObservableObject {
             logger.write(e)
             return
         }
+        // 表情の部分（v1.5 までに保存した普段の声の数値は、本人以外の声も入っているので使わない）
+        let faceMetrics = sv.metrics.filter { Metric(rawValue: $0.key)?.isFace ?? false }
         var row = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
                                  yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
-                                 minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: sv.metrics)
-        row.source = BaselineSource.saved.rawValue; row.compared = true
+                                 minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: faceMetrics)
+        row.source = BaselineSource.saved.rawValue; row.compared = true; row.part = BaselinePart.face.rawValue
         row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox
         logger.write(row)
-        let b = Self.engineBaseline(sv.metrics)
-        engine.setBaseline(b)
-        baselineStats = b
+        engine.setBaseline(Self.engineBaseline(faceMetrics), part: .face)
         comparing = .saved
         savedFromMs = sv.savedMs
-        insufficient = Metric.allCases.filter { sv.metrics[$0.rawValue]?.insufficient ?? true }
-        link.baseline = LiveBaseline(startedMs: sv.savedMs, tMs: now, metrics: sv.metrics)   // 見る側へ（名前は送らない）
+        usedFace = (sv.savedMs, faceMetrics)
+        // 声の部分（v1.6〜に保存したものがあれば、すぐ声も比べ始める。今日の声の普段はうしろで集める）
+        if let v = sv.voice {
+            var vr = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
+                                    yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
+                                    minN: Self.minSamples, targetS: DiffCriteria.voiceBaselineS, blinkMasked: true, metrics: v.metrics)
+            vr.source = BaselineSource.saved.rawValue; vr.compared = true; vr.part = BaselinePart.voice.rawValue
+            vr.savedMs = v.savedMs; vr.voiceValidS = v.validS
+            logger.write(vr)
+            engine.setBaseline(Self.engineBaseline(v.metrics), part: .voice)
+            comparingVoice = .saved
+            usedVoice = v.metrics
+            voiceSec = nil
+        }
+        publishBaseline(tMs: now)
         face.setPreferred(sv.faceBox)
     }
 
     /// 「この普段で保存し直しますか？」で「保存し直す」
     func overwriteSaved() {
         askResave = false
-        guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
+        guard var t = todayBaseline, let p = PersonStore.shared.selected else { return }
+        t.voice = todayVoice ?? p.saved?.voice   // 声の普段がまだなら、集め終えたときに保存し直す
+        resaveAccepted = true
         PersonStore.shared.setSaved(p.id, t)
         showMessage("\(p.displayName)の普段を保存し直しました")
     }
@@ -491,8 +538,9 @@ final class AnalysisModel: ObservableObject {
     /// （うしろで黙って取った今日の普段は、記録に書くだけで保存しない）
     private func saveTodayIfNew() {
         askResave = false
-        guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
+        guard var t = todayBaseline, let p = PersonStore.shared.selected else { return }
         if p.saved == nil {
+            t.voice = todayVoice
             PersonStore.shared.setSaved(p.id, t)
             showMessage("\(p.displayName)の普段を保存しました")
         } else if todayShown {
@@ -503,7 +551,7 @@ final class AnalysisModel: ObservableObject {
     private func finishBaseline(now: CFTimeInterval) {
         squintPending = []   // 後ろ 0.2秒を確かめられなかった分は数えない
         var out: [String: BaselineRecord.Stat] = [:]
-        for m in Metric.allCases {
+        for m in Metric.allCases where m.isFace {   // 声の普段は別に集める（v1.6〜）
             let w = stats[m] ?? Welford()
             out[m.rawValue] = BaselineRecord.Stat(n: w.n,
                                                   mean: w.n > 0 ? (w.mean * 10000).rounded() / 10000 : nil,
@@ -521,15 +569,15 @@ final class AnalysisModel: ObservableObject {
                                  yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                  minN: Self.minSamples, targetS: baselineTarget, blinkMasked: true, metrics: out)
         row.source = BaselineSource.today.rawValue; row.compared = useToday; row.faceBox = faceBox
+        row.part = BaselinePart.face.rawValue
         row.eyesClosedS = (baselineEyesClosedS * 10).rounded() / 10
         row.camera = (lensInUse ?? camera.lens).rawValue
         logger.write(row)
         if useToday {
-            insufficient = Metric.allCases.filter { (stats[$0]?.n ?? 0) < Self.minSamples }
-            engine.setBaseline(Self.engineBaseline(out))
-            baselineStats = Self.engineBaseline(out)
+            engine.setBaseline(Self.engineBaseline(out), part: .face)
             comparing = .today
-            link.baseline = LiveBaseline(startedMs: baselineStartMs, tMs: Self.nowMs(), metrics: out)   // 見る側へ1回
+            usedFace = (baselineStartMs, out)
+            publishBaseline(tMs: Self.nowMs())   // 見る側へ1回
             face.setPreferred(faceBox)
         }
         baselineSec = nil; baselineWait = nil
@@ -538,6 +586,59 @@ final class AnalysisModel: ObservableObject {
         todayBaseline = SavedBaseline(metrics: out, camera: (lensInUse ?? camera.lens).rawValue, targetS: baselineTarget,
                                       savedMs: Self.nowMs(), faceBox: faceBox)
         saveTodayIfNew()   // 人を選んでいて、保存した普段がまだ無ければ保存する（あれば、画面に出して取ったときだけ保存し直すか聞く）
+    }
+
+    /// 声の普段：本人の声のコマが合計 10秒たまったら（v1.6〜）。表情の普段とは別の baseline 行（part: "voice"）
+    private func collectVoice(tMs: Int64, voiceSelf: Bool?, audio a: AudioAnalyzer.Snapshot) {
+        guard running, !voiceDone else { return }
+        let t = Double(tMs) / 1000
+        let warm = t - Double(sessionStartMs) / 1000 >= Self.baselineWarmup
+        let counted = voiceSelf == true && warm
+        if counted, let p = voicePrevT, t > p { voiceValidS += min(t - p, 0.5) }
+        voicePrevT = t
+        if counted {
+            if let db = a.rmsDb { voiceStats[.rmsDb, default: Welford()].add(Double(db)) }
+            if let f0 = a.f0Hz { voiceStats[.f0Hz, default: Welford()].add(Double(f0)) }
+        }
+        if voiceValidS >= DiffCriteria.voiceBaselineS {
+            finishVoice(tMs: tMs)
+        } else if comparingVoice == nil, voiceSec != Int(voiceValidS) {
+            voiceSec = Int(voiceValidS)
+        }
+    }
+
+    private func finishVoice(tMs: Int64) {
+        voiceDone = true
+        var out: [String: BaselineRecord.Stat] = [:]
+        for m in Metric.allCases where !m.isFace {
+            let w = voiceStats[m] ?? Welford()
+            out[m.rawValue] = BaselineRecord.Stat(n: w.n,
+                                                  mean: w.n > 0 ? (w.mean * 10000).rounded() / 10000 : nil,
+                                                  std: w.n > 0 ? (w.std * 10000).rounded() / 10000 : nil,
+                                                  insufficient: w.n < Self.minSamples)
+        }
+        let useToday = comparingVoice == nil   // 保存した声の普段で比べているときは切り替えない
+        var row = BaselineRecord(tMs: tMs, startedMs: voiceStartMs, wallS: (Double(tMs - voiceStartMs) / 100).rounded() / 10,
+                                 validS: nil, yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
+                                 minN: Self.minSamples, targetS: DiffCriteria.voiceBaselineS, blinkMasked: true, metrics: out)
+        row.source = BaselineSource.today.rawValue; row.compared = useToday; row.part = BaselinePart.voice.rawValue
+        row.voiceValidS = (voiceValidS * 10).rounded() / 10
+        logger.write(row)
+        if useToday {
+            engine.setBaseline(Self.engineBaseline(out), part: .voice)
+            comparingVoice = .today
+            usedVoice = out
+            publishBaseline(tMs: tMs)
+        }
+        voiceSec = nil
+        let v = SavedVoice(metrics: out, validS: row.voiceValidS ?? voiceValidS, savedMs: tMs)
+        todayVoice = v
+        // 人の保存した普段に声の普段が無ければ足す（「保存し直す」を選んだあとなら置き換える）。うしろで集めたものは置き換えない
+        if let p = PersonStore.shared.selected, var sv = p.saved, sv.voice == nil || resaveAccepted {
+            sv.voice = v
+            PersonStore.shared.setSaved(p.id, sv)
+            showMessage("\(p.displayName)の声の普段を保存しました")
+        }
     }
 
     /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない
@@ -550,8 +651,14 @@ final class AnalysisModel: ObservableObject {
         return b
     }
 
-    private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64) {
+    private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64, voiceSelf: Bool?, voiceFaceValid: Bool) {
         guard cameraActive else { return }
+        collectVoice(tMs: tMs, voiceSelf: voiceSelf, audio: a)
+        let tNow = Double(tMs) / 1000
+        if voiceSelf == true { lastSelfVoiceT = tNow }
+        if voiceSelf == false, voiceFaceValid { lastOtherVoiceT = tNow }   // 顔が読めていて口が動いていない声
+        let other = running && tNow - lastOtherVoiceT <= 1 && tNow - lastSelfVoiceT > 1
+        if otherVoice != other { otherVoice = other }
         // 顔を向ける・そむける：0.5秒以上続いたときだけ記録する（全コマで見る）
         if let c = head.add(tMs: tMs, face: r.face, yaw: r.pose?.yaw) {
             var e = EventRecord(tMs: c.tMs, kind: "head_turn", value: .text(c.value))
@@ -611,7 +718,7 @@ final class AnalysisModel: ObservableObject {
             if let f0 = a.f0Hz { engineVoice[.f0Hz] = Double(f0) }
         }
         engine.add(DiffInput(t: epochT, face: r.face, yaw: r.pose?.yaw, faceValues: Self.faceValues(r), blink: blink,
-                             voice: engineVoice))
+                             voice: engineVoice, voiceSelf: voiceSelf))
 
         guard frames % 3 == 0 else { return }   // 画面の更新は 1/3 に間引く（記録は全コマ）
 
@@ -626,12 +733,6 @@ final class AnalysisModel: ObservableObject {
 
         // 今の値
         let faceValues = Self.faceValues(r)
-        var voiceValues: [Metric: Double] = [:]
-        if a.at > lastAudioAt {   // 同じ音の結果を二度数えない
-            lastAudioAt = a.at
-            if let db = a.rmsDb { voiceValues[.rmsDb] = Double(db) }
-            if let f0 = a.f0Hz { voiceValues[.f0Hz] = Double(f0) }
-        }
 
         let faceCount = recentFace.filter(\.face).count
         let readable = faceCount * 2 >= recentFace.count
@@ -664,7 +765,6 @@ final class AnalysisModel: ObservableObject {
                     stats[m, default: Welford()].add(x)
                 }
             }
-            for (m, x) in voiceValues { stats[m, default: Welford()].add(x) }
             if let b = r.box { boxStats.cx.add(b.cx); boxStats.cy.add(b.cy); boxStats.w.add(b.w) }
         }
         if faceReadable != readable { faceReadable = readable }
@@ -745,7 +845,8 @@ final class AnalysisModel: ObservableObject {
             faceRatio: faceRatio, fps: fps,
             z: comparing != nil ? liveZ : nil, diffs: comparing != nil ? liveDiffs : nil, diffCount: running ? diffCount : nil,
             head: head.state?.rawValue,
-            eyesClosed: comparing != nil && engine.eyesJudgeable ? engine.active[.eyesClosed] != nil : nil))
+            eyesClosed: comparing != nil && engine.eyesJudgeable ? engine.active[.eyesClosed] != nil : nil,
+            voiceSec: running ? voiceSec : nil, voiceTotal: Int(DiffCriteria.voiceBaselineS), otherVoice: running ? otherVoice : nil))
     }
 
     /// 映っている顔の数が変わって0.5秒続いたら、event（kind: "faces"、count）を書く。最初に決まった数は書かない
@@ -820,5 +921,18 @@ final class AnalysisModel: ObservableObject {
             e.baseline = comparing?.rawValue   // どちらの普段で比べたか
             logger.write(e)
         }
+    }
+}
+
+/// 本人の声を決める追跡（MediaPipe の結果のスレッドから呼ぶ。念のためロックする）
+final class VoiceSelfBox: @unchecked Sendable {
+    private var tracker = VoiceSelfTracker()
+    private let lock = NSLock()
+
+    /// 返り値：(本人の声か, 顔が読めているか)
+    func add(t: Double, face: Bool, yaw: Double?, bs: [String: Double], voiced: Bool) -> (Bool?, Bool) {
+        lock.lock(); defer { lock.unlock() }
+        let v = tracker.add(t: t, face: face, yaw: yaw, bs: bs, voiced: voiced)
+        return (v, tracker.faceValid)
     }
 }

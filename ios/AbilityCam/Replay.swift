@@ -41,6 +41,8 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
     // 要約
     let durationS: Double
     let faceRatio: Double?
+    let selfVoiceS: Double                       // 本人の声の時間（v1.6〜）
+    let otherVoiceS: Double                      // 本人の声と言えない声の時間
     var diffCount: Int { segments.count }
     var markCount: Int { marks.count }
     let notes: [String]
@@ -87,7 +89,9 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var bsList = [[String: Double]](repeating: [:], count: n)
         var rms = [Double?](repeating: nil, count: n), f0 = [Double?](repeating: nil, count: n)
         var pitch = [Double?](repeating: nil, count: n), roll = [Double?](repeating: nil, count: n)
+        var recordedVoiceSelf = [Bool??](repeating: nil, count: n)   // 記録の voice_self（v1.6〜。キーが無い古い記録は nil）
         for (i, o) in frames.enumerated() {
+            if let v = o["voice_self"] { recordedVoiceSelf[i] = .some(v as? Bool) }
             t[i] = ms(o)!
             yaw[i] = (o["yaw_deg"] as? NSNumber)?.doubleValue
             pitch[i] = (o["pitch_deg"] as? NSNumber)?.doubleValue
@@ -139,7 +143,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var notes: [String] = []
         let startedAt = ms(header, "started_at_ms") ?? t[0]
         let recount = Self.squintWithoutBlinks(t: t, face: face, yaw: yaw, squint: squint, blink: blink, start0: startedAt)
-        var bItems: [(t: Double, stats: [Metric: DiffEngine.Stat]?)] = []
+        var bItems: [(t: Double, stats: [Metric: DiffEngine.Stat]?, part: BaselinePart)] = []
         for b in baselines {
             // 撮る側が比べるのに使わなかった行（v1.2〜の compared: false）は使わない（振り返りレポートと同じ）
             guard let bt = ms(b), (b["compared"] as? Bool) != false else { continue }
@@ -157,22 +161,24 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
                     stats[m] = s
                 }
             }
-            bItems.append((bt, stats))
+            bItems.append((bt, stats, BaselinePart.of(b["part"] as? String)))
         }
-        for e in evs where e["kind"] as? String == "baseline_restart" { bItems.append((ms(e)!, nil)) }
+        for e in evs where e["kind"] as? String == "baseline_restart" { bItems.append((ms(e)!, nil, .all)) }
         bItems.sort { $0.t < $1.t }
         if baselines.isEmpty { notes.append("この記録には普段（baseline 行）が無いので、いつもとの違いは出せません") }
 
         // いつもとの違い：撮る側と同じ決まりで、コマを順に流す
         var engine = DiffEngine()
+        var voiceTracker = VoiceSelfTracker()
+        var selfS = 0.0, otherS = 0.0
         var bi = 0
         var noBase: [ReplayRun<Bool>] = []
         var hasBase = false
         var segs: [DiffSegment] = []
         for i in 0..<n {
             while bi < bItems.count, bItems[bi].t <= t[i] {   // その時刻のコマから使う（review.py の baseline_index）
-                engine.setBaseline(bItems[bi].stats)
-                hasBase = bItems[bi].stats != nil
+                engine.setBaseline(bItems[bi].stats, part: bItems[bi].part)
+                if bItems[bi].part != .voice { hasBase = bItems[bi].stats != nil }   // 斜線は表情の普段が無い時間
                 bi += 1
             }
             if !hasBase {
@@ -189,13 +195,19 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             var voice: [Metric: Double] = [:]
             if let r = rms[i] { voice[.rmsDb] = r }
             if let f = f0[i] { voice[.f0Hz] = f }
-            engine.add(DiffInput(t: t[i], face: face[i], yaw: yaw[i], faceValues: fv, blink: blink[i], voice: voice))
+            // 本人の声か：記録に書いてあればそれを、無い古い記録は撮る側と同じ決まりで決め直す（review.py と同じ）
+            let computed = voiceTracker.add(t: t[i], face: face[i], yaw: yaw[i], bs: bsList[i], voiced: f0[i] != nil)
+            let vs = recordedVoiceSelf[i] ?? computed
+            if vs == true { selfS += i + 1 < n ? min(t[i + 1] - t[i], 1) : 0 }
+            if vs == false { otherS += i + 1 < n ? min(t[i + 1] - t[i], 1) : 0 }
+            engine.add(DiffInput(t: t[i], face: face[i], yaw: yaw[i], faceValues: fv, blink: blink[i], voice: voice, voiceSelf: vs))
             segs += engine.finished
             engine.finished = []
         }
         engine.flush()
         segs += engine.finished
         segments = segs.filter(\.shown).sorted { $0.startT < $1.startT }
+        selfVoiceS = selfS; otherVoiceS = otherS
         noBaseline = noBase
 
         // 場面・家族の印・顔の向きの記録

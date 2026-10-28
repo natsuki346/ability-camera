@@ -29,6 +29,7 @@ HERE = Path(__file__).resolve().parent
 
 METRICS = ["mouth_smile", "brow_down", "eye_squint", "jaw_open", "rms_db", "f0_hz"]
 FACE_METRICS = {"mouth_smile", "brow_down", "eye_squint", "jaw_open"}
+VOICE_METRICS = ["rms_db", "f0_hz"]
 LABEL = {"mouth_smile": "口角を上げる", "brow_down": "眉を寄せる", "eye_squint": "目を細める",
          "jaw_open": "口を開ける", "rms_db": "声の大きさ", "f0_hz": "声の高さ"}
 UNIT = {"rms_db": " dB", "f0_hz": " Hz"}
@@ -52,6 +53,8 @@ def seg_text(m: str, sign: int) -> str:
     """区間を短く言う（「眉を寄せるがいつもより強い」「目を閉じている」）"""
     return LABEL[EYES] if m == EYES else f"{LABEL[m]}が{direction(m, sign)}"
 CRITERIA_KEYS = ["smooth_s", "start_z", "start_min_s", "end_z", "end_min_s"]
+# 口の動きを見る表情の数値の候補（どれを使うかは criteria.json の voice_self.keys）
+MOUTH_KEYS_ALL = ["jawOpen", "mouthClose", "mouthFunnel", "mouthPucker", "mouthRollLower", "mouthRollUpper", "mouthShrugLower", "mouthShrugUpper"]
 
 
 # ---------------------------------------------------------------- 読み込み
@@ -72,6 +75,8 @@ class Recording:
     baseline_source: str = "記録の baseline 行（アプリが記録したもの）"
     all_baselines: list[dict] = field(default_factory=list)   # 比べるのに使わなかった行（compared: false）も含む
     pairs: dict[str, np.ndarray] = field(default_factory=dict)   # 表情の数値 52種を左右平均したもの（browDown など。顔が無いコマは NaN）
+    bs_raw: dict[str, np.ndarray] = field(default_factory=dict)  # 口の動きを見る表情の数値（左右の無いもの。顔が無い・値が無いコマは NaN）
+    voice_self_rec: np.ndarray | None = None                     # 記録の voice_self（1 / 0 / NaN＝null、キーが無いコマは -1）。v1.6〜
 
     @property
     def has_pose(self) -> bool:
@@ -117,12 +122,20 @@ def load(path: Path) -> Recording:
     yaw, lat, proc, blink = (np.full(n, np.nan) for _ in range(4))
     face = np.zeros(n, bool)
     pairs: dict[str, np.ndarray] = {}
+    bs_raw = {k: np.full(n, np.nan) for k in MOUTH_KEYS_ALL}
+    vsr = np.full(n, -1.0)
     for i, o in enumerate(frames):
+        if "voice_self" in o:
+            v = o["voice_self"]
+            vsr[i] = np.nan if v is None else float(bool(v))
         if o.get("face") and o.get("bs"):
             face[i] = True
             for m, v in face_values(o["bs"]).items():
                 raw[m][i] = v
             bs = o["bs"]
+            for k in MOUTH_KEYS_ALL:
+                if bs.get(k) is not None:
+                    bs_raw[k][i] = bs[k]
             blink[i] = ((bs.get("eyeBlinkLeft") or 0) + (bs.get("eyeBlinkRight") or 0)) / 2
             for k, v in bs.items():
                 if k.endswith("Right") and k[:-5] + "Left" in bs:
@@ -148,7 +161,8 @@ def load(path: Path) -> Recording:
     # v1.2〜：保存した普段（source: "saved"）で比べたときは、今日の普段の行も compared: false で書かれる。
     # 区間はアプリと同じく、比べるのに使った行（compared が false でないもの）で判定する
     used = [b for b in baselines if b.get("compared", True) is not False]
-    return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines)
+    return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines,
+                     bs_raw=bs_raw, voice_self_rec=vsr)
 
 
 # ---------------------------------------------------------------- 基準
@@ -210,9 +224,19 @@ def face_valid(rec: Recording, c: dict) -> np.ndarray:
     return ok
 
 
-def baseline_index(rec: Recording) -> np.ndarray:
-    """各コマで使う普段（直前の baseline）。「普段を取り直す」から次の baseline までは無し（アプリと同じ）"""
-    marks = [(b["t_ms"] / 1000, i) for i, b in enumerate(rec.baselines)]
+def baseline_part(b: dict) -> str:
+    """baseline 行のどの部分か（v1.6〜の part：face / voice。無い行は all＝表情も声も）"""
+    return b.get("part") or "all"
+
+
+def covers(b: dict, part: str) -> bool:
+    return baseline_part(b) in ("all", part)
+
+
+def baseline_index(rec: Recording, part: str = "face") -> np.ndarray:
+    """各コマで使う普段（その部分を含む直前の baseline）。「普段を取り直す」から次の baseline までは無し（アプリと同じ）。
+    part は face（表情・目を閉じている）か voice（声）。v1.6〜の記録は、声の普段を表情とは別の行（part: "voice"）に書く"""
+    marks = [(b["t_ms"] / 1000, i) for i, b in enumerate(rec.baselines) if covers(b, part)]
     marks += [(e["t_ms"] / 1000, -1) for e in rec.events if e.get("kind") == "baseline_restart"]
     marks.sort()
     out = np.full(len(rec.t), -1)
@@ -319,6 +343,8 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
     processed, valid_arr, start0 = baseline_candidates(rec)
     starts = sorted([start0] + [e["t_ms"] / 1000 for e in rec.events if e.get("kind") == "baseline_restart"])
     blinked = blink_mask(rec, c)
+    split = bool(c and c.get("voice_self") and c.get("voice_baseline"))   # v1.6〜：声の普段は別に集める
+    face_only = [m for m in METRICS if m in FACE_METRICS] if split else METRICS
 
     out: list[dict] = []
     period = -1
@@ -328,7 +354,7 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
         ti = float(t[i])
         p = int(np.searchsorted(starts, ti, side="right")) - 1
         if p != period:
-            period, vals, valid_s, last, done = p, {m: [] for m in METRICS}, 0.0, None, False
+            period, vals, valid_s, last, done = p, {m: [] for m in face_only}, 0.0, None, False
         if done or p < 0 or not processed[i]:
             continue
         valid = bool(valid_arr[i])
@@ -336,7 +362,7 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
             valid_s += min(ti - last, 0.5)
         last = ti
         if valid:
-            for m in METRICS:
+            for m in face_only:
                 v = rec.raw[m][i]
                 if v == v and not (m == "eye_squint" and blinked[i]):
                     vals[m].append(float(v))
@@ -345,7 +371,46 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
                         "wall_s": round(ti - starts[p], 1), "valid_s": round(valid_s, 1),
                         "yaw_limit_deg": BASELINE_YAW_LIMIT, "warmup_s": BASELINE_WARMUP_S, "min_n": BASELINE_MIN_N,
                         "target_s": target_s, "rebuilt": True, "blink_masked": blink_mask_on(c),
-                        "metrics": {m: baseline_stat(np.array(vals[m])) for m in METRICS}})
+                        "metrics": {m: baseline_stat(np.array(vals[m])) for m in face_only},
+                        **({"part": "face"} if split else {})})
+            done = True
+    if split:
+        out += rebuild_voice_baselines(rec, c)
+        out.sort(key=lambda b: b["t_ms"])
+    return out
+
+
+def rebuild_voice_baselines(rec: Recording, c: dict) -> list[dict]:
+    """声の普段（アプリと同じ決まり、v1.6〜）：記録の始まりと「普段を取り直す」から、開いてから warmup 秒より後の本人の声のコマを集め、
+    数えた時間（前のコマからの幅、0.5秒で切る）が voice_baseline.target_s になったら1行（part: "voice"）。値はそのコマの rms_db・f0_hz"""
+    t = rec.t
+    _, _, start0 = baseline_candidates(rec)
+    starts = sorted([start0] + [e["t_ms"] / 1000 for e in rec.events if e.get("kind") == "baseline_restart"])
+    vs = voice_self_values(rec, c, face_valid(rec, c))
+    target = c["voice_baseline"]["target_s"]
+    out: list[dict] = []
+    period, vals, valid_s, last, done = -1, {}, 0.0, None, False
+    for i in range(len(t)):
+        ti = float(t[i])
+        p = int(np.searchsorted(starts, ti, side="right")) - 1
+        if p != period:
+            period, vals, valid_s, last, done = p, {m: [] for m in VOICE_METRICS}, 0.0, None, False
+        if done or p < 0:
+            continue
+        counted = vs[i] == 1 and ti - start0 >= BASELINE_WARMUP_S
+        if counted and last is not None and ti > last:
+            valid_s += min(ti - last, 0.5)
+        last = ti
+        if counted:
+            for m in VOICE_METRICS:
+                v = rec.raw[m][i]
+                if v == v:
+                    vals[m].append(float(v))
+        if valid_s >= target:
+            out.append({"type": "baseline", "t_ms": int(round(ti * 1000)), "started_ms": int(round(starts[p] * 1000)),
+                        "wall_s": round(ti - starts[p], 1), "voice_valid_s": round(valid_s, 1), "part": "voice",
+                        "warmup_s": BASELINE_WARMUP_S, "min_n": BASELINE_MIN_N, "target_s": target, "rebuilt": True,
+                        "blink_masked": True, "metrics": {m: baseline_stat(np.array(vals[m])) for m in VOICE_METRICS}})
             done = True
     return out
 
@@ -499,6 +564,52 @@ class Analysis:
     blinked: np.ndarray | None = None                            # 目を細めるを判定対象外にした、まばたきのコマ
     blink_note: str | None = None
     closed: np.ndarray | None = None                             # 目を閉じていたコマ（eyes_closed の区間）
+    voice_self: np.ndarray | None = None                         # 本人の声か（1 / 0 / NaN＝声が出ていない）。v1.6〜
+    vbidx: np.ndarray | None = None                              # 声の指標で使う普段（baseline 行の番号）
+
+
+def mouth_range(rec: Recording, keys: list[str], window_s: float) -> tuple[np.ndarray, np.ndarray]:
+    """各コマの、直近 window_s 秒の顔のあるコマでの、口の数値の変化（最大 − 最小）のうち一番大きいもの。
+    返り値：(変化, 窓の中の顔のあるコマの数)。アプリの VoiceSelfTracker と同じ"""
+    t, n = rec.t, len(rec.t)
+    out, cnt = np.zeros(n), np.zeros(n, int)
+    win: list[int] = []
+    for i in range(n):
+        if rec.face[i]:
+            win.append(i)
+        while win and t[i] - t[win[0]] > window_s + 1e-9:
+            win.pop(0)
+        cnt[i] = len(win)
+        best = 0.0
+        for k in keys:
+            x = rec.bs_raw.get(k)
+            if x is None:
+                continue
+            xs = x[win]
+            xs = xs[np.isfinite(xs)]
+            if len(xs):
+                best = max(best, float(xs.max() - xs.min()))
+        out[i] = best
+    return out, cnt
+
+
+def voice_self_values(rec: Recording, c: dict, fvalid: np.ndarray) -> np.ndarray:
+    """本人の声か（criteria.json の voice_self、アプリの VoiceSelfTracker と同じ決まり）。
+    声が出ている（f0 がある）コマのうち、顔が読めていて（face_valid）、そのコマに顔があり、口の数値の直近 window_s 秒の変化が
+    min_range 以上のものを 1（本人の声）、それ以外の声のコマを 0（本人の声と言えない）、声の無いコマを NaN にする。
+    記録に voice_self が書いてあるコマ（v1.6〜）は、その値を使う"""
+    voiced = np.isfinite(rec.raw["f0_hz"])
+    vc = c.get("voice_self") if c else None
+    if not vc:
+        out = np.where(voiced, 1.0, np.nan)        # 決まりが無ければ、今までどおり全部の声を使う
+    else:
+        rng, cnt = mouth_range(rec, vc["keys"], vc["window_s"])
+        ok = rec.face & fvalid & (cnt >= 2) & (rng >= vc["min_range"] - 1e-9)
+        out = np.where(voiced, ok.astype(float), np.nan)
+    if rec.voice_self_rec is not None:
+        has = rec.voice_self_rec != -1
+        out = np.where(has, rec.voice_self_rec, out)
+    return out
 
 
 def analyze(rec: Recording, c: dict) -> Analysis:
@@ -513,16 +624,22 @@ def analyze(rec: Recording, c: dict) -> Analysis:
     a = Analysis(rec, c, baseline_index(rec), face_valid(rec, c))
     a.blinked, a.blink_note = blinked, note
     t = rec.t
+    # 声：本人の声のコマの値だけを使い、本人の声と言えない声のコマでは判定しない（v1.6〜）
+    a.voice_self = voice_self_values(rec, c, a.fvalid)
+    a.vbidx = baseline_index(rec, "voice")
     for m in METRICS:
         mc = c["metrics"][m]
-        a.sm[m] = smooth(t, rec.raw[m], mc["smooth_s"], c["stale_s"])
+        voice = m not in FACE_METRICS
+        x = np.where(a.voice_self == 1, rec.raw[m], np.nan) if voice else rec.raw[m]
+        a.sm[m] = smooth(t, x, mc["smooth_s"], c["stale_s"])
+        bidx = a.vbidx if voice else a.bidx
         mean = np.full(len(t), np.nan)
         sd = np.full(len(t), np.nan)
         for bi, b in enumerate(rec.baselines):
             st = b.get("metrics", {}).get(m)
             if not st or st.get("insufficient") or st.get("mean") is None:
                 continue
-            sel = a.bidx == bi
+            sel = bidx == bi
             mean[sel] = st["mean"]
             sd[sel] = max(st.get("std") or 0, c["std_floor"][m])
         a.usable[m] = bool(np.isfinite(mean).any())
@@ -532,6 +649,8 @@ def analyze(rec: Recording, c: dict) -> Analysis:
             ok &= a.fvalid
         if m == "eye_squint":
             ok &= ~blinked
+        if voice:
+            ok &= ~(a.voice_self == 0)
         a.judge[m] = ok
         segs, shorts = detect(t, a.z[m], ok, mc)
         for s in segs:
@@ -702,7 +821,7 @@ def research_composite(a: "Analysis") -> Composite | None:
     mean = {k: np.full(len(t), np.nan) for k in keys}
     means = []
     for bi, b in enumerate(rec.baselines):
-        if b.get("started_ms") is None:
+        if b.get("started_ms") is None or baseline_part(b) == "voice":
             means.append({"t_ms": b["t_ms"], "values": {}})
             continue
         win = valid & (t >= b["started_ms"] / 1000) & (t <= b["t_ms"] / 1000 + 1e-6)
@@ -820,7 +939,8 @@ def segment_rows(a: Analysis, segs: list[Segment] | None = None, kind: str = "�
     for s in (a.segments if segs is None else segs):
         t0, t1 = t[s.i0], t[s.i1]
         eyes = s.metric == EYES
-        b = None if eyes else rec.baselines[a.bidx[s.i0]]["metrics"][s.metric]
+        idx = a.vbidx if s.metric in VOICE_METRICS else a.bidx
+        b = None if eyes else rec.baselines[idx[s.i0]]["metrics"][s.metric]
         sl = slice(s.i0, s.i1 + 1)
         sc = [name for (a0, a1, name) in scenes if a0 <= t1 and a1 >= t0]
         near = [f"{v}（{m_t - t0:+.1f}秒）" for (m_t, v) in mk if t0 - w <= m_t <= t1 + w]
@@ -850,6 +970,14 @@ def criteria_lines(c: dict) -> list[str]:
                    f"終了 |z|<{mc['end_z']} が {mc['end_min_s']}秒 / std下限 {c['std_floor'][m]}")
     out.append("表情の「いつもより弱い」区間：" + ("区間に数える" if c.get("face_below_counts", False)
                else "区間・通知候補・10分あたりには数えず、「表情の弱い方への変化（参考）」として別に出す（アプリと同じ。face_below_counts=false）"))
+    vc = c.get("voice_self")
+    if vc:
+        out.append(f"声（rms_db・f0_hz）：本人の声のコマだけで判定する。本人の声＝声が出ていて（f0 がある）、表情を判定できるコマで、"
+                   f"{'・'.join(vc['keys'])} のどれかの直近 {vc['window_s']:g}秒の変化が {vc['min_range']:g} 以上"
+                   + ("（仮の値）" if vc.get("provisional") else "") + "。本人の声と言えない声のコマでは判定しない")
+    vb = c.get("voice_baseline")
+    if vb:
+        out.append(f"声の普段：表情の普段とは別に、本人の声のコマが合計 {vb['target_s']:g}秒たまったら作る（baseline 行の part: \"voice\"）")
     ec = c.get("eyes_closed")
     if ec:
         out.append(f"目を閉じている（eyes_closed、普段とは比べない）：eyeBlink 左右平均が {ec['threshold']:g} 以上が {ec['start_min_s']:g}秒以上続いたら"
@@ -960,6 +1088,18 @@ def quality(a: Analysis, calm: bool) -> dict:
 
     q["missing"] = missing_values(a)
 
+    # 本人の声（v1.6〜）：本人の声・本人の声と言えない声の時間と、声が出ているコマの口の動き（しきい値を決めるため）
+    vs = a.voice_self
+    if vs is not None:
+        vc = c.get("voice_self")
+        q["voice"] = {"self_s": float(dt[vs == 1].sum()), "other_s": float(dt[vs == 0].sum()),
+                      "recorded": bool(rec.voice_self_rec is not None and (rec.voice_self_rec != -1).any())}
+        if vc:
+            rng, cnt = mouth_range(rec, vc["keys"], vc["window_s"])
+            sel = np.isfinite(rec.raw["f0_hz"]) & rec.face & a.fvalid & (cnt >= 2)
+            x = rng[sel]
+            q["voice"]["mouth"] = (tuple(float(np.percentile(x, p)) for p in (10, 50, 90)), int(len(x))) if len(x) else None
+
     yaw = rec.yaw[np.isfinite(rec.yaw)]
     if len(yaw):
         ay = np.abs(yaw)
@@ -1039,8 +1179,10 @@ def compare_saved(rec: Recording, c: dict) -> dict:
     if not rows["saved"] or not rows["today"]:
         out["missing"] = ("保存した普段の行がありません（人を選んでいない・その人の保存した普段が無い・カメラが違う、または v1.2.1 より前で設定がオフの記録）" if not rows["saved"]
                           else "今日の普段の行がありません（今日の普段を記録し終える前に閉じた記録）")
-    sv, td = (rows["saved"][0] if rows["saved"] else None), (rows["today"][0] if rows["today"] else None)
     for m in METRICS:
+        part = "face" if m in FACE_METRICS else "voice"
+        sv = next((b for b in rows["saved"] if covers(b, part)), None)   # その指標を含む最初の行（v1.6〜は表情と声が別の行）
+        td = next((b for b in rows["today"] if covers(b, part)), None)
         a_ = (sv or {}).get("metrics", {}).get(m, {})
         b_ = (td or {}).get("metrics", {}).get(m, {})
         shift = None
@@ -1294,18 +1436,22 @@ def baseline_time_row(b: dict) -> list:
     started = jst(b["started_ms"] / 1000) if b.get("started_ms") else "–"
     wall = b.get("wall_s", b.get("duration_s"))
     valid = b.get("valid_s")
+    part = {"face": "表情", "voice": "声", "all": ""}[baseline_part(b)]
+    if baseline_part(b) == "voice":
+        valid = b.get("voice_valid_s")
     if baseline_kind(b) == "saved":
         cond = "保存した普段" + (f"（{jst(b['saved_ms'] / 1000)} に保存）" if b.get("saved_ms") else "")
     elif valid is None:
         cond = "時計の時間で数えた（v0.3 までの記録）"
     else:
-        cond = f"顔が読めていて |yaw| < {b.get('yaw_limit_deg', 35):g}°、開いてから {b.get('warmup_s', 5):g}秒より後"
+        cond = (f"本人の声のコマ、開いてから {b.get('warmup_s', 5):g}秒より後" if baseline_part(b) == "voice" else
+                f"顔が読めていて |yaw| < {b.get('yaw_limit_deg', 35):g}°、開いてから {b.get('warmup_s', 5):g}秒より後")
     target = b.get("target_s")
     target = f"{target:g}秒" if target is not None else ("60秒（書かれていない v0.9 より前の記録）" if valid is not None else "–")
     closed = b.get("eyes_closed_s")
     closed = "–" if closed is None else f"{closed:g}秒" + (f"（{closed / valid:.0%}）" if valid else "")
     return [started, jst(b["t_ms"] / 1000), target, "–" if wall is None else f"{wall:g}秒",
-            "–" if valid is None else f"{valid:g}秒", closed, cond]
+            "–" if valid is None else f"{valid:g}秒", closed, f"{part}：{cond}" if part else cond]
 
 
 def peak_text(rw: dict) -> str:
@@ -1347,6 +1493,15 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
              ["解析コマ/秒", f"{q['fps']:.1f}"],
              ["撮影→結果の遅れ ms（中央値 / 95%）", ms(q["lat"])],
              ["解析時間 ms（中央値 / 95%）", ms(q["proc"])]]
+    if "voice" in q:
+        v = q["voice"]
+        qrows.append(["本人の声の時間 / 本人の声と言えない声の時間（v1.6〜）",
+                      f"{fmt_s(v['self_s'])} / {fmt_s(v['other_s'])}"
+                      + ("（記録の voice_self）" if v["recorded"] else "（voice_self の無い記録なので、同じ決まりで決め直したもの）")])
+        if v.get("mouth"):
+            (p10, p50, p90), n = v["mouth"]
+            qrows.append(["声が出ていて顔が読めているコマの口の動き（直近0.3秒の変化、10% / 中央値 / 90%）",
+                          f"{p10:.3f} / {p50:.3f} / {p90:.3f}（{n}コマ。しきい値 {c['voice_self']['min_range']:g}）"])
     if "yaw" in q:
         y = q["yaw"]
         qrows.append(["yaw の分布（5% / 中央値 / 95%）", f"{y['p5']:.0f}° / {y['median']:.0f}° / {y['p95']:.0f}°"])
@@ -1386,6 +1541,8 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         brows = []
         for b in rec.baselines:
             for m in METRICS:
+                if m not in b.get("metrics", {}):
+                    continue   # v1.6〜は表情と声が別の行
                 st = b.get("metrics", {}).get(m, {})
                 f = lambda v: "" if v is None else f"{v:g}"
                 app = b.get("eye_squint_app") if m == "eye_squint" else None

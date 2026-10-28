@@ -18,10 +18,22 @@ struct FrameRecord: Encodable {
     var faceCx: Double?         // 本人として使った顔の枠：中心 x・y と幅（0〜1、v1.2〜）
     var faceCy: Double?
     var faceW: Double?
+    var voiceSelf = Nullable<Bool>(nil)   // 本人の声か（v1.6〜）：true / false（本人の声と言えない）/ null（声が出ていない）。いつも書く
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", face, bs, pts, rmsDb = "rms_db", f0Hz = "f0_hz", procMs = "proc_ms", latMs = "lat_ms"
         case yawDeg = "yaw_deg", pitchDeg = "pitch_deg", rollDeg = "roll_deg", faceCx = "face_cx", faceCy = "face_cy", faceW = "face_w"
+        case voiceSelf = "voice_self"
+    }
+}
+
+/// nil のときも null と書く値（書いていない古い記録と見分けるため）
+struct Nullable<T: Encodable>: Encodable {
+    let value: T?
+    init(_ v: T?) { value = v }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        if let value { try c.encode(value) } else { try c.encodeNil() }
     }
 }
 
@@ -87,10 +99,12 @@ struct BaselineRecord: Encodable {
     var savedMs: Int64?         // saved：保存した日時
     var camera: String?         // saved：保存したときのカメラ
     var faceBox: FaceBoxStats?  // 普段の間の顔の位置と大きさ（v1.2〜）
+    var part: String?           // face：表情の普段 / voice：声の普段（v1.6〜。無い行は両方）
+    var voiceValidS: Double?    // voice：声の普段に数えた本人の声の秒数（v1.6〜）
     var eyesClosedS: Double?    // 普段の間に目を閉じていた秒数（v1.4〜。目を閉じているの決まりで、数えたコマから。保存した普段には無い）
 
     enum CodingKeys: String, CodingKey {
-        case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", eyesClosedS = "eyes_closed_s"
+        case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", eyesClosedS = "eyes_closed_s", part, voiceValidS = "voice_valid_s"
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
         case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics
     }

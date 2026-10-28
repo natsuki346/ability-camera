@@ -829,6 +829,11 @@ def pitch_ranges(rec: Recording) -> list[tuple[float, float, float]]:
         out.append((b["t_ms"] / 1000, float(st["median"]), spread_of(float(st.get("iqr") or 0))))
     # 声も取り直したとき（part が face でない baseline_restart、v1.9.3〜）は、そこから範囲を外す（アプリと同じ）
     out += [(t, None, None) for t in restart_times(rec, "voice")]
+    # 声の普段を集め終えた・保存し直したときに、アプリが使い始めた範囲（v1.9.4〜、kind: "voice_pitch_range"。median が無ければ外した）
+    for e in rec.events:
+        if e.get("kind") == "voice_pitch_range":
+            m = e.get("median")
+            out.append((e["t_ms"] / 1000, None if m is None else float(m), None if m is None else spread_of(float(e.get("iqr") or 0))))
     return sorted(out, key=lambda x: x[0])
 
 

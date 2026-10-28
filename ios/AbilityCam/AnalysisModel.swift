@@ -696,7 +696,10 @@ final class AnalysisModel: ObservableObject {
         guard let t = todayBaseline, let p = PersonStore.shared.selected else { return }
         resaveAccepted = true   // 声の普段も、集め終えたもので置き換える
         PersonStore.shared.setSaved(p.id, camera: t.camera, t)   // 今のカメラの普段だけ置き換える
-        if let v = todayVoice { PersonStore.shared.setVoice(p.id, v) }
+        if let v = todayVoice {
+            PersonStore.shared.setVoice(p.id, v)
+            usePitchRange(of: v, tMs: Self.nowMs())   // 保存し直した声の普段の範囲を、この時刻から使う（v1.9.4〜）
+        }
         showMessage("\(p.displayName)の\(CameraLens(rawValue: t.camera)?.shortLabel ?? "")の普段を保存し直しました")
     }
 
@@ -846,6 +849,20 @@ final class AnalysisModel: ObservableObject {
             showMessage("\(p.displayName)の声の普段を\(replaced ? "保存し直しました" : "保存しました")")
         }
         voiceRetake = false; voiceRetaking = false
+        // 声の高さの範囲（v1.9.4〜）：集め終えたら、選んでいる人の今の保存した声の普段（今保存し直したなら新しいもの、置き換えなかったなら前のもの）の範囲を使い始める。
+        // 外していたのは集めている間だけ。記録に event（voice_pitch_range）を書き、振り返りレポートとリプレイもこの時刻から同じ範囲を使う
+        usePitchRange(of: PersonStore.shared.selected?.voice, tMs: tMs)
+    }
+
+    /// 声の高さの範囲を、その声の普段の中央値・四分位範囲にする（中央値が無ければ外す）。記録に event（kind: "voice_pitch_range"、median・iqr）を書く
+    private func usePitchRange(of v: SavedVoice?, tMs: Int64) {
+        let st = v?.metrics[Metric.f0Hz.rawValue]
+        let median = st?.insufficient == false ? st?.median : nil
+        voiceBox.setPitchRange(median: median, iqr: st?.iqr, fromT: Double(tMs) / 1000)
+        var e = EventRecord(tMs: tMs, kind: "voice_pitch_range", value: nil)
+        e.median = median; e.iqr = median == nil ? nil : st?.iqr
+        logger.write(e)
+        voiceSpreadWide = v?.spreadWide ?? false
     }
 
     /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない

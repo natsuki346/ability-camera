@@ -84,11 +84,13 @@ struct EventRecord: Encodable {
     var savedCamera: String?    // saved_baseline_skipped：保存した普段のカメラ
     var mirrorCorrected: Bool?  // camera：解析に渡す映像が鏡のようになっていて、記録の値（左右の表情・yaw・roll・顔の枠）を背面と同じ意味に直した（v1.6.1〜）
     var orientationVersion: Int? // camera：解析に渡す映像の向きの決め方（camera_orientation_version、v1.6.1〜は 2）
+    var median: Double?         // voice_pitch_range：声の高さの範囲に使う中央値（Hz）。無ければ範囲を外した（v1.9.4〜）
+    var iqr: Double?            // voice_pitch_range：その四分位範囲（Hz）
     var part: String?           // baseline_restart：face＝表情の普段だけ取り直した（カメラを変えたとき、v1.7〜。声の普段は続ける）。無ければ両方
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
-        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part
+        case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part, median, iqr
     }
 }
 

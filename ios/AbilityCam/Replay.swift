@@ -197,6 +197,10 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         for e in evs where e["kind"] as? String == "baseline_restart" && BaselinePart.of(e["part"] as? String) != .face {
             pitchRanges.append((ms(e)!, nil, nil))
         }
+        // 声の普段を集め終えた・保存し直したときに、撮る側が使い始めた範囲（v1.9.4〜、kind: "voice_pitch_range"。median が無ければ外した）
+        for e in evs where e["kind"] as? String == "voice_pitch_range" {
+            pitchRanges.append((ms(e)!, (e["median"] as? NSNumber)?.doubleValue, (e["iqr"] as? NSNumber)?.doubleValue ?? 0))
+        }
         pitchRanges.sort { $0.t < $1.t }
         var pi = 0
         var detail: [(t: Double, voiceSelf: Bool, reason: String?, corr: Double?, corrOther: Double?, match: String?)] = []

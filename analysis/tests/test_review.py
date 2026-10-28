@@ -1434,3 +1434,49 @@ class PitchRangeRestartTest(unittest.TestCase):
                 pitch = any(det.reason[i] == "pitch" for i in range(len(rec.t)) if 22 <= rec.t[i] - t0 < 32)
                 self.assertEqual(pitch, want, part)
                 self.assertEqual(check_app.compare_voice(q, check_app.build(), c), [], part)
+
+
+class PitchRangeAfterRetakeTest(unittest.TestCase):
+    """声の普段を集め終えたら（v1.9.4〜）、アプリは voice_pitch_range の event の時刻から、その人の保存した声の普段の範囲を使い始める。
+    声だけ取り直して保存し直したとき（新しい範囲）・両方取り直して置き換えなかったとき（前の範囲に戻す）。レポートとリプレイも同じ"""
+
+    def write(self, d, restart_part, event):
+        import json
+        p = Path(d) / f"retake_{restart_part}_{bool(event)}.jsonl"
+        _voice_mix_record(p, saved_pitch=(150.0, 15.0))
+        lines = p.read_text(encoding="utf-8").splitlines()
+        t0 = json.loads(lines[0])["started_at_ms"]
+        e = {"type": "event", "t_ms": t0 + 5000, "kind": "baseline_restart", "value": None}
+        if restart_part:
+            e["part"] = restart_part
+        lines.append(json.dumps(e))
+        # 本人の声が10秒たまった（10〜20秒）ところで、今日の声の普段の行と、使い始めた範囲
+        lines.append(json.dumps({"type": "baseline", "t_ms": t0 + 20500, "source": "today", "compared": True, "part": "voice",
+                                 "metrics": {"f0_hz": {"n": 300, "mean": 152.0, "std": 14.0, "median": 152.0, "iqr": 24.0, "insufficient": False},
+                                             "rms_db": {"n": 300, "mean": -45.0, "std": 4.0, "insufficient": False}}}))
+        if event:
+            lines.append(json.dumps({"type": "event", "t_ms": t0 + 20500, "kind": "voice_pitch_range", "value": None, **event}))
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def reasons(self, p, a, b):
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        rec = review.load(p)
+        d = review.voice_self_details(rec, c, review.face_valid(rec, c), use_recorded=False)
+        t0 = rec.t[0]
+        return {d.reason[i] for i in range(len(rec.t)) if a <= rec.t[i] - t0 < b and d.values[i] == d.values[i]}
+
+    def test_cases(self):
+        import check_app
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        exe = check_app.build()
+        with tempfile.TemporaryDirectory() as d:
+            for part, event in (("voice", {"median": 152.0, "iqr": 24.0}),   # 声だけ取り直して保存し直した：新しい範囲
+                                (None, {"median": 150.0, "iqr": 20.2}),       # 両方取り直して置き換えなかった：前の範囲に戻す
+                                ("voice", None)):                             # v1.9.3 まで（event が無い）：範囲は外れたまま
+                p = self.write(d, part, event)
+                self.assertNotIn("pitch", self.reasons(p, 10.5, 20))          # 集めている間は範囲を使わない
+                self.assertEqual("pitch" in self.reasons(p, 22, 32), event is not None, (part, event))
+                self.assertEqual(check_app.compare_voice(p, exe, c), [], (part, event))
+                diffs, _ = check_app.compare(p, exe, c)
+                self.assertEqual(diffs, [], (part, event))

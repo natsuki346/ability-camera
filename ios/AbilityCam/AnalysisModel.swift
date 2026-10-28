@@ -124,6 +124,7 @@ final class AnalysisModel: ObservableObject {
     private var voiceCarry: VoicePartial?                     // このセッションの始め（・人を選んだとき）に読んだもの
     private var voiceCarryOwner: String?                      // voiceCarry を読んだ人（人を変えたら、その人の分を元に戻す）
     private var voiceSessionFirstMs: Int64?                   // このセッションで初めて本人の声を数えた時刻
+    private var voiceRetake = false                           // 声の普段だけを取り直した（集め終えたら、その人の声の普段を置き換える。v1.9.2〜）
     private var voiceF0Values: [Double] = []                  // このセッションで数えた声の高さ（v1.9.1〜、中央値・四分位範囲を求める）
     private var voiceSavedSec = -1                            // 最後に保存した秒（1秒ごとに保存する）
     private var pitchCoverage = PitchCoverage()
@@ -221,6 +222,7 @@ final class AnalysisModel: ObservableObject {
         sessionStartMs = Self.nowMs()
         face.setPreferred(nil)
         voiceCarry = nil; voiceCarryOwner = nil
+        PersonStore.shared.onVoiceRestart = { [weak self] id in self?.restartVoiceFromSettings(id) ?? false }
         voiceBox.setPitchRange(median: nil, iqr: nil, fromT: 0)   // 保存した声の普段の範囲は、applySaved で使い始める
         resetBaseline()   // 普段（設定の長さ）も自動で始める
         loadVoiceCarry()  // 途中まで集めた声の普段があれば、続きから（v1.7〜）
@@ -249,6 +251,7 @@ final class AnalysisModel: ObservableObject {
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false
             voiceWait = nil; voiceSpreadWide = false
+            PersonStore.shared.voiceRestarting = nil
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
             if let s = logger.finish() {
@@ -404,7 +407,48 @@ final class AnalysisModel: ObservableObject {
 
     /// 普段を取り直す：保存した普段で比べていても、それをやめて今日の普段を画面に出して取り直す。
     /// 取り終えたら、選んだ人に保存した普段があれば「この普段で保存し直しますか？」と聞く
-    /// keepVoice：カメラを変えたとき（v1.7〜）。声の普段はカメラに関係ないので続ける（記録には part: "face" で書く）
+    /// 「普段を取り直す」で選ぶもの（v1.9.2〜）
+    enum RestartPart: String, CaseIterable, Identifiable {
+        case face = "表情だけ", voice = "声だけ", both = "両方"
+        var id: String { rawValue }
+    }
+
+    func restart(_ part: RestartPart) {
+        switch part {
+        case .face: restartBaseline(keepVoice: true)
+        case .voice: restartVoice()
+        case .both: restartBaseline()
+        }
+    }
+
+    /// 声の普段だけを、その場で初めから集め直す（v1.9.2〜）。表情の普段はそのまま。記録には baseline_restart（part: "voice"）
+    @discardableResult
+    func restartVoice() -> Bool {
+        guard running else { return false }
+        var e = EventRecord(tMs: Self.nowMs(), kind: "baseline_restart", value: nil)
+        e.part = BaselinePart.voice.rawValue
+        logger.write(e)
+        engine.setBaseline(nil, part: .voice)          // 声は集め直すまで比べない
+        voiceBox.setPitchRange(median: nil, iqr: nil, fromT: 0)
+        voiceCarry = nil                                  // 前のセッションまでに途中まで集めた分も使わない
+        voiceStats = [:]; voiceValidS = 0; voicePrevT = nil; voiceStartMs = Self.nowMs(); voiceDone = false
+        voiceSessionFirstMs = nil; voiceSavedSec = -1; voiceF0Values = []; voiceSpreadWide = false
+        voiceSec = 0; comparingVoice = nil; usedVoice = nil; todayVoice = nil
+        voiceWaitTracker.reset(); voiceWait = nil
+        voiceRetake = true
+        voiceCarryOwner = PersonStore.shared.selected?.id
+        publishBaseline(tMs: Self.nowMs())   // 声の「データ不足」を消して、集めている表示にする
+        showMessage("声の普段を集め直しています")
+        return true
+    }
+
+    /// 設定の「人」で「声の普段を取り直す」を押した：記録中でその人を選んでいれば、その場で集め直す（v1.9.2〜）
+    private func restartVoiceFromSettings(_ id: String) -> Bool {
+        guard running, PersonStore.shared.selectedID == id else { return false }
+        return restartVoice()
+    }
+
+    /// keepVoice：カメラを変えたとき（v1.7〜）・「表情だけ」取り直すとき（v1.9.2〜）。声の普段は続ける（記録には part: "face" で書く）
     func restartBaseline(keepVoice: Bool = false) {
         guard running else { return }
         var e = EventRecord(tMs: Self.nowMs(), kind: "baseline_restart", value: nil)
@@ -494,7 +538,7 @@ final class AnalysisModel: ObservableObject {
         guard !keepVoice else { return }
         // 声の普段も、表情とは別に初めから集め直す（v1.6〜）。前のセッションまでに途中まで集めた分（voiceCarry）は残す（v1.7〜）
         voiceStats = [:]; voiceValidS = 0; voicePrevT = nil; voiceStartMs = Self.nowMs(); voiceDone = false
-        voiceSessionFirstMs = nil; voiceSavedSec = -1; voiceF0Values = []; voiceSpreadWide = false
+        voiceSessionFirstMs = nil; voiceSavedSec = -1; voiceF0Values = []; voiceSpreadWide = false; voiceRetake = false
         voiceSec = Int(voiceCarry?.validS ?? 0); comparingVoice = nil; usedVoice = nil; todayVoice = nil
         voiceWaitTracker.reset(); voiceWait = nil
     }
@@ -779,13 +823,16 @@ final class AnalysisModel: ObservableObject {
             publishBaseline(tMs: tMs)
         }
         voiceSec = nil; voiceWait = nil
+        PersonStore.shared.voiceRestarting = nil   // 集め直し終えた
         let v = SavedVoice(metrics: out, validS: row.voiceValidS ?? voiceTotalS, savedMs: tMs)
         todayVoice = v
         // 人の保存した普段に声の普段が無ければ足す（「保存し直す」を選んだあとなら置き換える）。うしろで集めたものは置き換えない
-        if let p = PersonStore.shared.selected, p.voice == nil || resaveAccepted {
+        if let p = PersonStore.shared.selected, p.voice == nil || resaveAccepted || voiceRetake {
+            let replaced = p.voice != nil
             PersonStore.shared.setVoice(p.id, v)
-            showMessage("\(p.displayName)の声の普段を保存しました")
+            showMessage("\(p.displayName)の声の普段を\(replaced ? "保存し直しました" : "保存しました")")
         }
+        voiceRetake = false
     }
 
     /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない

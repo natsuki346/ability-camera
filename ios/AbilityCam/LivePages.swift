@@ -57,11 +57,16 @@ struct NowPage: View {
             HStack(alignment: .center, spacing: 6) {
                 Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(2).minimumScaleFactor(0.6)
                 Spacer(minLength: 2)
-                Button("普段を取り直す") { model.restartBaseline() }
-                    .font(.caption)
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                    .disabled(!model.running)
+                // 表情だけ／声だけ／両方を選ぶ（v1.9.2〜）
+                Menu("普段を取り直す") {
+                    ForEach(AnalysisModel.RestartPart.allCases) { p in
+                        Button(p.rawValue) { model.restart(p) }
+                    }
+                }
+                .font(.caption)
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(!model.running)
             }
             differences
             meters

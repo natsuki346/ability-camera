@@ -1371,3 +1371,41 @@ class AudioLagTest(unittest.TestCase):
         c0["voice_self"]["sync"]["lag_s"] = 0
         corr0, _, _ = review.sync_corr(rec, c0["voice_self"])
         self.assertLess(np.nanmedian(corr0[60:]), np.nanmedian(corr[60:]) - 0.1)   # ずれを探さないと低い
+
+
+class VoiceRestartTest(unittest.TestCase):
+    """声だけ取り直す（baseline_restart、part: "voice"、v1.9.2〜）：声の普段だけ消え、表情の普段はそのまま。アプリのリプレイと同じ"""
+
+    def write(self, d, part):
+        import json
+        lines = VOICE_FIXTURE.read_text(encoding="utf-8").splitlines()
+        e = {"type": "event", "t_ms": review.load(VOICE_FIXTURE).t[0] * 1000 + 45000, "kind": "baseline_restart", "value": None}
+        if part:
+            e["part"] = part
+        e["t_ms"] = int(e["t_ms"])
+        p = Path(d) / f"restart_{part}.jsonl"
+        p.write_text("\n".join(lines + [json.dumps(e)]) + "\n", encoding="utf-8")
+        return p
+
+    def test_voice_only(self):
+        import check_app
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            p = self.write(d, "voice")
+            a = review.analyze(review.load(p), c)
+            kinds = [s.metric for s in a.segments]
+            self.assertNotIn("f0_hz", kinds)            # 50秒の声の高さ・80秒の声の大きさは、声の普段が無いので出ない
+            self.assertNotIn("rms_db", kinds)
+            self.assertTrue((a.bidx[-10:] >= 0).all())  # 表情の普段はそのまま
+            self.assertTrue((a.vbidx[-10:] < 0).all())
+            self.assertIn(review.VOICE_ON, kinds)       # 声が出たは普段と関係なく出る
+            diffs, _ = check_app.compare(p, check_app.build(), c)
+            self.assertEqual(diffs, [])
+
+    def test_face_only_keeps_voice(self):
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            a = review.analyze(review.load(self.write(d, "face")), c)
+        self.assertTrue((a.vbidx[-10:] >= 0).all())
+        self.assertTrue((a.bidx[-10:] < 0).all())
+        self.assertIn("rms_db", [s.metric for s in a.segments])

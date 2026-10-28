@@ -94,6 +94,21 @@ final class PersonStore: ObservableObject {
 
     var selected: Person? { people.first { $0.id == selectedID } }
 
+    /// 記録中にその場で声の普段を集め直している人（v1.9.2〜。設定の「人」に「声の普段を集め直しています」と出す）
+    @Published var voiceRestarting: String?
+    /// 撮る側が、記録中ならその場で声の普段を集め直し始める（始めたら true）。AnalysisModel が入れる
+    var onVoiceRestart: ((String) -> Bool)?
+
+    /// 「声の普段を取り直す」：保存した声の普段と途中まで集めた分を消し、記録中でその人を選んでいれば、その場で集め直し始める。
+    /// 返り値：その場で始めたか（false なら次に記録を始めたときから）
+    @discardableResult
+    func restartVoice(_ id: String) -> Bool {
+        setVoice(id, nil); setVoicePartial(id, nil)
+        let live = onVoiceRestart?(id) ?? false
+        voiceRestarting = live ? id : nil
+        return live
+    }
+
     private static var url: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -256,6 +271,7 @@ struct PersonEditView: View {
     @ObservedObject var store = PersonStore.shared
     @State private var name = ""
     @State private var confirmDelete = false
+    @State private var voiceRetakeLater = false   // 記録していないときに取り直した（次に記録を始めたときから）
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -289,14 +305,18 @@ struct PersonEditView: View {
                     if v.spreadWide {
                         Text("声の普段のばらつきが大きいです（取り直せます）").foregroundStyle(ContentView.navyText)
                     }
-                    // 取り直す：保存した声の普段と途中まで集めた分を消し、次に記録を始めたときから集め直す
-                    Button("声の普段を取り直す") { store.setVoice(id, nil); store.setVoicePartial(id, nil) }
+                    // 取り直す：保存した声の普段と途中まで集めた分を消し、記録中ならその場で集め直し始める（v1.9.2〜）
+                    Button("声の普段を取り直す") { voiceRetakeLater = !store.restartVoice(id) }
                     Button("声の普段を消す") { store.setVoice(id, nil) }
+                } else if store.voiceRestarting == id {
+                    Text("声の普段を集め直しています").foregroundStyle(ContentView.navyText)
+                } else if voiceRetakeLater {
+                    Text("次に記録を始めたときから、声の普段を集め直します").foregroundStyle(.secondary)
                 } else {
                     Text("ありません（本人の声が10秒たまると、自動で保存します）").foregroundStyle(.secondary)
                 }
             } header: { Text("保存した声の普段（どのカメラでも使う）") } footer: {
-                Text("「取り直す」と、保存した声の普段と途中まで集めた声を消し、次に記録を始めたときから集め直します")
+                Text("「取り直す」と、保存した声の普段と途中まで集めた声を消して集め直します（記録中でこの人を選んでいればその場で、そうでなければ次に記録を始めたときから）")
             }
             Section {
                 Button("この人を消す") { confirmDelete = true }

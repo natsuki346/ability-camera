@@ -319,9 +319,10 @@ def covers(b: dict, part: str) -> bool:
 
 
 def restart_times(rec: Recording, part: str = "face") -> list[float]:
-    """「普段を取り直す」（baseline_restart）の時刻。カメラを変えたときの行（part: "face"、v1.7〜）は表情だけ取り直し、声の普段は続ける"""
+    """「普段を取り直す」（baseline_restart）の時刻。part: "face"（カメラを変えたとき・表情だけ、v1.7〜）は表情だけ、
+    part: "voice"（声だけ、v1.9.2〜）は声だけ取り直す。part の無い行は両方"""
     return [e["t_ms"] / 1000 for e in rec.events
-            if e.get("kind") == "baseline_restart" and (part == "face" or e.get("part") != "face")]
+            if e.get("kind") == "baseline_restart" and e.get("part") in (None, "all", part)]
 
 
 def baseline_index(rec: Recording, part: str = "face") -> np.ndarray:

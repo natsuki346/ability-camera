@@ -174,9 +174,10 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             }
             bItems.append((bt, stats, BaselinePart.of(b["part"] as? String)))
         }
-        // カメラを変えたときの取り直し（part: "face"、v1.7〜）は表情の普段だけ消す（声の普段は続ける。review.py の restart_times と同じ）
+        // カメラを変えたとき・表情だけの取り直し（part: "face"、v1.7〜）は表情の普段だけ消す（声の普段は続ける。review.py の restart_times と同じ）
         for e in evs where e["kind"] as? String == "baseline_restart" {
-            bItems.append((ms(e)!, nil, (e["part"] as? String) == "face" ? .face : .all))
+            // part: "voice"（声だけ取り直した、v1.9.2〜）は声の普段だけ消す
+            bItems.append((ms(e)!, nil, BaselinePart.of(e["part"] as? String)))
         }
         bItems.sort { $0.t < $1.t }
         if baselines.isEmpty { notes.append("この記録には普段（baseline 行）が無いので、いつもとの違いは出せません") }

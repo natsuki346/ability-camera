@@ -81,6 +81,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回だ
   声が出ていて顔が読めているコマの「口の動き」（直近0.3秒の変化の 10% / 中央値 / 90%）を出す（しきい値 `min_range` を決めるため）
 - **声の普段（voice_baseline）**：v1.6〜の記録は、表情の普段（`part: "face"`）と声の普段（`part: "voice"`）が別の行。区間は指標ごとに、その部分を含む直前の行で判定する（古い行は両方を含む）。
   `--baseline-s` で作り直すときも、声はアプリと同じく本人の声が10秒たまった所で別の行にする
+- **本人の声の見分け（voice_self.sync・pitch_range、v1.9〜）**：声のコマを pitch（保存した声の普段の範囲の外）→ no_face → no_mouth → timing（直近1秒の jawOpen と rms_db の相関が min_corr 未満）の順に見る。
+  記録に `voice_self` があるコマはその値（と `voice_self_reason`・`voice_corr`・`voice_match`）を使い、無い古い記録は同じ決まりで決め直す。
+  `check_app.py` は区間に加えて、声のコマごとの判定・理由・相関・どの顔の口と合っていたかも、アプリ（DiffCheck `--voice`）と比べる。`VoiceSyncTest` が作り物の記録で確かめる
 - **顔の向きの普段と特徴（pose、v1.8〜、`pose.py`）**：区間・通知候補には使わず、レポートの節に出すだけ。いつもの向き（baseline 行の `pose`。無い v1.7 までの記録は普段を集めた時間のコマから数え直す）、
   いつもの範囲（平均 ± `range_z` × 標準偏差、下限 `std_floor_deg`）から同じ向きに `min_s` 秒以上外れた時間、向きを変えた回数・とどまった長さの分布・急な向きの変化（`quick_window_s` 秒で `quick_deg` 以上）、
   場面ごと・家族の印の前後 `mark_window_s` 秒の向きの分布。`--baseline-s` で作り直した普段にも `pose` を入れる。`PoseTest` が作り物の記録で確かめる
@@ -159,6 +162,15 @@ PITCH_FLOOR_DB=-55 .venv/bin/python pitch_check.py 音.wav   # 音の下限を�
 ```
 `ios/Tools/PitchCheck` とアプリの `Pitch.swift` を `swiftc` でビルドし、アプリと同じく 0.1秒ごとの塊の先頭 4096 サンプルで求める。
 部屋の音だけを録った WAV で「f0」が 0 になることを確かめる。`PitchTest` は、`--selftest` が通ること・`criteria.json` の `pitch` とアプリの値が同じこと・範囲の外の f0 を外してもアプリとレポートの区間が一致することを確かめる。
+
+### 本人の声の見分けのしきい値を確かめる（v1.9〜）
+```sh
+.venv/bin/python voice_check.py 記録.jsonl --self 25-37 --other 42-51           # 本人・ほかの人が話していた時間（記録の始まりからの秒、または 13:42:05-13:42:20）
+.venv/bin/python voice_check.py 記録.jsonl --self-hz 100-200 --other-hz 250-400  # 時間が分からなければ声の高さで分けて代わりに（タイミングの決まりだけを見る）
+.venv/bin/python voice_check.py 記録.jsonl --self 25-37 --other 42-51 --pitch-mean 150 --pitch-sd 15   # 保存した声の普段の代わりを足して、声の高さの範囲も試す
+```
+記録の `voice_self` は使わずに決め直し、決まりの組み合わせ（口の動きだけ＝v1.8 まで／＋タイミング／＋声の高さの範囲／両方）と `min_corr`（0〜0.6）ごとに、
+「本人の声を本人と言えた割合」「ほかの人の声を本人と言ってしまった割合」を出す。
 
 ### アプリの判定と比べる（Mac）
 ```sh

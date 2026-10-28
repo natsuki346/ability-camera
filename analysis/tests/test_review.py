@@ -1136,3 +1136,126 @@ class PoseTest(unittest.TestCase):
             rows = review.rebuild_baselines(review.load(p), 10.0, review.load_criteria(review.HERE / "criteria.json", []))
         self.assertIn("pose", rows[0])
         self.assertLess(abs(rows[0]["pose"]["roll_deg"]["mean"]), 1)
+
+
+def _voice_mix_record(path, saved_pitch=None, two_faces=False, length=34.0):
+    """本人の声の見分け（v1.9〜）の確かめ用。2026-10-28 20:25 の記録で起きたことを作り物で：
+      0–10・20–22・32– 黙っている（口は小さく動く：直近0.3秒の変化 0.1 くらい）
+      10–20 本人が話す（f0 150Hz 前後、口の開きと声の大きさが同じ 4Hz で揺れる）
+      22–32 ほかの人が話す（f0 320Hz、声は 3.3Hz で揺れる。本人の口は黙っているときと同じ小さな動き）
+    two_faces なら、ほかの人の顔も映っていて、その口が声と同じ 3.3Hz で揺れる（other_jaw_open）"""
+    import json
+    import math
+    t0 = 1_800_000_000_000
+    lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "camera": "front", "direction_version": 2})]
+    if saved_pitch:
+        lines.append(json.dumps({"type": "baseline", "t_ms": t0 + 500, "source": "saved", "compared": True, "part": "voice",
+                                 "metrics": {"f0_hz": {"n": 300, "mean": saved_pitch[0], "std": saved_pitch[1], "insufficient": False},
+                                             "rms_db": {"n": 300, "mean": -45.0, "std": 4.0, "insufficient": False}}}))
+    for k in range(int(length * 30)):
+        s = k / 30
+        idle = 0.05 + 0.05 * math.sin(2 * math.pi * 1.7 * s) + 0.03 * math.sin(2 * math.pi * 5.3 * s + 1)
+        jaw, rms, f0, other = idle, -70.0 + 2 * math.sin(2 * math.pi * 0.9 * s), None, None
+        if 10 <= s < 20:
+            jaw = 0.15 + 0.08 * math.sin(2 * math.pi * 4 * s)
+            rms = -45 + 6 * math.sin(2 * math.pi * 4 * s) + 1.5 * math.sin(2 * math.pi * 0.7 * s)
+            f0 = 150 + 20 * math.sin(2 * math.pi * 0.5 * s)
+        if 22 <= s < 32:
+            rms = -40 + 6 * math.sin(2 * math.pi * 3.3 * s)
+            f0 = 320.0
+        if two_faces:
+            other = 0.05 if not (22 <= s < 32) else 0.15 + 0.08 * math.sin(2 * math.pi * 3.3 * s)
+        o = {"type": "frame", "t_ms": t0 + round(s * 1000), "face": True, "yaw_deg": 0.0,
+             "bs": {"jawOpen": round(jaw, 3), "mouthFunnel": round(idle, 3)}, "rms_db": round(rms, 1)}
+        if f0 is not None:
+            o["f0_hz"] = round(f0, 1)
+        if other is not None:
+            o["other_jaw_open"] = round(other, 3)
+        lines.append(json.dumps(o))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class VoiceSyncTest(unittest.TestCase):
+    """本人の声の見分け（v1.9〜）：口の動きと声のタイミング・声の高さの範囲"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.TemporaryDirectory()
+        d = Path(cls.dir.name)
+        cls.paths = {}
+        for name, kw in (("plain", {}), ("pitch", {"saved_pitch": (150.0, 15.0)}), ("two", {"two_faces": True})):
+            cls.paths[name] = d / f"{name}.jsonl"
+            _voice_mix_record(cls.paths[name], **kw)
+        cls.c = review.load_criteria(review.HERE / "criteria.json", [])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def details(self, name, c=None):
+        rec = review.load(self.paths[name])
+        c = c or self.c
+        return rec, review.voice_self_details(rec, c, review.face_valid(rec, c), use_recorded=False)
+
+    def rate(self, rec, d, a, b):
+        sel = (rec.t - rec.t[0] >= a) & (rec.t - rec.t[0] < b) & np.isfinite(d.values)
+        return float((d.values[sel] == 1).mean())
+
+    def test_mouth_only_lets_other_voice_in(self):
+        import voice_check
+        rec, d = self.details("plain", voice_check.variant(self.c, sync=False, pitch=False))
+        self.assertGreater(self.rate(rec, d, 22, 32), 0.9)    # v1.8 までの決まりでは、ほかの人の声も本人の声になる
+
+    def test_timing(self):
+        rec, d = self.details("plain")
+        self.assertGreater(self.rate(rec, d, 10.5, 20), 0.95)  # 本人の声は本人
+        self.assertLess(self.rate(rec, d, 22, 32), 0.05)       # ほかの人の声は本人と言わない
+        other = [d.reason[i] for i in range(len(rec.t)) if 22 <= rec.t[i] - rec.t[0] < 32 and d.values[i] == 0]
+        self.assertEqual(set(other), {"timing"})
+
+    def test_pitch_range(self):
+        rec, d = self.details("pitch")
+        other = {d.reason[i] for i in range(len(rec.t)) if 22 <= rec.t[i] - rec.t[0] < 32}
+        self.assertEqual(other, {"pitch"})                     # 保存した声の普段（150 ± 3×20Hz）の外
+        self.assertGreater(self.rate(rec, d, 10.5, 20), 0.95)  # 本人の声（130〜170Hz）は範囲の中
+
+    def test_two_faces_match(self):
+        rec, d = self.details("two")
+        rel = rec.t - rec.t[0]
+        m_other = [d.match[i] for i in range(len(rec.t)) if 23 <= rel[i] < 32]
+        m_self = [d.match[i] for i in range(len(rec.t)) if 11 <= rel[i] < 20]
+        self.assertGreater(m_other.count("other") / len(m_other), 0.9)
+        self.assertGreater(m_self.count("self") / len(m_self), 0.9)
+        self.assertLess(self.rate(rec, d, 22, 32), 0.05)       # 判定は本人として選んだ顔で（ほかの人の声は本人と言わない）
+
+    def test_same_in_app(self):
+        import check_app
+        exe = check_app.build()
+        for p in self.paths.values():
+            diffs, _ = check_app.compare(p, exe, self.c)
+            self.assertEqual(diffs, [], p.name)
+            self.assertEqual(check_app.compare_voice(p, exe, self.c), [], p.name)
+
+    def test_voice_check_tool(self):
+        import io
+        import contextlib
+        import voice_check
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = voice_check.main([str(self.paths["plain"]), "--self", "10-20", "--other", "22-32"])
+        self.assertEqual(code, 0)
+        rows = {ln.split("\t")[0]: ln.split("\t") for ln in buf.getvalue().splitlines()[2:]}
+        self.assertEqual(rows["口の動きだけ（v1.8 まで）"][2], "100%")
+        self.assertEqual(rows["両方（v1.9）"][2], "0%")
+
+    def test_criteria_match_app(self):
+        import re
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "DiffEngine.swift").read_text(encoding="utf-8")
+        val = lambda name: float(re.search(rf"static let {name} = ([\d.]+)", src).group(1))
+        vc = self.c["voice_self"]
+        self.assertEqual(val("syncWindowS"), vc["sync"]["window_s"])
+        self.assertEqual(val("syncMinFrames"), vc["sync"]["min_frames"])
+        self.assertEqual(val("syncMinCorr"), vc["sync"]["min_corr"])
+        self.assertEqual(val("pitchRangeK"), vc["pitch_range"]["k_sd"])
+        self.assertEqual(val("pitchStdFloorHz"), vc["pitch_range"]["std_floor_hz"])
+        self.assertIn(f'static let syncKey = "{vc["sync"]["key"]}"', src)

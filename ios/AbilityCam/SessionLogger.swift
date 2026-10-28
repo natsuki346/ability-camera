@@ -19,11 +19,18 @@ struct FrameRecord: Encodable {
     var faceCy: Double?
     var faceW: Double?
     var voiceSelf = Nullable<Bool>(nil)   // 本人の声か（v1.6〜）：true / false（本人の声と言えない）/ null（声が出ていない）。いつも書く
+    // v1.9〜（声が出ているコマだけ）
+    var voiceSelfReason: String?  // 本人の声と言えなかった理由：pitch / no_face / no_mouth / timing（本人の声のときは書かない）
+    var voiceCorr: Double?        // 本人として選んだ顔の jawOpen と rms_db の相関（直近1秒、0.01 に丸める）
+    var voiceCorrOther: Double?   // もう1つの顔の相関（2つ映っているとき）
+    var voiceMatch: String?       // どの顔の口と声のタイミングが合っていたか：self / other / none（判定は本人として選んだ顔で）
+    var otherJawOpen: Double?     // もう1つの顔の jawOpen（2つ映っているとき。声が出ていなくても書く）
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", face, bs, pts, rmsDb = "rms_db", f0Hz = "f0_hz", procMs = "proc_ms", latMs = "lat_ms"
         case yawDeg = "yaw_deg", pitchDeg = "pitch_deg", rollDeg = "roll_deg", faceCx = "face_cx", faceCy = "face_cy", faceW = "face_w"
-        case voiceSelf = "voice_self"
+        case voiceSelf = "voice_self", voiceSelfReason = "voice_self_reason", voiceCorr = "voice_corr", voiceCorrOther = "voice_corr_other"
+        case voiceMatch = "voice_match", otherJawOpen = "other_jaw_open"
     }
 }
 

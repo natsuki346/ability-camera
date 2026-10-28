@@ -72,6 +72,11 @@ def eyes_blink(t):
     return (blink if closed else 0.05), (50.0 if 41 <= t < 41.5 else 2.0), not (50.4 <= t < 50.5)
 
 
+def speak(t):
+    """話している間の口の開きと声の大きさの揺れ（4Hz）。本人の声では jawOpen と rms_db が同じ向きに動く（v1.9〜、口と声のタイミング）"""
+    return math.sin(2 * math.pi * 4 * t)
+
+
 def frame(t):
     v = {k: mu for k, (mu, _) in BASE.items()}
     face, yaw, f0 = True, 2.0, (200.0 if int(t) % 3 == 0 else None)
@@ -91,6 +96,12 @@ def frame(t):
         v["rms_db"], f0 = -65.0, 190.0
     if 70 <= t < 71.5 or 80 <= t < 81.5:
         mouth = round(0.1 + 0.1 * math.sin(2 * math.pi * 4 * t), 3)   # 話している口の動き（mouthFunnel、指標には使わない）
+        v["jaw_open"] = round(0.08 + 0.02 * speak(t), 3)                # 口の開きと声の大きさが同じ向きに揺れる（本人の声）
+        v["rms_db"] = round(v["rms_db"] + 3 * speak(t), 1)
+    elif 81.5 <= t < 82:
+        f0 = None             # 話し終えた直後は声なし（話し終えてすぐ別の声が入ると、ならした値が残って短い区間になるため）
+    elif 65 <= t < 90 and f0 is None:
+        v["rms_db"] = -75.0   # 話していない間は静か（v1.9〜：話し始めの口の開きと声の大きさが同じ向きに変わるように）
     if 105 <= t < 106:
         v["jaw_open"] = 0.5
     return frame_obj(t, v, face, yaw, f0, mouth=mouth)
@@ -166,7 +177,7 @@ def voice_at(t):
     inside = lambda spans: any(a <= t < b for a, b in spans)
     if inside(SELF):
         f0 = 260.0 if 50 <= t < 52 else 200.0 + 5 * math.sin(2 * math.pi * 1.3 * t)
-        rms = -20.0 if 80 <= t < 82 else -50.0 + 3 * math.sin(2 * math.pi * 0.7 * t)
+        rms = (-20.0 if 80 <= t < 82 else -50.0 + 3 * math.sin(2 * math.pi * 0.7 * t)) + 3 * speak(t)
         yaw = 50.0 if 70 <= t < 72 else 2.0
         return round(f0, 1), round(rms, 1), round(0.1 + 0.1 * math.sin(2 * math.pi * 4 * t), 3), yaw, yaw < 35
     if inside(OTHER):
@@ -186,6 +197,8 @@ def build_voice():
         t = i / FPS
         f0, rms, mouth, yaw, vs = voice_at(t)
         v = {k: mu for k, (mu, _) in BASE.items()}
+        if mouth:   # 本人が話している：口の開きが声の大きさと同じ向きに揺れる
+            v["jaw_open"] = round(0.08 + 0.02 * speak(t), 3)
         o = frame_obj(t, v, True, yaw, f0, mouth=mouth)
         o["rms_db"] = rms
         o["voice_self"] = vs

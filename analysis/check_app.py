@@ -75,6 +75,30 @@ def compare(path: Path, exe: Path, c: dict) -> tuple[list[str], int]:
     return diffs, len(rep)
 
 
+def compare_voice(path: Path, exe: Path, c: dict) -> list[str]:
+    """本人の声の判定（v1.9〜）：声が出ていたコマごとに、アプリ（DiffCheck --voice、決め直したもの）と review.py の
+    voice_self・理由・相関・どの顔の口と合っていたかを比べる。違いの一覧を返す"""
+    p = subprocess.run([str(exe), "--voice", str(path)], check=True, capture_output=True, text=True)
+    app = [json.loads(x) for x in p.stdout.splitlines() if x.strip()]
+    rec = review.load(path)
+    d = review.voice_self_details(rec, c, review.face_valid(rec, c), use_recorded=False)
+    idx = [i for i in range(len(rec.t)) if d.values[i] == d.values[i]]
+    if len(app) != len(idx):
+        return [f"声が出ていたコマの数が違います：アプリ {len(app)} / レポート {len(idx)}"]
+    out = []
+    for x, i in zip(app, idx):
+        where = review.jst(float(rec.t[i]), ms=True)
+        rep = {"voice_self": bool(d.values[i] == 1), "reason": d.reason[i], "match": d.match[i]}
+        for k, v in rep.items():
+            if x.get(k) != v:
+                out.append(f"{where}：{k} が違います（アプリ {x.get(k)} / レポート {v}）")
+        for k, arr in (("corr", d.corr), ("corr_other", d.corr_other)):
+            a, b = x.get(k), arr[i]
+            if (a is None) != (b != b) or (a is not None and abs(a - b) > 1e-9):
+                out.append(f"{where}：{k} が違います（アプリ {a} / レポート {b}）")
+    return out
+
+
 def main(argv=None) -> int:
     args = [Path(x) for x in (argv if argv is not None else sys.argv[1:])]
     if not args:
@@ -85,6 +109,8 @@ def main(argv=None) -> int:
     bad = 0
     for p in args:
         diffs, n = compare(p, exe, c)
+        vd = compare_voice(p, exe, c)   # 本人の声の判定もコマごとに（v1.9〜）
+        diffs += vd[:10] + ([f"ほか本人の声の判定の違い {len(vd) - 10}件"] if len(vd) > 10 else [])
         kinds = {}
         for s in report_segments(p, c):
             kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1

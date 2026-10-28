@@ -90,6 +90,8 @@ class Recording:
     pairs: dict[str, np.ndarray] = field(default_factory=dict)   # 表情の数値 52種を左右平均したもの（browDown など。顔が無いコマは NaN）
     bs_raw: dict[str, np.ndarray] = field(default_factory=dict)  # 口の動きを見る表情の数値（左右の無いもの。顔が無い・値が無いコマは NaN）
     voice_self_rec: np.ndarray | None = None                     # 記録の voice_self（1 / 0 / NaN＝null、キーが無いコマは -1）。v1.6〜
+    other_jaw: np.ndarray | None = None                          # もう1つの顔の jawOpen（v1.9〜、2つ映っているとき）
+    voice_extra: dict = field(default_factory=dict)              # 記録の voice_self_reason・voice_corr・voice_corr_other・voice_match（v1.9〜）
     pitch: np.ndarray | None = None                              # 顔の向き（上が +）。v1.8〜で読む
     roll: np.ndarray | None = None                               # 頭の傾き（本人から見て右が +）
     direction_flipped: bool = False                              # v1.6.1 までの記録（direction_version が無い）の左右を、本人から見た右・左に入れ替えた
@@ -136,7 +138,8 @@ def load(path: Path) -> Recording:
 
     n = len(frames)
     raw = {m: np.full(n, np.nan) for m in METRICS}
-    yaw, lat, proc, blink, pitch, roll = (np.full(n, np.nan) for _ in range(6))
+    yaw, lat, proc, blink, pitch, roll, other_jaw = (np.full(n, np.nan) for _ in range(7))
+    extra = {"reason": [None] * n, "corr": np.full(n, np.nan), "corr_other": np.full(n, np.nan), "match": [None] * n, "has": False}
     face = np.zeros(n, bool)
     pairs: dict[str, np.ndarray] = {}
     bs_raw = {k: np.full(n, np.nan) for k in MOUTH_KEYS_ALL}
@@ -175,6 +178,16 @@ def load(path: Path) -> Recording:
                 f0_dropped += 1
         if o.get("yaw_deg") is not None:
             yaw[i] = o["yaw_deg"]
+        if o.get("other_jaw_open") is not None:
+            other_jaw[i] = o["other_jaw_open"]
+        if "voice_corr" in o or "voice_match" in o or "voice_self_reason" in o:
+            extra["has"] = True
+            extra["reason"][i] = o.get("voice_self_reason")
+            extra["match"][i] = o.get("voice_match")
+            if o.get("voice_corr") is not None:
+                extra["corr"][i] = o["voice_corr"]
+            if o.get("voice_corr_other") is not None:
+                extra["corr_other"][i] = o["voice_corr_other"]
         if o.get("pitch_deg") is not None:
             pitch[i] = o["pitch_deg"]
         if o.get("roll_deg") is not None:
@@ -192,7 +205,8 @@ def load(path: Path) -> Recording:
     # 区間はアプリと同じく、比べるのに使った行（compared が false でないもの）で判定する
     used = [b for b in baselines if b.get("compared", True) is not False]
     return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines,
-                     bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped, direction_flipped=flipped, pitch=pitch, roll=roll)
+                     bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped, direction_flipped=flipped, pitch=pitch, roll=roll,
+                     other_jaw=other_jaw, voice_extra=extra)
 
 
 DIRECTION_VERSION = 2   # アプリの FaceDirection.version
@@ -689,23 +703,139 @@ def mouth_range(rec: Recording, keys: list[str], window_s: float) -> tuple[np.nd
     return out, cnt
 
 
-def voice_self_values(rec: Recording, c: dict, fvalid: np.ndarray) -> np.ndarray:
-    """本人の声か（criteria.json の voice_self、アプリの VoiceSelfTracker と同じ決まり）。
-    声が出ている（f0 がある）コマのうち、顔が読めていて（face_valid）、そのコマに顔があり、口の数値の直近 window_s 秒の変化が
-    min_range 以上のものを 1（本人の声）、それ以外の声のコマを 0（本人の声と言えない）、声の無いコマを NaN にする。
-    記録に voice_self が書いてあるコマ（v1.6〜）は、その値を使う"""
+def pearson(xs: list[float], ys: list[float]) -> float | None:
+    """相関（アプリの VoiceSelfTracker.pearson と同じ順で足す）。どちらかがほとんど動いていなければ None"""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = my = 0.0
+    for x, y in zip(xs, ys):
+        mx += x
+        my += y
+    mx /= n
+    my /= n
+    sxx = syy = sxy = 0.0
+    for x, y in zip(xs, ys):
+        dx, dy = x - mx, y - my
+        sxx += dx * dx
+        syy += dy * dy
+        sxy += dx * dy
+    if sxx <= 1e-12 or syy <= 1e-12:
+        return None
+    return sxy / math.sqrt(sxx * syy)
+
+
+def sync_corr(rec: Recording, vc: dict) -> tuple[np.ndarray, np.ndarray]:
+    """口の動きと声のタイミング（v1.9〜、voice_self.sync）：各コマの、直近 window_s 秒の口の開き（key）と rms_db の相関。
+    本人として選んだ顔と、もう1つの顔（other_jaw_open）。数えるコマが min_frames より少なければ NaN"""
+    sc = vc["sync"]
+    t, n = rec.t, len(rec.t)
+    jaw = rec.bs_raw.get(sc["key"], np.full(n, np.nan))
+    rms = rec.raw["rms_db"]
+    oj = rec.other_jaw if rec.other_jaw is not None else np.full(n, np.nan)
+    out, out_o = np.full(n, np.nan), np.full(n, np.nan)
+    lo = 0
+    for i in range(n):
+        while t[i] - t[lo] > sc["window_s"] + 1e-9:
+            lo += 1
+        for arr, dst in ((jaw, out), (oj, out_o)):
+            if arr is oj and not np.isfinite(oj[i]):
+                continue
+            xs, ys = [], []
+            for j in range(lo, i + 1):
+                x, r = arr[j], rms[j]
+                if arr is jaw and not rec.face[j]:
+                    continue
+                if x == x and r == r:
+                    xs.append(float(x))
+                    ys.append(float(r))
+            if len(xs) >= sc["min_frames"]:
+                v = pearson(xs, ys)
+                if v is not None:
+                    dst[i] = v
+    return out, out_o
+
+
+def pitch_ranges(rec: Recording) -> list[tuple[float, float, float]]:
+    """保存した声の普段の行（source: saved、声を含む行）の (時刻, f0 の平均, 標準偏差)。アプリはこの行の時刻のコマから使う"""
+    out = []
+    for b in rec.all_baselines:
+        if baseline_kind(b) != "saved" or baseline_part(b) == "face":
+            continue
+        st = b.get("metrics", {}).get("f0_hz") or {}
+        if st.get("insufficient") is True or st.get("mean") is None:
+            continue
+        out.append((b["t_ms"] / 1000, float(st["mean"]), float(st.get("std") or 0)))
+    return sorted(out)
+
+
+@dataclass
+class VoiceSelf:
+    values: np.ndarray        # 1＝本人の声 / 0＝本人の声と言えない / NaN＝声が出ていない
+    reason: list              # 本人の声と言えなかった理由（pitch / no_face / no_mouth / timing）
+    corr: np.ndarray          # 本人として選んだ顔の相関
+    corr_other: np.ndarray    # もう1つの顔の相関
+    match: list               # self / other / none（声が出ているコマだけ）
+
+
+def voice_self_details(rec: Recording, c: dict, fvalid: np.ndarray, use_recorded: bool = True) -> VoiceSelf:
+    """本人の声か（criteria.json の voice_self、アプリの VoiceSelfTracker と同じ決まり）。声が出ている（f0 がある）コマを、次の順に見る：
+    1. 保存した声の普段があれば（その行の時刻から）、f0 が 平均 ± pitch_range.k_sd × 標準偏差（下限 std_floor_hz）の外 → pitch
+    2. 顔が読めていない・そのコマに顔が無い → no_face
+    3. 口の数値の直近 window_s 秒の変化が min_range より小さい → no_mouth
+    4. 口の開きと声の大きさの直近 sync.window_s 秒の相関が sync.min_corr より小さい（数えられない） → timing（v1.9〜）
+    どれでもなければ本人の声。use_recorded なら、記録に voice_self が書いてあるコマ（v1.6〜）はその値を使う（理由・相関も記録のもの）"""
+    n = len(rec.t)
     voiced = np.isfinite(rec.raw["f0_hz"])
     vc = c.get("voice_self") if c else None
+    reason: list = [None] * n
+    match: list = [None] * n
+    corr, corr_o = np.full(n, np.nan), np.full(n, np.nan)
     if not vc:
         out = np.where(voiced, 1.0, np.nan)        # 決まりが無ければ、今までどおり全部の声を使う
     else:
         rng, cnt = mouth_range(rec, vc["keys"], vc["window_s"])
-        ok = rec.face & fvalid & (cnt >= 2) & (rng >= vc["min_range"] - 1e-9)
-        out = np.where(voiced, ok.astype(float), np.nan)
-    if rec.voice_self_rec is not None:
+        out = np.full(n, np.nan)
+        sync = vc.get("sync")
+        if sync:
+            corr, corr_o = sync_corr(rec, vc)
+        pr = vc.get("pitch_range")
+        ranges = pitch_ranges(rec) if pr else []
+        ri, cur = 0, None
+        f0 = rec.raw["f0_hz"]
+        for i in range(n):
+            while ri < len(ranges) and ranges[ri][0] <= rec.t[i]:
+                cur = ranges[ri]
+                ri += 1
+            if not voiced[i]:
+                continue
+            if sync:
+                ok_s = corr[i] == corr[i] and corr[i] >= sync["min_corr"] - 1e-9
+                ok_o = corr_o[i] == corr_o[i] and corr_o[i] >= sync["min_corr"] - 1e-9
+                match[i] = "self" if ok_s and not (corr_o[i] == corr_o[i] and corr_o[i] > corr[i]) else "other" if ok_o else "none"
+            if cur is not None and abs(f0[i] - cur[1]) > pr["k_sd"] * max(cur[2], pr["std_floor_hz"]) + 1e-9:
+                reason[i] = "pitch"
+            elif not (rec.face[i] and fvalid[i] and cnt[i] >= 2):
+                reason[i] = "no_face"
+            elif rng[i] < vc["min_range"] - 1e-9:
+                reason[i] = "no_mouth"
+            elif sync and not ok_s:
+                reason[i] = "timing"
+            out[i] = 0.0 if reason[i] else 1.0
+    if use_recorded and rec.voice_self_rec is not None:
         has = rec.voice_self_rec != -1
         out = np.where(has, rec.voice_self_rec, out)
-    return out
+        ex = rec.voice_extra
+        if ex.get("has"):
+            for i in np.flatnonzero(has):
+                reason[i], match[i] = ex["reason"][i], ex["match"][i]
+            corr = np.where(has, ex["corr"], corr)
+            corr_o = np.where(has, ex["corr_other"], corr_o)
+    return VoiceSelf(out, reason, corr, corr_o, match)
+
+
+def voice_self_values(rec: Recording, c: dict, fvalid: np.ndarray) -> np.ndarray:
+    return voice_self_details(rec, c, fvalid).values
 
 
 def analyze(rec: Recording, c: dict) -> Analysis:
@@ -1078,6 +1208,11 @@ def criteria_lines(c: dict) -> list[str]:
                else "区間・通知候補・10分あたりには数えず、「表情の弱い方への変化（参考）」として別に出す（アプリと同じ。face_below_counts=false）"))
     vc = c.get("voice_self")
     if vc:
+        if vc.get("sync"):
+            sc, pr = vc["sync"], vc.get("pitch_range") or {}
+            out.append(f"本人の声の見分け（v1.9〜）：直近 {sc['window_s']:g}秒の {sc['key']} と rms_db の相関が {sc['min_corr']:g} 以上（{sc['min_frames']}コマ以上）"
+                       + (f"。保存した声の普段があるときは、f0 が 平均 ± {pr['k_sd']:g} × 標準偏差（下限 {pr['std_floor_hz']:g}Hz）の外なら本人の声と言わない" if pr else "")
+                       + "（仮の値）。声紋は作らない")
         out.append(f"声（rms_db・f0_hz）：本人の声のコマだけで判定する。本人の声＝声が出ていて（f0 がある）、表情を判定できるコマで、"
                    f"{'・'.join(vc['keys'])} のどれかの直近 {vc['window_s']:g}秒の変化が {vc['min_range']:g} 以上"
                    + ("（仮の値）" if vc.get("provisional") else "") + "。本人の声と言えない声のコマでは判定しない")
@@ -1218,6 +1353,11 @@ def quality(a: Analysis, calm: bool) -> dict:
             moving = rng >= vc["min_range"] - 1e-9
             nv, nq = int((judged & voiced).sum()), int((judged & ~voiced).sum())
             q["voice"]["voiced_no_mouth"] = (int((judged & voiced & ~moving).sum()), nv)
+            # 本人の声と言えなかった理由と、どの顔の口と声のタイミングが合っていたか（v1.9〜。記録にあれば記録の値）
+            det = voice_self_details(rec, c, a.fvalid)
+            from collections import Counter
+            q["voice"]["reasons"] = Counter(r for r, v in zip(det.reason, det.values) if v == 0 and r)
+            q["voice"]["matches"] = Counter(m for m in det.match if m)
             q["voice"]["mouth_no_voice"] = (int((judged & ~voiced & moving).sum()), nq)
 
     # 声の高さ（v1.6.2〜）：求め方の版と、取れたコマ・範囲の外で使わなかった値
@@ -1677,6 +1817,15 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         qrows.append(["声が出ていて顔が読めているのに、口が動いていないと判定されたコマの割合（v1.7〜。多いときは、口があまり動かずに声を出す人の声を取りこぼしているかもしれない）",
                       ratio("voiced_no_mouth")])
         qrows.append(["声が出ていない（声の高さが無い）のに、口が動いているコマの割合（顔が読めているコマのうち、v1.7〜）", ratio("mouth_no_voice")])
+        names = {"pitch": "声の高さが保存した声の普段の範囲の外", "no_face": "顔が読めていない", "no_mouth": "口がほとんど動いていない",
+                 "timing": "口の開きと声の大きさのタイミングが合っていない"}
+        if v.get("reasons"):
+            qrows.append(["本人の声と言えなかった理由（声のコマ、v1.9〜）",
+                          "、".join(f"{names.get(k, k)} {n}コマ" for k, n in v["reasons"].most_common())])
+        if v.get("matches"):
+            mn = {"self": "本人として選んだ顔", "other": "もう1つの顔", "none": "どちらとも合っていない"}
+            qrows.append(["声のタイミングが合っていた口（声のコマ、v1.9〜。判定は本人として選んだ顔で）",
+                          "、".join(f"{mn.get(k, k)} {n}コマ" for k, n in v["matches"].most_common())])
     p = q["pitch"]
     qrows.append(["声の高さ（f0）が取れたコマ",
                   f"{p['f0_frames']}コマ（求め方 {p['version']}："

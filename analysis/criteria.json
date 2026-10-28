@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-28.5",
+  "version": "2026-10-28.6",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -44,6 +44,10 @@
     {
       "date": "2026-10-28",
       "reason": "v1.8：pose（顔の向きの普段と特徴）を足した。振り返りレポートだけで、区間の判定・通知候補・アプリの画面には使わない（カメラは介助する人の胸にあり、介助する人が動くと本人の顔の向きも変わって見えるため、まず記録を見て決める）。アプリは表情の普段と同じコマで yaw・pitch・roll（本人から見て）の平均と標準偏差を baseline 行の pose と保存した普段に書く。いつもの範囲は 平均 ± 2 × 標準偏差（下限 5°）、0.3秒でならして同じ向きに 5秒以上外れた時間を出す。急な向きの変化は 0.5秒で 20°以上。ひとつの向きにとどまった長さは 2・10・30・60秒で区切る。家族の印の前後 10秒。すべて仮の値。"
+    },
+    {
+      "date": "2026-10-28",
+      "reason": "v1.9：voice_self に sync（口の動きと声のタイミング）と pitch_range（声の高さの範囲）を足した。2026-10-28 20:25 の記録（前面）で、本人が黙っているときも口の数値の直近0.3秒の変化は中央値 0.12（90% は 0.61）あり、しきい値 0.04 ではほかの人の声（約320Hz）が全部本人の声になっていたため。sync：直近1秒の jawOpen と rms_db の相関が 0.3 以上（10コマ以上）。pitch_range：保存した声の普段があるとき、f0 が 平均 ± 3 × 標準偏差（下限 20Hz）の外なら本人の声と言わない。どちらも仮の値で、本人の声の区間・ほかの人の声の区間を分けた記録で voice_check.py を使って決める。理由は記録の voice_self_reason。声紋は作らない。アプリ（v1.9）と同じ値。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -116,7 +120,7 @@
     "end_open_s": 0.2
   },
   "voice_self": {
-    "_note": "本人の声（v1.6〜）。声が出ている（f0 がある）コマのうち、face_valid で、そのコマに顔があり、keys のどれかの直近 window_s 秒の変化（最大 − 最小）が min_range 以上のもの。声の違いは本人の声のコマだけで判定する。min_range は仮の値",
+    "_note": "本人の声（v1.6〜）。声が出ている（f0 がある）コマのうち、face_valid で、そのコマに顔があり、keys のどれかの直近 window_s 秒の変化（最大 − 最小）が min_range 以上のもの。声の違いは本人の声のコマだけで判定する。min_range は仮の値。v1.9〜：pitch_range（保存した声の普段があるとき、その行の時刻から f0 が 平均 ± k_sd × 標準偏差（下限 std_floor_hz）の外なら pitch）→ 顔（no_face）→ 口の動き（no_mouth）→ sync（直近 window_s 秒の key と rms_db の相関が min_corr 以上、min_frames コマ以上。足りなければ timing）の順に見る",
     "provisional": true,
     "keys": [
       "jawOpen",
@@ -125,7 +129,17 @@
       "mouthPucker"
     ],
     "window_s": 0.3,
-    "min_range": 0.04
+    "min_range": 0.04,
+    "sync": {
+      "key": "jawOpen",
+      "window_s": 1.0,
+      "min_frames": 10,
+      "min_corr": 0.3
+    },
+    "pitch_range": {
+      "k_sd": 3.0,
+      "std_floor_hz": 20.0
+    }
   },
   "voice_baseline": {
     "_note": "声の普段（v1.6〜）。表情の普段とは別に、開いてから warmup 秒より後の本人の声のコマが合計 target_s 秒たまったら作る（baseline 行の part: \"voice\"）。v1.7〜：途中まで集めた分は人ごとに保存し、次のセッションで続きから足す（baseline 行の voice_sessions・voice_days・voice_carried_s）。集め始めてから max_age_days 日たったものは捨てる。記録から作り直すとき（--baseline-s）はその記録の中の声だけで集める",

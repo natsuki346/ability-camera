@@ -43,6 +43,8 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
     let faceRatio: Double?
     let selfVoiceS: Double                       // 本人の声の時間（v1.6〜）
     let otherVoiceS: Double                      // 本人の声と言えない声の時間
+    /// 声が出ていたコマの、撮る側と同じ決まりで決め直した本人の声の判定（v1.9〜。記録の voice_self ではなく決め直したもの。check_app.py が比べる）
+    let voiceDetail: [(t: Double, voiceSelf: Bool, reason: String?, corr: Double?, corrOther: Double?, match: String?)]
     /// いつもとの違いの数（声が出たは普段と比べたものではないので入れない。sessions.jsonl の segments と同じ）
     var diffCount: Int { segments.filter { $0.target != .voiceOn }.count }
     var voiceOnCount: Int { segments.filter { $0.target == .voiceOn }.count }   // 声が出た回数（v1.7〜）
@@ -95,6 +97,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var rms = [Double?](repeating: nil, count: n), f0 = [Double?](repeating: nil, count: n)
         var pitch = [Double?](repeating: nil, count: n), roll = [Double?](repeating: nil, count: n)
         var recordedVoiceSelf = [Bool??](repeating: nil, count: n)   // 記録の voice_self（v1.6〜。キーが無い古い記録は nil）
+        var otherJaw = [Double?](repeating: nil, count: n)           // もう1つの顔の jawOpen（v1.9〜）
         for (i, o) in frames.enumerated() {
             if let v = o["voice_self"] { recordedVoiceSelf[i] = .some(v as? Bool) }
             t[i] = ms(o)!
@@ -102,6 +105,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             pitch[i] = (o["pitch_deg"] as? NSNumber)?.doubleValue
             roll[i] = (o["roll_deg"] as? NSNumber).map { $0.doubleValue * flip }
             rms[i] = (o["rms_db"] as? NSNumber)?.doubleValue
+            otherJaw[i] = (o["other_jaw_open"] as? NSNumber)?.doubleValue
             // 声の高さの範囲の外（v1.6.1 までの記録の 800Hz のような取り違え）は使わない（review.py の F0_RANGE と同じ）
             f0[i] = ((o["f0_hz"] as? NSNumber)?.doubleValue).flatMap {
                 $0 >= Double(PitchCriteria.minHz) && $0 <= Double(PitchCriteria.maxHz) ? $0 : nil }
@@ -180,6 +184,15 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         // いつもとの違い：撮る側と同じ決まりで、コマを順に流す
         var engine = DiffEngine()
         var voiceTracker = VoiceSelfTracker()
+        // 保存した声の普段の行（source: saved、声を含む行）の時刻と f0 の平均・標準偏差（データ不足なら使わない）
+        let pitchRanges: [(t: Double, mean: Double, sd: Double)] = baselines.compactMap { b in
+            guard (b["source"] as? String) == "saved", BaselinePart.of(b["part"] as? String) != .face, let bt = ms(b),
+                  let st = (b["metrics"] as? [String: [String: Any]])?[Metric.f0Hz.rawValue],
+                  (st["insufficient"] as? Bool) != true, let m = (st["mean"] as? NSNumber)?.doubleValue else { return nil }
+            return (bt, m, (st["std"] as? NSNumber)?.doubleValue ?? 0)
+        }.sorted { $0.t < $1.t }
+        var pi = 0
+        var detail: [(t: Double, voiceSelf: Bool, reason: String?, corr: Double?, corrOther: Double?, match: String?)] = []
         var selfS = 0.0, otherS = 0.0
         var bi = 0
         var noBase: [ReplayRun<Bool>] = []
@@ -206,7 +219,14 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             if let r = rms[i] { voice[.rmsDb] = r }
             if let f = f0[i] { voice[.f0Hz] = f }
             // 本人の声か：記録に書いてあればそれを、無い古い記録は撮る側と同じ決まりで決め直す（review.py と同じ）
-            let computed = voiceTracker.add(t: t[i], face: face[i], yaw: yaw[i], bs: bsList[i], voiced: f0[i] != nil)
+            while pi < pitchRanges.count, pitchRanges[pi].t <= t[i] {   // 保存した声の普段の範囲（v1.9〜、review.py の pitch_ranges と同じ）
+                voiceTracker.setPitchRange(mean: pitchRanges[pi].mean, sd: pitchRanges[pi].sd, fromT: pitchRanges[pi].t)
+                pi += 1
+            }
+            let computed = voiceTracker.add(t: t[i], face: face[i], yaw: yaw[i], bs: bsList[i], rms: rms[i], f0: f0[i], otherJaw: otherJaw[i])
+            if let c = computed {
+                detail.append((t[i], c, voiceTracker.reason?.rawValue, voiceTracker.corr, voiceTracker.corrOther, voiceTracker.match?.rawValue))
+            }
             let vs = recordedVoiceSelf[i] ?? computed
             if vs == true { selfS += i + 1 < n ? min(t[i + 1] - t[i], 1) : 0 }
             if vs == false { otherS += i + 1 < n ? min(t[i + 1] - t[i], 1) : 0 }
@@ -218,6 +238,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         segs += engine.finished
         segments = segs.filter(\.shown).sorted { $0.startT < $1.startT }
         selfVoiceS = selfS; otherVoiceS = otherS
+        voiceDetail = detail
         noBaseline = noBase
 
         // 場面・家族の印・顔の向きの記録

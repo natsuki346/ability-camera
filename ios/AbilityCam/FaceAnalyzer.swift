@@ -28,6 +28,7 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         let latMs: Double           // 撮影されてから結果が返るまで
         let faceCount: Int          // 映っていた顔の数（numFaces まで）
         let box: Box?               // 本人として使った顔の枠
+        var otherJaw: Double? = nil // もう1つの顔の jawOpen（2つ映っているとき、v1.9〜。口と声のタイミングを顔ごとに見るため）
     }
 
     /// 鼻先・額・あご・両目尻・両口角（追跡の安定性を後で確かめる用）
@@ -135,6 +136,14 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         }
     }
 
+    /// 本人として選ばなかった顔（いちばん大きいもの）の jawOpen（0.001 に丸める）。jawOpen は左右が無いので鏡でも同じ
+    static func otherJaw(_ blend: [Classifications], boxes: [Box?], pick: Int) -> Double? {
+        let others = boxes.indices.filter { $0 != pick && boxes[$0] != nil && blend.indices.contains($0) }
+        guard let i = others.max(by: { boxes[$0]!.w < boxes[$1]!.w }) else { return nil }
+        guard let s = blend[i].categories.first(where: { $0.categoryName == "jawOpen" })?.score else { return nil }
+        return (Double(s) * 1000).rounded() / 1000
+    }
+
     /// 変換行列（標準の顔 → カメラの座標。x 右・y 上・z 手前）から向きを求める
     static func pose(_ m: TransformMatrix) -> Pose? {
         guard m.rows >= 3, m.columns >= 3 else { return nil }
@@ -219,7 +228,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
             procMs: sent.map { (now - $0) * 1000 } ?? -1,
             latMs: now * 1000 - Double(timestampInMilliseconds),
             faceCount: boxes.compactMap { $0 }.count,
-            box: boxes.indices.contains(pick) ? boxes[pick] : nil
+            box: boxes.indices.contains(pick) ? boxes[pick] : nil,
+            otherJaw: Self.otherJaw(result?.faceBlendshapes ?? [], boxes: boxes, pick: pick)
         ))
     }
 }

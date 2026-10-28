@@ -219,6 +219,7 @@ final class AnalysisModel: ObservableObject {
         sessionStartMs = Self.nowMs()
         face.setPreferred(nil)
         voiceCarry = nil; voiceCarryOwner = nil
+        voiceBox.setPitchRange(mean: nil, sd: nil, fromT: 0)   // 保存した声の普段の範囲は、applySaved で使い始める
         resetBaseline()   // 普段（設定の長さ）も自動で始める
         loadVoiceCarry()  // 途中まで集めた声の普段があれば、続きから（v1.7〜）
         applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
@@ -306,18 +307,28 @@ final class AnalysisModel: ObservableObject {
             let round4 = { (x: Double) in (x * 10000).rounded() / 10000 }
             // 本人の声か（記録に書いた値と同じもので決める：表情の数値は 0.001、yaw は 0.1 に丸めたもの）
             let bsD = r.face ? r.blendshapes.mapValues { (Double($0) * 1000).rounded() / 1000 } : [:]
-            let (voiceSelf, voiceFaceValid) = voiceBox.add(t: Double(tMs) / 1000, face: r.face, yaw: r.pose.map { round1($0.yaw) },
-                                                           bs: bsD, voiced: a.f0Hz != nil)
+            // 声の大きさ・高さは、記録に書く値（JSON の Float の書き方）と同じ Double にする（振り返りレポートと同じ値で決めるため）
+            let num = { (f: Float?) in f.flatMap { Double("\($0)") } }
+            let dec = voiceBox.add(t: Double(tMs) / 1000, face: r.face, yaw: r.pose.map { round1($0.yaw) },
+                                   bs: bsD, rms: num(a.rmsDb), f0: num(a.f0Hz), otherJaw: r.otherJaw)
+            let voiceSelf = dec.voiceSelf, voiceFaceValid = dec.faceValid
+            let r2 = { (x: Double?) in x.map { ($0 * 100).rounded() / 100 } }
+            var frame = FrameRecord(tMs: tMs, face: r.face,
+                                    bs: r.face ? r.blendshapes : nil, pts: r.face ? r.keyPoints : nil,
+                                    rmsDb: a.rmsDb, f0Hz: a.f0Hz, procMs: r.procMs, latMs: r.latMs,
+                                    yawDeg: r.pose.map { round1($0.yaw) }, pitchDeg: r.pose.map { round1($0.pitch) },
+                                    rollDeg: r.pose.map { round1($0.roll) },
+                                    faceCx: r.box.map { round4($0.cx) }, faceCy: r.box.map { round4($0.cy) },
+                                    faceW: r.box.map { round4($0.w) }, voiceSelf: Nullable(voiceSelf))
+            if voiceSelf != nil {
+                frame.voiceSelfReason = dec.reason?.rawValue
+                frame.voiceCorr = r2(dec.corr); frame.voiceCorrOther = r2(dec.corrOther); frame.voiceMatch = dec.match?.rawValue
+            }
+            frame.otherJawOpen = r.otherJaw
             // ファイルが開いていないとき・記録の開始より前のコマは書かれない
-            logger.write(FrameRecord(tMs: tMs, face: r.face,
-                                     bs: r.face ? r.blendshapes : nil, pts: r.face ? r.keyPoints : nil,
-                                     rmsDb: a.rmsDb, f0Hz: a.f0Hz, procMs: r.procMs, latMs: r.latMs,
-                                     yawDeg: r.pose.map { round1($0.yaw) }, pitchDeg: r.pose.map { round1($0.pitch) },
-                                     rollDeg: r.pose.map { round1($0.roll) },
-                                     faceCx: r.box.map { round4($0.cx) }, faceCy: r.box.map { round4($0.cy) },
-                                     faceW: r.box.map { round4($0.w) }, voiceSelf: Nullable(voiceSelf)),
-                         notBefore: tMs)
-            Task { @MainActor in self?.update(r, audio: a, tMs: tMs, voiceSelf: voiceSelf, voiceFaceValid: voiceFaceValid) }
+            logger.write(frame, notBefore: tMs)
+            let reason = dec.reason
+            Task { @MainActor in self?.update(r, audio: a, tMs: tMs, voiceSelf: voiceSelf, voiceFaceValid: voiceFaceValid, voiceReason: reason) }
         }
         let video = self.video, link = self.link
         video.onJPEG = { [weak link] d in link?.sendVideo(d) }
@@ -606,6 +617,9 @@ final class AnalysisModel: ObservableObject {
             vr.savedMs = v.savedMs; vr.voiceValidS = v.validS
             logger.write(vr)
             engine.setBaseline(Self.engineBaseline(v.metrics), part: .voice)
+            // 声の高さの範囲（v1.9〜）：この行の時刻のコマから、保存した声の普段の範囲の外の声は本人の声と言わない（review.py と同じ）
+            let f0 = v.metrics[Metric.f0Hz.rawValue]
+            voiceBox.setPitchRange(mean: f0?.insufficient == false ? f0?.mean : nil, sd: f0?.std, fromT: Double(now) / 1000)
             comparingVoice = .saved
             usedVoice = v.metrics
             voiceSec = nil; voiceWait = nil
@@ -699,7 +713,7 @@ final class AnalysisModel: ObservableObject {
     }
 
     /// 声の普段：本人の声のコマが合計 10秒たまったら（v1.6〜）。表情の普段とは別の baseline 行（part: "voice"）
-    private func collectVoice(tMs: Int64, voiceSelf: Bool?, faceValid: Bool, audio a: AudioAnalyzer.Snapshot) {
+    private func collectVoice(tMs: Int64, voiceSelf: Bool?, faceValid: Bool, reason: VoiceSelfTracker.Reason?, audio a: AudioAnalyzer.Snapshot) {
         guard running, !voiceDone else { return }
         let t = Double(tMs) / 1000
         let warm = t - Double(sessionStartMs) / 1000 >= Self.baselineWarmup
@@ -718,7 +732,7 @@ final class AnalysisModel: ObservableObject {
             if voiceSec != Int(total) { voiceSec = Int(total) }
             if Int(voiceValidS) != voiceSavedSec { voiceSavedSec = Int(voiceValidS); saveVoicePartial() }   // 1秒ごとに保存
             // 進み具合が増えないときの理由（開いてから5秒より後だけ）
-            let w = warm ? voiceWaitTracker.add(t: t, voiceSelf: voiceSelf, faceValid: faceValid)?.rawValue : nil
+            let w = warm ? voiceWaitTracker.add(t: t, voiceSelf: voiceSelf, faceValid: faceValid, selfReason: reason)?.rawValue : nil
             if voiceWait != w { voiceWait = w }
         }
     }
@@ -772,9 +786,10 @@ final class AnalysisModel: ObservableObject {
         return b
     }
 
-    private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64, voiceSelf: Bool?, voiceFaceValid: Bool) {
+    private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64, voiceSelf: Bool?, voiceFaceValid: Bool,
+                        voiceReason: VoiceSelfTracker.Reason? = nil) {
         guard cameraActive else { return }
-        collectVoice(tMs: tMs, voiceSelf: voiceSelf, faceValid: r.face && voiceFaceValid, audio: a)
+        collectVoice(tMs: tMs, voiceSelf: voiceSelf, faceValid: r.face && voiceFaceValid, reason: voiceReason, audio: a)
         if a.at > lastAudioAtCoverage, let db = a.rmsDb {   // 音の塊ごとに1回
             lastAudioAtCoverage = a.at
             pitchCoverage.add(t: a.at, db: db, f0: a.f0Hz != nil)
@@ -1067,10 +1082,20 @@ final class VoiceSelfBox: @unchecked Sendable {
     private var tracker = VoiceSelfTracker()
     private let lock = NSLock()
 
-    /// 返り値：(本人の声か, 顔が読めているか)
-    func add(t: Double, face: Bool, yaw: Double?, bs: [String: Double], voiced: Bool) -> (Bool?, Bool) {
+    struct Decision { let voiceSelf: Bool?; let faceValid: Bool; let reason: VoiceSelfTracker.Reason?
+                      let corr: Double?; let corrOther: Double?; let match: VoiceSelfTracker.Match? }
+
+    /// 本人の声を決める（rms・f0 は記録に書くのと同じ値）
+    func add(t: Double, face: Bool, yaw: Double?, bs: [String: Double], rms: Double?, f0: Double?, otherJaw: Double?) -> Decision {
         lock.lock(); defer { lock.unlock() }
-        let v = tracker.add(t: t, face: face, yaw: yaw, bs: bs, voiced: voiced)
-        return (v, tracker.faceValid)
+        let v = tracker.add(t: t, face: face, yaw: yaw, bs: bs, rms: rms, f0: f0, otherJaw: otherJaw)
+        return Decision(voiceSelf: v, faceValid: tracker.faceValid, reason: tracker.reason,
+                        corr: tracker.corr, corrOther: tracker.corrOther, match: tracker.match)
+    }
+
+    /// 保存した声の普段の声の高さを、この時刻のコマから使う（v1.9〜。nil で使わない）
+    func setPitchRange(mean: Double?, sd: Double?, fromT: Double) {
+        lock.lock(); defer { lock.unlock() }
+        tracker.setPitchRange(mean: mean, sd: sd, fromT: fromT)
     }
 }

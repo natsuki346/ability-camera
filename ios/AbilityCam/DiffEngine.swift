@@ -22,6 +22,15 @@ enum DiffCriteria {
     static let mouthKeys = ["jawOpen", "mouthClose", "mouthFunnel", "mouthPucker"]
     static let mouthWindowS = 0.3          // 直近 0.3秒の
     static let mouthMinRange = 0.04        //   変化（最大 − 最小）が、どれかでこれ以上なら口が動いている（仮の値）
+    // 口の動きと声のタイミング（v1.9〜、criteria.json の voice_self.sync）：直近 syncWindowS 秒の、口の開き（syncKey）と声の大きさ（rms_db）の相関が
+    // syncMinCorr 以上なら本人の声らしい（数えるコマが syncMinFrames より少なければ言えない）。仮の値
+    static let syncKey = "jawOpen"
+    static let syncWindowS = 1.0
+    static let syncMinFrames = 10
+    static let syncMinCorr = 0.3
+    // 声の高さの範囲（v1.9〜、criteria.json の voice_self.pitch_range）：保存した声の普段があるとき、f0 が 平均 ± pitchRangeK × 標準偏差（下限 pitchStdFloorHz）の外なら本人の声と言わない
+    static let pitchRangeK = 3.0
+    static let pitchStdFloorHz = 20.0
     // 声の普段（v1.6〜、criteria.json の voice_baseline）：本人の声のコマが合計これだけたまったら
     static let voiceBaselineS = 10.0
     // 途中まで集めた声の普段は人ごとに保存して、次のセッションで続きから足す（v1.7〜）。集め始めてからこの日数たったら捨てる
@@ -33,16 +42,67 @@ enum DiffCriteria {
 }
 
 /// 本人の声か（review.py の voice_self と同じ決まり）。1コマずつ流す。
-/// 返り値：nil＝声が出ていない（f0 が無い）、true＝本人の声、false＝本人の声と言えない（顔が読めない・横を向きすぎ・口が動いていない）
+/// 返り値：nil＝声が出ていない（f0 が無い）、true＝本人の声、false＝本人の声と言えない（理由は reason）
+/// v1.9〜：口の動きの大きさに加えて、口の開きと声の大きさのタイミングが合っているか（直近1秒の相関）と、
+/// 保存した声の普段があるときは声の高さが普段の範囲に入っているかで決める。声紋（声の特徴で人を特定するもの）は作らない
 struct VoiceSelfTracker {
+    /// 本人の声と言えなかった理由（記録の voice_self_reason）。決まりを見る順
+    enum Reason: String {
+        case pitch          // 声の高さが、保存した声の普段の範囲の外
+        case noFace = "no_face"     // 顔が読めていない・横を向きすぎ・そのコマに顔が無い
+        case noMouth = "no_mouth"   // 口がほとんど動いていない
+        case timing         // 口の開きと声の大きさのタイミングが合っていない（相関が低い・数えるコマが足りない）
+    }
+    /// 声が出ていたとき、どの顔の口と声のタイミングが合っていたか（記録の voice_match。将来、複数の人を分けるための下準備）
+    enum Match: String { case selfFace = "self", other, none }
+
     private var recentFace: [(t: Double, face: Bool)] = []
     private var lastYaw: (v: Double, t: Double)?
     private var mouth: [(t: Double, v: [String: Double])] = []
+    private var sync: [(t: Double, jaw: Double?, rms: Double?, other: Double?)] = []
+    private var pitchRange: (mean: Double, sd: Double, fromT: Double)?
 
     /// 顔が読めているか（DiffEngine の faceValid と同じ：直近1秒で顔が映るコマが半分以上、|yaw| < 35°）
     private(set) var faceValid = false
+    /// 最後のコマの判定の中身（声が出ていなければ reason・corr は nil）
+    private(set) var reason: Reason?
+    private(set) var corr: Double?          // 本人として選んだ顔の口の開きと声の大きさの相関（直近1秒）
+    private(set) var corrOther: Double?     // もう1つの顔の相関（2つ映っているとき）
+    private(set) var match: Match?
 
-    mutating func add(t: Double, face: Bool, yaw: Double?, bs: [String: Double], voiced: Bool) -> Bool? {
+    /// 保存した声の普段の声の高さ（平均・標準偏差）を、この時刻のコマから使う（nil で使わない）
+    mutating func setPitchRange(mean: Double?, sd: Double?, fromT: Double) {
+        pitchRange = mean.map { ($0, sd ?? 0, fromT) }
+    }
+
+    /// 相関（ピアソン）。どちらかがほとんど動いていなければ nil
+    static func pearson(_ xs: [Double], _ ys: [Double]) -> Double? {
+        let n = Double(xs.count)
+        guard xs.count >= 2 else { return nil }
+        var mx = 0.0, my = 0.0
+        for i in xs.indices { mx += xs[i]; my += ys[i] }
+        mx /= n; my /= n
+        var sxx = 0.0, syy = 0.0, sxy = 0.0
+        for i in xs.indices {
+            let dx = xs[i] - mx, dy = ys[i] - my
+            sxx += dx * dx; syy += dy * dy; sxy += dx * dy
+        }
+        guard sxx > 1e-12, syy > 1e-12 else { return nil }
+        return sxy / (sxx * syy).squareRoot()
+    }
+
+    private func correlation(other: Bool) -> Double? {
+        var xs: [Double] = [], ys: [Double] = []
+        for e in sync {
+            guard let x = other ? e.other : e.jaw, let r = e.rms else { continue }
+            xs.append(x); ys.append(r)
+        }
+        guard xs.count >= DiffCriteria.syncMinFrames else { return nil }
+        return Self.pearson(xs, ys)
+    }
+
+    /// rms：そのコマの声の大きさ（記録に書いた 0.1 に丸めた値）。f0：声の高さ（無ければ声が出ていない）。otherJaw：もう1つの顔の jawOpen
+    mutating func add(t: Double, face: Bool, yaw: Double?, bs: [String: Double], rms: Double?, f0: Double?, otherJaw: Double? = nil) -> Bool? {
         recentFace.append((t, face))
         while let f = recentFace.first, f.t <= t - DiffCriteria.faceWindowS { recentFace.removeFirst() }
         let ratio = Double(recentFace.filter(\.face).count) / Double(recentFace.count)
@@ -56,14 +116,30 @@ struct VoiceSelfTracker {
             mouth.append((t, v))
         }
         while let m = mouth.first, t - m.t > DiffCriteria.mouthWindowS + 1e-9 { mouth.removeFirst() }
-        guard voiced else { return nil }
-        guard face, faceValid, mouth.count >= 2 else { return false }
+        sync.append((t, face ? bs[DiffCriteria.syncKey] : nil, rms, otherJaw))
+        while let e = sync.first, t - e.t > DiffCriteria.syncWindowS + 1e-9 { sync.removeFirst() }
+
+        reason = nil; corr = nil; corrOther = nil; match = nil
+        guard let f0 else { return nil }
+        corr = correlation(other: false)
+        corrOther = otherJaw == nil ? nil : correlation(other: true)
+        let okSelf = (corr ?? -.infinity) >= DiffCriteria.syncMinCorr - 1e-9
+        let okOther = (corrOther ?? -.infinity) >= DiffCriteria.syncMinCorr - 1e-9
+        match = okSelf && (corrOther == nil || corr! >= corrOther!) ? .selfFace : okOther ? .other : Match.none
+
+        if let p = pitchRange, t >= p.fromT - 1e-9,
+           abs(f0 - p.mean) > DiffCriteria.pitchRangeK * max(p.sd, DiffCriteria.pitchStdFloorHz) + 1e-9 {
+            reason = .pitch; return false
+        }
+        guard face, faceValid, mouth.count >= 2 else { reason = .noFace; return false }
         var range = 0.0
         for k in DiffCriteria.mouthKeys {
             let xs = mouth.compactMap { $0.v[k] }
             if let lo = xs.min(), let hi = xs.max() { range = max(range, hi - lo) }
         }
-        return range >= DiffCriteria.mouthMinRange - 1e-9
+        guard range >= DiffCriteria.mouthMinRange - 1e-9 else { reason = .noMouth; return false }
+        guard okSelf else { reason = .timing; return false }
+        return true
     }
 }
 
@@ -74,24 +150,28 @@ struct VoiceWaitTracker {
         case noPitch = "声の高さが取れていません"
         case noMouth = "口が動いていません"
         case noFace = "顔が読めていません"
+        case timing = "口の動きと声のタイミングが合っていません"   // v1.9〜
+        case pitch = "声の高さが本人の普段の範囲の外です"           // v1.9〜（保存した声の普段があるとき）
     }
     static let stallS = 3.0
     private var recent: [(t: Double, r: Reason)] = []
     private var lastSelfT: Double?
     private var firstT: Double?
 
-    /// voiceSelf：VoiceSelfTracker の返り値（nil：f0 が無い）。faceValid：顔が読めているか（そのコマに顔があり、直近1秒で読めている）
-    mutating func add(t: Double, voiceSelf: Bool?, faceValid: Bool) -> Reason? {
+    /// voiceSelf：VoiceSelfTracker の返り値（nil：f0 が無い）。faceValid：顔が読めているか（そのコマに顔があり、直近1秒で読めている）。
+    /// selfReason：VoiceSelfTracker が本人の声と言わなかった理由（v1.9〜）
+    mutating func add(t: Double, voiceSelf: Bool?, faceValid: Bool, selfReason: VoiceSelfTracker.Reason? = nil) -> Reason? {
         if firstT == nil { firstT = t }
         if voiceSelf == true { lastSelfT = t; recent = []; return nil }
         // 顔が読めていなければ、口が動いているかは分からないので先に出す。f0 が無いのは、顔が読めているときだけ「声の高さ」とする
-        let r: Reason = !faceValid ? .noFace : voiceSelf == nil ? .noPitch : .noMouth
+        let r: Reason = !faceValid ? .noFace : voiceSelf == nil ? .noPitch
+            : selfReason == .pitch ? .pitch : selfReason == .timing ? .timing : .noMouth
         recent.append((t, r))
         while let f = recent.first, t - f.t > Self.stallS { recent.removeFirst() }
         guard t - (lastSelfT ?? firstT!) >= Self.stallS else { return nil }
         var count: [Reason: Int] = [:]
         for x in recent { count[x.r, default: 0] += 1 }
-        return [Reason.noPitch, .noMouth, .noFace].max { (count[$0] ?? 0) < (count[$1] ?? 0) }
+        return [Reason.noPitch, .noMouth, .timing, .pitch, .noFace].max { (count[$0] ?? 0) < (count[$1] ?? 0) }
     }
 
     mutating func reset() { recent = []; lastSelfT = nil; firstT = nil }

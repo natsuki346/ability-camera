@@ -38,22 +38,27 @@ enum SpeakerEnrollCollect: String {
 }
 
 /// 本人を登録するとき（v1.10.1〜）：声のまとまりの埋め込みを、そのまとまりのコマの voice_self が分かるまで待ち、数えるかを決める。
-/// 数える：使った声のまとまり全体に voice_self が false のコマが無く、数える分（終わりから min(使った長さ, 0.5秒)）のコマがすべて true（1コマ以上）
+/// v1.10.3〜の決まり：数える分（終わりから min(使った長さ, 0.5秒)）のコマだけを見る（まとまり全体は見ない）。
+///   - voice_self: false で理由が pitch 以外（no_face・no_mouth・timing）のコマがあれば数えない（notSelf）
+///   - true のコマが1つ以上あれば数える（false が pitch だけ・null が混じっていても）
+///   - true が無く null があれば数えない（noF0）。pitch の false だけなら数えない（notSelf）
+/// v1.10.1〜v1.10.2 は、まとまり全体に false が1つでもあれば数えず、数える分がすべて true のときだけ数えた。
+/// 声の高さが上がった本人の声（保存した声の普段の範囲の外、reason pitch）でほとんど数えられなかったため変えた（docs/validation-log.md）
 struct SpeakerSelfGate<Item> {
-    /// 決まったときの結果（v1.10.2〜、数えなかった理由も）
+    /// 決まったときの結果（数えなかった理由も。記録の speaker_enroll_progress の not_self_s・no_f0_s・no_frames_s）
     enum Outcome: Equatable {
         case counted     // 数えた
-        case notSelf     // 使った声のまとまりに voice_self: false のコマがあった
-        case noF0        // false は無いが、数える分に voice_self: null（f0 が取れていない）のコマがあった（記録の skipped_no_f0_s）
+        case notSelf     // pitch 以外の理由の voice_self: false のコマがあった、または pitch の false だけで true が無い
+        case noF0        // true が無く、voice_self: null（f0 が取れていない）のコマがあった
         case noFrames    // 数える分のコマが無い・待っても来なかった
     }
 
-    private var frames: [(t: Int64, v: Bool?)] = []        // 時刻の順（映像のコマ）
+    private var frames: [(t: Int64, v: Bool?, reason: String?)] = []   // 時刻の順（映像のコマ）。reason は voice_self_reason
     private var pending: [(endMs: Int64, spanS: Double, item: Item)] = []
 
-    mutating func frame(tMs: Int64, voiceSelf: Bool?) {
+    mutating func frame(tMs: Int64, voiceSelf: Bool?, reason: String? = nil) {
         if let last = frames.last, tMs <= last.t { return }
-        frames.append((tMs, voiceSelf))
+        frames.append((tMs, voiceSelf, reason))
         let keep = tMs - Int64((SpeakerCriteria.maxSpanS + 7) * 1000)
         if let i = frames.firstIndex(where: { $0.t >= keep }), i > 0 { frames.removeFirst(i) }
     }
@@ -66,22 +71,45 @@ struct SpeakerSelfGate<Item> {
         let lastT = frames.last?.t ?? Int64.min
         while let p = pending.first, lastT >= p.endMs || nowMs - p.endMs > SpeakerCriteria.selfGateWaitMs {
             pending.removeFirst()
-            out.append((p.item, lastT >= p.endMs ? decide(endMs: p.endMs, spanS: p.spanS) : .noFrames))
+            out.append((p.item, lastT >= p.endMs ? Self.decide(frames.lazy.map { ($0.t, $0.v, $0.reason) }, endMs: p.endMs, spanS: p.spanS) : .noFrames))
         }
         return out
     }
 
     mutating func clear() { frames = []; pending = [] }
 
-    private func decide(endMs: Int64, spanS: Double) -> Outcome {
-        let start = endMs - Int64((spanS * 1000).rounded())
+    /// 決まり（analysis/enroll_check.py も同じ決まり）
+    static func decide<S: Sequence>(_ frames: S, endMs: Int64, spanS: Double) -> Outcome where S.Element == (Int64, Bool?, String?) {
         let counted = endMs - Int64((min(spanS, SpeakerCriteria.hopS) * 1000).rounded())
-        var n = 0, null = false
-        for f in frames where f.t >= start && f.t <= endMs {
-            if f.v == false { return .notSelf }
-            if f.t >= counted { if f.v == nil { null = true } else { n += 1 } }
+        var trues = 0, null = false, any = false
+        for (t, v, reason) in frames where t >= counted && t <= endMs {
+            any = true
+            switch v {
+            case .some(true): trues += 1
+            case .some(false): if reason != "pitch" { return .notSelf }
+            case .none: null = true
+            }
         }
-        return null ? .noF0 : n > 0 ? .counted : .noFrames
+        if trues > 0 { return .counted }
+        return null ? .noF0 : any ? .notSelf : .noFrames
+    }
+}
+
+/// 声の登録の途中の数え（v1.10.3〜、記録の speaker_enroll_progress）。計算した声（数えた＋数えなかった）を理由ごとに足す
+struct SpeakerEnrollTally: Equatable {
+    var computedS = 0.0, notSelfS = 0.0, noF0S = 0.0, noFramesS = 0.0
+
+    /// 足し、計算した声が 5秒の区切りを越えたら true（そのとき記録に1行書く）
+    mutating func add<I>(_ o: SpeakerSelfGate<I>.Outcome, seconds s: Double) -> Bool {
+        let step = SpeakerCriteria.enrollProgressStepS, before = computedS
+        computedS += s
+        switch o {
+        case .counted: break
+        case .notSelf: notSelfS += s
+        case .noF0: noF0S += s
+        case .noFrames: noFramesS += s
+        }
+        return ((computedS + 1e-9) / step).rounded(.down) > ((before + 1e-9) / step).rounded(.down)
     }
 }
 
@@ -252,6 +280,7 @@ final class SpeakerEmbedder {
     private let fbankArray: MLMultiArray
     private let maskArray: MLMultiArray
     private let fbank = SpeakerFbank()
+    private let lock = NSLock()   // アプリの中で1つを使い回すので（v1.10.3〜）、前の記録のキューと重なっても入力の配列を壊さない
     let url: URL
     let computeUnits: MLComputeUnits
 
@@ -270,10 +299,13 @@ final class SpeakerEmbedder {
     }
 
     /// window：直近 3秒の 16kHz の声（足りなければ前を 0 で埋めたもの、windowSamples 個）。spanS：そのうち使う直近の秒数。
-    /// 返り値：長さ1の埋め込み（256）
-    func embed(window: [Float], spanS: Double) -> [Float]? {
+    /// 返り値：長さ1の埋め込み（256）と、fbank・モデルの計算にかかった時間（ms、v1.10.3〜）
+    func embed(window: [Float], spanS: Double) -> (embedding: [Float], fbankMs: Double, predictMs: Double)? {
         guard window.count == SpeakerCriteria.windowSamples else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        let t0 = CFAbsoluteTimeGetCurrent()
         let fb = fbank.compute(window)
+        let t1 = CFAbsoluteTimeGetCurrent()
         guard fb.count == SpeakerCriteria.fbankFrames * SpeakerFbank.bins else { return nil }
         let m = SpeakerMath.mask(spanS: spanS)
         fb.withUnsafeBufferPointer { fbankArray.dataPointer.assumingMemoryBound(to: Float.self).update(from: $0.baseAddress!, count: $0.count) }
@@ -281,11 +313,17 @@ final class SpeakerEmbedder {
         guard let input = try? MLDictionaryFeatureProvider(dictionary: ["fbank": fbankArray, "weights": maskArray]),
               let out = try? model.prediction(from: input),
               let e = out.featureValue(for: "embedding")?.multiArrayValue else { return nil }
+        let t2 = CFAbsoluteTimeGetCurrent()
         let dim = e.shape.last?.intValue ?? 256
         var v = [Float](repeating: 0, count: dim)
-        for i in 0..<dim { v[i] = e[i].floatValue }
+        if e.dataType == .float32 {
+            let p = e.dataPointer.assumingMemoryBound(to: Float.self)
+            for i in 0..<dim { v[i] = p[i] }
+        } else {
+            for i in 0..<dim { v[i] = e[i].floatValue }
+        }
         guard v.allSatisfy({ $0.isFinite }) else { return nil }
-        return SpeakerMath.normalized(v)
+        return (SpeakerMath.normalized(v), (t1 - t0) * 1000, (t2 - t1) * 1000)
     }
 
     /// 演算ごとに、どこで動かす予定か（Neural Engine / GPU / CPU の数。iOS 17.4・macOS 14.4〜。記録の event speaker_model）

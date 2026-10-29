@@ -207,6 +207,29 @@ iPhone をつないで実行。初回は、iPhone の 設定 > 一般 > VPNと�
 - 振り返りレポート・リプレイは、`voice_self` の無い古い記録では、同じ決まりで本人の声を決め直す
 - 声の普段の進み具合が3秒増えないときは、理由を小さく出す（v1.6.2〜）：「声の普段が増えない理由：声の高さが取れていません」／「口が動いていません」／「顔が読めていません」（見る側の声の欄にも）
 
+## 本人の声の登録が進むようにする・計算時間の内訳（v1.10.3）
+記録 `ability-cam-20261029-123404`（v1.10.2 続き、iPhone）で分かった2つを直した。
+- **本人の声の登録の数える決まり**（`SpeakerSelfGate.decide`、`analysis/enroll_check.py` も同じ。記録の `speaker_enroll` に `gate_version: 2`）：
+  数える分（終わりから min(使った長さ, 0.5秒)）のコマだけを見る（まとまり全体は見ない）。
+  - `voice_self: false` で理由が `pitch` 以外（`no_face`・`no_mouth`・`timing`）のコマがあれば数えない
+  - `true` のコマが1つ以上あれば数える（`false` が `pitch` だけ・`null` が混じっていても）
+  - `true` が無く `null` があれば数えない（`no_f0`）、`pitch` の `false` だけなら数えない（`not_self`）
+
+  v1.10.1〜v1.10.2 は、まとまり全体に `false` が1つでもあれば数えなかった。この記録では、取り直しを始めてから約130秒で計算した声のまとまり 117個のうち数えたのは 8個（4秒）で、
+  98個が `not_self`（本人の声が 160〜190Hz に上がり、保存した声の普段の範囲（〜158Hz）を外れた `pitch` の `false` が多かった）。
+  `python enroll_check.py 記録.jsonl` で、前の決まりと今の決まりで何個・何秒になるかを、記録の `voice_self` と `speaker` 行から数え直せる
+- **登録の途中の記録**：`speaker_enroll_progress` を、数えた声が5秒増えるごとに加えて、**計算した声が5秒増えるごと**にも書く（本人の登録のとき）。
+  `computed_s`（計算した声）と、数えなかった理由ごとの `not_self_s`・`no_f0_s`・`no_frames_s`（v1.10.2 の `skipped_no_f0_s` は `no_f0_s` に替えた）。
+  裏に回ったときにもその時点の1行を書き、アプリが終わる（上にスワイプして閉じた・裏で時間が尽きた）ときも記録を閉じて `final: true` の1行を書く
+  （この記録には `final` が無かった。閉じる処理まで行かずにアプリが終わったと考えられる）
+- **計算時間の内訳**：iPhone で1回 中央値146ms・95% 174ms（Mac 1.3ms、`plan` は ne 111/111）。どこにかかっているかを見るため、`speaker` 行に
+  `fbank_ms`・`predict_ms`・`wait_ms`（声のまとまりが決まってから計算を始めるまで）を足した。`perf_check.py` が並べる
+- **確かめる用の切り替え**：設定の「話者の区別を記録する」の下の「確かめる用の設定」（初めは閉じている）、または起動引数（Xcode の Scheme > Arguments に
+  `-speakerQoS userInitiated`、`-speakerComputeUnits all` / `cpuOnly` / `cpuAndGPU`）で、計算のキューの優先度（初めは `utility`）と computeUnits（初めは `cpuAndNeuralEngine`）を変えられる。
+  次の記録から使い、ヘッダの `speaker_qos`・`speaker_compute_units` に書く
+- **モデルの読み込みはアプリの中で1回だけ**：v1.10.2 は記録を始めるたびに読み込み直していた（`load_ms` 5032）。アプリを開いたとき（設定がオンのとき）に読み込み、記録では使い回す。
+  computeUnits を変えたときだけ読み込み直す。`speaker_model` に `cached`（前に読み込んだものを使った）
+
 ## 話者の区別を、f0 の取れない声でも・速く動かす（v1.10.2）
 記録 `ability-cam-20261029-114906`（iPhone）で分かった2つを直した。
 - **声が出ているかの決め方**：「f0 がある、**または声の大きさが -52dB 以上**」（v1.10〜v1.10.1 は f0 がある間だけ）。
@@ -419,6 +442,8 @@ v1.9.1 からは、タイミングを判定に使わないので、アプリは 
 | `calc_ms` | 計算にかかった時間（ms。v1.10.2〜は fbank とモデルの合計） |
 | `model` | 使ったモデルの版 |
 | `f0_ratio` | そのまとまりで、声が出ていた音の塊のうち f0 が取れていた割合（0.01 に丸める、v1.10.2〜） |
+| `fbank_ms` / `predict_ms` | `calc_ms` の内訳：fbank・Core ML の prediction（v1.10.3〜） |
+| `wait_ms` | 声のまとまりが決まってから計算を始めるまで（キューの待ち、v1.10.3〜） |
 
 ### `type: "audio"`（v1.9.1〜、音の塊（約0.1秒）ごとに1行）
 | キー | 意味 |
@@ -458,8 +483,8 @@ v1.9.1 からは、タイミングを判定に使わないので、アプリは 
 | `baseline_restart` | なし | 「普段を取り直す」を押した（カメラを切り替えたときも）。`part: "face"`＝表情の普段だけ（カメラを切り替えたとき v1.7〜・「表情だけ」v1.9.2〜）、`part: "voice"`＝声の普段だけ（「声だけ」・設定の「人」の「声の普段を取り直す」、v1.9.2〜）、無ければ両方 |
 | `voice_pitch_range` | なし | 声の高さの範囲を使い始めた（v1.9.4〜、声の普段を集め終えたとき・保存し直したとき）。`median`・`iqr`（Hz）。無ければ範囲を外した |
 | `speaker_enroll` | `"登録"` / `"取り直し"` | 声の登録を集め始めた（v1.10〜）。`person_id`、`collect`（`voice_self`＝本人の声とされた時間だけ / `voiced`＝声が出ている時間すべて、v1.10.1〜）。名前・同意した人・埋め込みは書かない |
-| `speaker_enroll_progress` | なし | 声の登録の途中で、たまった秒数が 5秒増えた（v1.10.1〜）。`person_id`、`valid_s`（たまった秒数）、`score`（その時点までの登録と最新の声の似ている度合い）。本人を登録しているとき（`collect: "voice_self"`）は `skipped_no_f0_s`（声が出ていたが `voice_self` が null で数えなかった秒数、この登録を始めてから。v1.10.2〜）。登録し終えた・止めたときに `final: true` の1行（`score` なし、v1.10.2〜） |
-| `speaker_model` | モデルの版 | 話者の区別のモデルを読み込んだ（v1.10.2〜）。`compute_units`、`load_ms`、`plan`（演算ごとの計算の予定：`ne`＝Neural Engine / `gpu` / `cpu` の数。iOS 17.4〜） |
+| `speaker_enroll_progress` | なし | 声の登録の途中（v1.10.1〜）。数えた声（`valid_s`）が5秒増えるごと、本人の登録では計算した声（`computed_s`）が5秒増えるごとにも（v1.10.3〜）。`person_id`、`valid_s`、`score`（その時点までの登録と最新の声の似ている度合い。数えた声が5秒増えたときだけ）。本人を登録しているとき（`collect: "voice_self"`）は `computed_s`・`not_self_s`・`no_f0_s`・`no_frames_s`（この登録を始めてから。v1.10.2 は `skipped_no_f0_s` だけ）。登録し終えた・止めた・記録を閉じたときに `final: true` の1行（`score` なし、v1.10.2〜） |
+| `speaker_model` | モデルの版 | 話者の区別のモデルを用意した（v1.10.2〜）。`compute_units`、`load_ms`（読み込みにかかった時間）、`cached`（アプリの中で前に読み込んだものを使った、v1.10.3〜）、`plan`（演算ごとの計算の予定：`ne`＝Neural Engine / `gpu` / `cpu` の数。iOS 17.4〜） |
 | `audio_session` | カテゴリ | マイクを始めた（v1.10.2〜）。`audio`：`category`・`mode`・`voice_processing`（エコーキャンセルなどの声の処理）・`other_audio_playing`（始めたときにほかのアプリの音が鳴っていたか）・`mix_with_others`・`input_gain_settable` |
 | `voice_partial_discarded` | 理由 | 途中まで集めた声の普段が、集め始めてから14日たっていたので使わなかった（v1.7〜）。`person_id` |
 | `head_turn` | `"右へ"` / `"左へ"` / `"正面に戻った"` / `"見えなくなった（直前は右 40°）"` / `"見えるようになった（左 20°）"` | 顔の向きが変わって0.5秒続いた（v0.8〜）。`head`（新しい向き：`front` / `right` / `left` / `hidden` / `oblique`）、`from`（前の向き）、`yaw_deg`（なり始めたときの yaw。`hidden` は見えなくなる直前の yaw）が付く |

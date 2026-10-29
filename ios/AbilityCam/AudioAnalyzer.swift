@@ -1,5 +1,6 @@
 import AVFoundation
 import Accelerate
+import CoreML
 import QuartzCore
 
 /// 音の設定（v1.10.2〜、記録の event audio_session）。打ち消し（エコーキャンセル）・自動の音量補正をしていないかを確かめるため
@@ -105,8 +106,72 @@ final class AudioAnalyzer {
 
 /// 話者の区別の音の流れ（v1.10〜、docs/speaker-plan.md）。タップの中では計算しない：16kHz に変えて輪のバッファ（3秒、メモリだけ）に足すだけ。
 /// 声が出ている間だけ（f0 がある、または声の大きさがしきい値以上。v1.10.2〜）、0.5秒ごとに、別の低い優先度のキューで直近の声のまとまり（最大3秒。1.5秒未満も）の埋め込みを求め、onEmbedding に渡す
+/// 話者の区別の計算の、確かめる用の切り替え（v1.10.3〜。設定の「確かめる用の設定」、または起動引数 -speakerQoS userInitiated / -speakerComputeUnits all など。
+/// 起動引数は UserDefaults に入るので、どちらでも同じ）。記録のヘッダ speaker_qos・speaker_compute_units
+enum SpeakerSettings {
+    static let qosKey = "speakerQoS", unitsKey = "speakerComputeUnits"
+    static let qosChoices = ["utility", "userInitiated"]
+    static let unitsChoices = ["cpuAndNeuralEngine", "all", "cpuOnly", "cpuAndGPU"]
+
+    static var qosName: String { UserDefaults.standard.string(forKey: qosKey).flatMap { qosChoices.contains($0) ? $0 : nil } ?? "utility" }
+    static var unitsName: String { UserDefaults.standard.string(forKey: unitsKey).flatMap { unitsChoices.contains($0) ? $0 : nil } ?? "cpuAndNeuralEngine" }
+    static var qos: DispatchQoS { qosName == "userInitiated" ? .userInitiated : .utility }
+    static func units(_ name: String) -> MLComputeUnits {
+        switch name { case "all": return .all; case "cpuOnly": return .cpuOnly; case "cpuAndGPU": return .cpuAndGPU; default: return .cpuAndNeuralEngine }
+    }
+}
+
+/// 話者の区別のモデルを、アプリの中で1回だけ読み込む（v1.10.3〜。v1.10.2 は記録ごとに読み込み直していて、iPhone で約5秒かかっていた）。
+/// computeUnits を切り替えたときだけ読み込み直す
+final class SpeakerModelStore {
+    static let shared = SpeakerModelStore()
+    struct Loaded { let units: String; let embedder: SpeakerEmbedder; let loadMs: Double; let plan: [String: Int]? }
+    private let queue = DispatchQueue(label: "speaker-load", qos: .utility)
+    private var loaded: Loaded?          // queue の上でだけ触る
+
+    /// アプリを開いたとき・設定をオンにしたとき（待たない）
+    func preload() {
+        guard SpeakerEmbedder.bundledURL() != nil else { return }
+        let u = SpeakerSettings.unitsName
+        queue.async { _ = self.load(u) }
+    }
+
+    /// 読み込んだもの（cached：前に読み込んだものを使った）。まだなら、ここで読み込む（呼んだキューで待つ）
+    func get(_ units: String) -> (loaded: Loaded, cached: Bool)? {
+        queue.sync {
+            let cached = loaded?.units == units
+            return load(units).map { ($0, cached) }
+        }
+    }
+
+    private func load(_ units: String) -> Loaded? {
+        if let l = loaded, l.units == units { return l }
+        guard let url = SpeakerEmbedder.bundledURL() else { return nil }
+        let cu = SpeakerSettings.units(units)
+        let t0 = CACurrentMediaTime()
+        guard let e = SpeakerEmbedder(url: url, computeUnits: cu) else { return nil }
+        let ms = (CACurrentMediaTime() - t0) * 1000
+        // どこで動かす予定か（iOS 17.4〜）。async なので、この読み込みのキューで待つ
+        var plan: [String: Int]?
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached { plan = await SpeakerEmbedder.computePlan(url: url, computeUnits: cu); sem.signal() }
+        sem.wait()
+        let l = Loaded(units: units, embedder: e, loadMs: ms, plan: plan)
+        loaded = l
+        return l
+    }
+}
+
+/// 1回の計算の内訳（v1.10.3〜、記録の speaker 行の calc_ms・fbank_ms・predict_ms・wait_ms）
+struct SpeakerTiming {
+    let calcMs: Double      // fbank とモデル（embed の中）
+    let fbankMs: Double
+    let predictMs: Double
+    let waitMs: Double      // 声のまとまりが決まってから、計算を始めるまで（キューの待ち）
+}
+
 final class SpeakerFeed {
-    private let queue = DispatchQueue(label: "speaker", qos: .utility)
+    private let queue: DispatchQueue
     private let lock = NSLock()
     private var ring = SpeakerRing()            // lock の中でだけ触る
     private var converter: AVAudioConverter?
@@ -118,23 +183,23 @@ final class SpeakerFeed {
 
     /// 埋め込みを求めた（音のスレッドではなく speaker のキュー）。endMs：使った声のまとまりの終わりの時刻（epoch ms）。
     /// calcMs は fbank とモデルの計算の合計。f0Ratio：そのまとまりで f0 が取れていた割合
-    var onEmbedding: ((_ endMs: Int64, _ spanS: Double, _ calcMs: Double, _ f0Ratio: Double?, _ embedding: [Float]) -> Void)?
-    /// モデルを読み込んだ：どこで動かす予定か（Neural Engine / GPU / CPU の演算の数）と、computeUnits（v1.10.2〜、記録の event speaker_model）
-    var onModel: ((_ plan: [String: Int]?, _ computeUnits: String, _ loadMs: Double) -> Void)?
+    var onEmbedding: ((_ endMs: Int64, _ spanS: Double, _ timing: SpeakerTiming, _ f0Ratio: Double?, _ embedding: [Float]) -> Void)?
+    /// モデルを用意した：どこで動かす予定か（Neural Engine / GPU / CPU の演算の数）・computeUnits・読み込みにかかった時間・前に読み込んだものか（v1.10.2〜、記録の event speaker_model）
+    var onModel: ((_ plan: [String: Int]?, _ computeUnits: String, _ loadMs: Double?, _ cached: Bool) -> Void)?
+    let qosName: String
+    let unitsName: String
 
-    /// モデルが無ければ nil
+    /// モデルが無ければ nil。キューの優先度と computeUnits は SpeakerSettings（記録を始めたときのもの）
     init?() {
-        guard let url = SpeakerEmbedder.bundledURL() else { return nil }
+        guard SpeakerEmbedder.bundledURL() != nil else { return nil }
         ready = true
-        queue.async { [weak self] in   // 読み込みも別のキューで
-            let t0 = CACurrentMediaTime()
-            let e = SpeakerEmbedder()
-            let loadMs = (CACurrentMediaTime() - t0) * 1000
-            self?.embedder = e
-            Task { [weak self] in
-                let plan = await SpeakerEmbedder.computePlan(url: url, computeUnits: .cpuAndNeuralEngine)
-                self?.onModel?(plan, e == nil ? "failed" : "cpuAndNeuralEngine", loadMs)
-            }
+        qosName = SpeakerSettings.qosName; unitsName = SpeakerSettings.unitsName
+        queue = DispatchQueue(label: "speaker", qos: SpeakerSettings.qos)
+        let units = unitsName
+        queue.async { [weak self] in   // 読み込み（済んでいれば使い回す）も別のキューで
+            let r = SpeakerModelStore.shared.get(units)
+            self?.embedder = r?.loaded.embedder
+            self?.onModel?(r?.loaded.plan, r == nil ? "failed" : units, r?.loaded.loadMs, r?.cached ?? false)
         }
     }
 
@@ -157,10 +222,10 @@ final class SpeakerFeed {
         ring.append(x, count: Int(out.frameLength))
         ring.mark(voiced: voiced, f0: f0, at: endS)
         let span = ring.span(now: endS)
-        var job: (window: [Float], span: Double, f0Ratio: Double?)?
+        var job: (window: [Float], span: Double, f0Ratio: Double?, at: CFTimeInterval)?
         if voiced, let s = span, s >= SpeakerCriteria.minSpanS, endS - lastRun >= SpeakerCriteria.hopS - 1e-6, !busy {
             busy = true; lastRun = endS
-            job = (ring.window(), s, ring.f0Ratio(spanS: s, now: endS))
+            job = (ring.window(), s, ring.f0Ratio(spanS: s, now: endS), CACurrentMediaTime())
         }
         lock.unlock()
         guard let job else { return }
@@ -171,7 +236,8 @@ final class SpeakerFeed {
             guard let emb = self.embedder else { return }
             let t0 = CACurrentMediaTime()
             guard let e = emb.embed(window: job.window, spanS: job.span) else { return }
-            self.onEmbedding?(endMs, job.span, (CACurrentMediaTime() - t0) * 1000, job.f0Ratio, e)
+            let timing = SpeakerTiming(calcMs: (CACurrentMediaTime() - t0) * 1000, fbankMs: e.fbankMs, predictMs: e.predictMs, waitMs: (t0 - job.at) * 1000)
+            self.onEmbedding?(endMs, job.span, timing, job.f0Ratio, e.embedding)
         }
     }
 }

@@ -1474,8 +1474,13 @@ def quality(a: Analysis, calm: bool) -> dict:
                 v = prog.setdefault(e["person_id"], {"collect": None, "points": []})
                 if e.get("score") is not None:
                     v["points"].append((float(e.get("valid_s", 0)), float(e["score"])))
-                if e.get("skipped_no_f0_s") is not None:   # v1.10.2〜：本人の登録で、f0 が取れず（voice_self が null）数えなかった秒数。最後の行の値
-                    v["skipped_no_f0_s"] = float(e["skipped_no_f0_s"]); v["valid_s"] = float(e.get("valid_s", 0))
+                # 本人の登録で数えなかった秒数（最後の行の値）。v1.10.2 は skipped_no_f0_s だけ、v1.10.3〜は computed_s と理由ごと
+                nf = e.get("no_f0_s", e.get("skipped_no_f0_s"))
+                if nf is not None:
+                    v["skipped_no_f0_s"] = float(nf); v["valid_s"] = float(e.get("valid_s", 0))
+                    for k in ("computed_s", "not_self_s", "no_frames_s"):
+                        if e.get(k) is not None:
+                            v[k] = float(e[k])
         q["speaker"]["enroll"] = {k: v for k, v in prog.items() if v["points"] or "skipped_no_f0_s" in v}
 
     yaw = rec.yaw[np.isfinite(rec.yaw)]
@@ -1969,7 +1974,9 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
             qrows.append([f"声の登録の途中 {k[:8]}（{cl.get(v['collect'], v['collect'])}。たまった秒数：その時点までの登録と最新の声の似ている度合い）",
                           ("、".join(f"{t:.0f}秒 {sc:.2f}" for t, sc in v["points"]) or "5秒に届かなかった")
                           + (f"。f0 が取れず（voice_self が null）数えなかった声 {v['skipped_no_f0_s']:.1f}秒（数えた声 {v['valid_s']:.1f}秒）"
-                             if "skipped_no_f0_s" in v else "")])
+                             if "skipped_no_f0_s" in v else "")
+                          + (f"。計算した声 {v['computed_s']:.1f}秒のうち、本人の声と言えなかった {v.get('not_self_s', 0):.1f}秒・コマが無かった {v.get('no_frames_s', 0):.1f}秒"
+                             if "computed_s" in v else "")])
     p = q["pitch"]
     qrows.append(["声の高さ（f0）が取れたコマ",
                   f"{p['f0_frames']}コマ（求め方 {p['version']}："

@@ -70,6 +70,9 @@ struct SettingsView: View {
     @AppStorage("baselineSeconds") private var baselineSeconds = AnalysisModel.defaultBaselineSeconds
     @State private var allowed = AllowedViewers.all()
     @ObservedObject private var people = PersonStore.shared
+    @AppStorage(SpeakerSettings.qosKey) private var speakerQoS = "utility"                       // 確かめる用（v1.10.3〜）
+    @AppStorage(SpeakerSettings.unitsKey) private var speakerUnits = "cpuAndNeuralEngine"
+    @State private var speakerDevOpen = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -111,6 +114,19 @@ struct SettingsView: View {
                     PeopleSettingsSection()
                     Section {
                         Toggle("話者の区別を記録する", isOn: $speakerRecord)
+                            .onChange(of: speakerRecord) { _, on in if on { SpeakerModelStore.shared.preload() } }
+                        // 確かめる用の設定（v1.10.3〜。初めは閉じている。起動引数 -speakerQoS / -speakerComputeUnits でも変えられる）
+                        DisclosureGroup("確かめる用の設定", isExpanded: $speakerDevOpen) {
+                            Picker("計算の優先度", selection: $speakerQoS) {
+                                ForEach(SpeakerSettings.qosChoices, id: \.self) { Text($0).tag($0) }
+                            }
+                            Picker("計算の場所（computeUnits）", selection: $speakerUnits) {
+                                ForEach(SpeakerSettings.unitsChoices, id: \.self) { Text($0).tag($0) }
+                            }
+                            .onChange(of: speakerUnits) { _, _ in if speakerRecord { SpeakerModelStore.shared.preload() } }
+                            Text("話者の区別の計算の速さを比べるためのもの。次の記録から使い、記録のヘッダ（speaker_qos・speaker_compute_units）に書きます。初めは utility・cpuAndNeuralEngine")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     } footer: {
                         VStack(alignment: .leading, spacing: 4) {
                             // 記録中に切り替えても、今の記録には効かない（v1.10.2〜。オンにしたつもりの記録がオフだったため）

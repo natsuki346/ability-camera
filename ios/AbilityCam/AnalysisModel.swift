@@ -130,7 +130,7 @@ final class AnalysisModel: ObservableObject {
     private var speakerOn = false
     private var speakerEnroll: (id: String, partial: SpeakerEnrollPartial, retake: Bool, collect: SpeakerEnrollCollect)?
     private var speakerEnrollSavedSec = -1
-    private var speakerSkippedNoF0S = 0.0   // 本人を登録しているとき、声が出ていたが voice_self が null（f0 が取れない）で数えなかった秒数（この登録を始めてから。v1.10.2〜）
+    private var speakerTally = SpeakerEnrollTally()   // 登録を始めてから計算した声と、数えなかった理由ごとの秒数（v1.10.3〜、speaker_enroll_progress）
     private var speakerGate = SpeakerSelfGate<(endMs: Int64, spanS: Double, embedding: [Float])>()   // 本人を登録するとき（v1.10.1〜）
     private var voiceRetake = false                           // 声の普段だけを取り直した（集め終えたら、その人の声の普段を置き換える。v1.9.2〜）
     private var voiceF0Values: [Double] = []                  // このセッションで数えた声の高さ（v1.9.1〜、中央値・四分位範囲を求める）
@@ -183,6 +183,8 @@ final class AnalysisModel: ObservableObject {
         guard running else { return }
         if micOn { audio.stop() }
         rmsDb = nil; f0Hz = nil
+        // 登録している途中なら、裏に回った時点の数えを書いておく（v1.10.3〜。このあと閉じられずに終わっても、取りこぼしが分かるように）
+        if let en = speakerEnroll { writeEnrollProgress(en, tMs: Self.nowMs(), score: nil) }
         logger.flush()
         UIApplication.shared.isIdleTimerDisabled = false
         bgTask = UIApplication.shared.beginBackgroundTask(withName: "finish-session") { [weak self] in
@@ -214,7 +216,8 @@ final class AnalysisModel: ObservableObject {
         let enrolled = PersonStore.shared.people.filter { $0.speaker?.model == SpeakerCriteria.model }
             .map { ["id": $0.id, "role": $0.id == selected ? "self" : "family"] }
         return ["speaker_on": true, "speaker_setting": setting, "speaker_model": SpeakerCriteria.model, "speaker_voiced_floor_db": Double(SpeakerCriteria.voicedFloorDb), "speaker_enrolled": enrolled,
-                "speaker_hop_s": SpeakerCriteria.hopS, "speaker_max_span_s": SpeakerCriteria.maxSpanS]
+                "speaker_hop_s": SpeakerCriteria.hopS, "speaker_max_span_s": SpeakerCriteria.maxSpanS,
+                "speaker_qos": audio.speaker?.qosName ?? "", "speaker_compute_units": audio.speaker?.unitsName ?? ""]   // 確かめる用の切り替え（v1.10.3〜）
     }
 
     private func startSession() async {
@@ -223,15 +226,16 @@ final class AnalysisModel: ObservableObject {
         audio.speaker = UserDefaults.standard.bool(forKey: "speakerRecord") ? SpeakerFeed() : nil
         speakerOn = audio.speaker != nil
         PersonStore.shared.speakerInSession = speakerOn
-        audio.speaker?.onEmbedding = { [weak self] endMs, span, calc, f0r, e in
-            Task { @MainActor in self?.speakerResult(endMs: endMs, spanS: span, calcMs: calc, f0Ratio: f0r, embedding: e) }
+        audio.speaker?.onEmbedding = { [weak self] endMs, span, timing, f0r, e in
+            Task { @MainActor in self?.speakerResult(endMs: endMs, spanS: span, timing: timing, f0Ratio: f0r, embedding: e) }
         }
         // モデルを読み込んだら、どこで動かす予定かを記録に書く（v1.10.2〜、iPhone で Neural Engine を使っているかを確かめる）
-        audio.speaker?.onModel = { [weak self] plan, units, loadMs in
+        // v1.10.3〜：モデルはアプリの中で1回だけ読み込む。cached：前に読み込んだものを使った（load_ms はそのときの読み込みにかかった時間）
+        audio.speaker?.onModel = { [weak self] plan, units, loadMs, cached in
             Task { @MainActor in
                 guard let self, self.running else { return }
                 var e = EventRecord(tMs: Self.nowMs(), kind: "speaker_model", value: .text(SpeakerCriteria.model))
-                e.computeUnits = units; e.loadMs = (loadMs * 10).rounded() / 10; e.plan = plan
+                e.computeUnits = units; e.loadMs = loadMs.map { ($0 * 10).rounded() / 10 }; e.plan = plan; e.cached = cached
                 self.logger.write(e)
             }
         }
@@ -476,19 +480,23 @@ final class AnalysisModel: ObservableObject {
     // MARK: 話者の区別（v1.10〜、記録に書くだけ。画面には出さない）
 
     /// 埋め込みを1つ求めた：登録した人ごとの似ている度合いを記録に書き、声の登録を集めていれば足す
-    private func speakerResult(endMs: Int64, spanS: Double, calcMs: Double, f0Ratio: Double?, embedding e: [Float]) {
+    private func speakerResult(endMs: Int64, spanS: Double, timing: SpeakerTiming, f0Ratio: Double?, embedding e: [Float]) {
         guard running, speakerOn else { return }
         var scores: [String: Double] = [:]
         for p in PersonStore.shared.people {
             guard let s = p.speaker, s.model == SpeakerCriteria.model else { continue }
             scores[p.id] = (SpeakerMath.cosine(e, s.embedding) * 1000).rounded() / 1000
         }
+        let r1 = { (x: Double) in (x * 10).rounded() / 10 }
         logger.write(SpeakerRecord(tMs: endMs, windowMs: Int((spanS * 1000).rounded()), scores: scores,
-                                   calcMs: (calcMs * 10).rounded() / 10, model: SpeakerCriteria.model,
-                                   f0Ratio: f0Ratio.map { ($0 * 100).rounded() / 100 }), notBefore: endMs)
+                                   calcMs: r1(timing.calcMs), model: SpeakerCriteria.model,
+                                   f0Ratio: f0Ratio.map { ($0 * 100).rounded() / 100 },
+                                   fbankMs: r1(timing.fbankMs), predictMs: r1(timing.predictMs), waitMs: r1(timing.waitMs)), notBefore: endMs)
         guard let en = speakerEnroll else { return }
         switch en.collect {
-        case .voiced: addSpeakerEnroll(endMs: endMs, spanS: spanS, embedding: e)
+        case .voiced:
+            _ = speakerTally.add(SpeakerSelfGate<Int>.Outcome.counted, seconds: min(spanS, SpeakerCriteria.hopS))
+            addSpeakerEnroll(endMs: endMs, spanS: spanS, embedding: e)
         case .voiceSelf:   // 本人：そのまとまりのコマの voice_self が分かってから決める（v1.10.1〜）
             speakerGate.embedding(endMs: endMs, spanS: spanS, item: (endMs, spanS, e))
             drainSpeakerGate()
@@ -496,9 +504,9 @@ final class AnalysisModel: ObservableObject {
     }
 
     /// 本人を登録しているとき、映像のコマごとの voice_self を入れる（update から）
-    private func speakerGateFrame(tMs: Int64, voiceSelf: Bool?) {
+    private func speakerGateFrame(tMs: Int64, voiceSelf: Bool?, reason: String?) {
         guard let en = speakerEnroll, en.collect == .voiceSelf else { return }
-        speakerGate.frame(tMs: tMs, voiceSelf: voiceSelf)
+        speakerGate.frame(tMs: tMs, voiceSelf: voiceSelf, reason: reason)
         drainSpeakerGate()
     }
 
@@ -506,20 +514,23 @@ final class AnalysisModel: ObservableObject {
         for r in speakerGate.ready(nowMs: Self.nowMs()) {
             // 途中で選んでいる人を変えたら、voice_self はほかの人のものなので数えない
             guard let en = speakerEnroll, en.collect == .voiceSelf, PersonStore.shared.selectedID == en.id else { continue }
-            switch r.outcome {
-            case .counted: addSpeakerEnroll(endMs: r.item.endMs, spanS: r.item.spanS, embedding: r.item.embedding)
-            case .noF0: speakerSkippedNoF0S += min(r.item.spanS, SpeakerCriteria.hopS)   // 数えたら足した分と同じ長さ
-            case .notSelf, .noFrames: break
+            // 数えたら足した分と同じ長さを、理由ごとに足す。計算した声が5秒増えるごとにも1行（v1.10.3〜。数えた声が5秒に届かなくても取りこぼしが分かるように）
+            let crossed = speakerTally.add(r.outcome, seconds: min(r.item.spanS, SpeakerCriteria.hopS))
+            if r.outcome == .counted {
+                addSpeakerEnroll(endMs: r.item.endMs, spanS: r.item.spanS, embedding: r.item.embedding, computedCrossed: crossed)
+            } else if crossed {
+                writeEnrollProgress(en, tMs: r.item.endMs, score: nil)
             }
         }
     }
 
-    private func addSpeakerEnroll(endMs: Int64, spanS: Double, embedding e: [Float]) {
+    private func addSpeakerEnroll(endMs: Int64, spanS: Double, embedding e: [Float], computedCrossed: Bool = false) {
         guard var en = speakerEnroll else { return }
         // 0.5秒ごとなので、重ならない分だけ数える
         let score = SpeakerMath.addWithProgress(&en.partial, embedding: e, spanS: min(spanS, SpeakerCriteria.hopS))
         speakerEnroll = en
-        if let score { writeEnrollProgress(en, tMs: endMs, score: score) }   // たまった秒数が5秒増えるごと（v1.10.1〜）
+        // たまった秒数が5秒増えるごと（v1.10.1〜）、または本人の登録で計算した声が5秒増えたとき（v1.10.3〜、score なしのこともある）
+        if score != nil || computedCrossed { writeEnrollProgress(en, tMs: endMs, score: score) }
         let sec = Int(en.partial.validS)
         if PersonStore.shared.speakerEnrollSec != sec { PersonStore.shared.speakerEnrollSec = sec }
         let name = PersonStore.shared.people.first { $0.id == en.id }?.displayName ?? ""
@@ -538,13 +549,17 @@ final class AnalysisModel: ObservableObject {
         }
     }
 
-    /// 記録の speaker_enroll_progress（埋め込みは書かない）。本人を登録しているときは skipped_no_f0_s も（v1.10.2〜）。
-    /// final：登録し終えた・止めたときの最後の1行（score は無い。たまった秒数が5秒に届かなくても、取りこぼした秒数が分かるように）
+    /// 記録の speaker_enroll_progress（埋め込みは書かない）。本人を登録しているときは、計算した声と数えなかった理由ごとの秒数も（v1.10.3〜）。
+    /// final：登録し終えた・止めた・記録を閉じたときの最後の1行（score は無い）
     private func writeEnrollProgress(_ en: (id: String, partial: SpeakerEnrollPartial, retake: Bool, collect: SpeakerEnrollCollect),
                                      tMs: Int64, score: Double?, final: Bool = false) {
         var ev = EventRecord(tMs: tMs, kind: "speaker_enroll_progress", value: nil)
         ev.personId = en.id; ev.validS = (en.partial.validS * 10).rounded() / 10; ev.score = score
-        if en.collect == .voiceSelf { ev.skippedNoF0S = (speakerSkippedNoF0S * 10).rounded() / 10 }
+        if en.collect == .voiceSelf {
+            let r1 = { (x: Double) in (x * 10).rounded() / 10 }
+            ev.computedS = r1(speakerTally.computedS); ev.notSelfS = r1(speakerTally.notSelfS)
+            ev.noF0S = r1(speakerTally.noF0S); ev.noFramesS = r1(speakerTally.noFramesS)
+        }
         if final { ev.final = true }
         logger.write(ev)
     }
@@ -576,13 +591,14 @@ final class AnalysisModel: ObservableObject {
         }
         speakerEnroll = (id, part, retake, collect)
         speakerEnrollSavedSec = -1
-        speakerSkippedNoF0S = 0
+        speakerTally = SpeakerEnrollTally()
         speakerGate.clear()
         PersonStore.shared.speakerEnrollCollect = collect
         PersonStore.shared.speakerEnrollSec = Int(part.validS)
         var e = EventRecord(tMs: now, kind: "speaker_enroll", value: .text(retake ? "取り直し" : "登録"))
         e.personId = id   // 名前・同意した人は記録に書かない
         e.collect = collect.rawValue
+        if collect == .voiceSelf { e.gateVersion = 2 }   // 数える決まり（v1.10.3〜：数える 0.5秒だけを見て、false は pitch だけなら数える）
         logger.write(e)
         setSpeakerProgress(name: p.displayName, sec: Int(part.validS))
         return true
@@ -1051,7 +1067,7 @@ final class AnalysisModel: ObservableObject {
                         voiceReason: VoiceSelfTracker.Reason? = nil) {
         guard cameraActive else { return }
         collectVoice(tMs: tMs, voiceSelf: voiceSelf, faceValid: r.face && voiceFaceValid, reason: voiceReason, audio: a)
-        speakerGateFrame(tMs: tMs, voiceSelf: voiceSelf)
+        speakerGateFrame(tMs: tMs, voiceSelf: voiceSelf, reason: voiceReason?.rawValue)
         if a.at > lastAudioAtCoverage, let db = a.rmsDb {   // 音の塊ごとに1回
             lastAudioAtCoverage = a.at
             pitchCoverage.add(t: a.at, db: db, f0: a.f0Hz != nil)

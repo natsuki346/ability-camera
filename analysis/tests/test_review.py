@@ -1528,7 +1528,7 @@ class SpeakerTest(unittest.TestCase):
             for k in range(20):
                 lines.append(json.dumps({"type": "speaker", "t_ms": t0 + 500 * (k + 1), "window_ms": 400 if k < 5 else 3000,
                                          "scores": {"aaaa1111": 0.7, "bbbb2222": 0.3}, "calc_ms": 8.0 + k % 3, "model": "wespeaker-r34lm-fluid-coreml-v1",
-                                         "f0_ratio": 0.0 if k < 4 else 0.8}))
+                                         "f0_ratio": 0.0 if k < 4 else 0.8, "fbank_ms": 2.0, "predict_ms": 6.0 + k % 3, "wait_ms": 1.0}))
             lines.append(json.dumps({"type": "event", "t_ms": t0 + 50, "kind": "speaker_model", "value": "wespeaker-r34lm-3s-fp16-v2",
                                      "compute_units": "cpuAndNeuralEngine", "load_ms": 120.0, "plan": {"ne": 111}}))
             lines.append(json.dumps({"type": "event", "t_ms": t0 + 100, "kind": "speaker_enroll", "value": "登録", "person_id": "aaaa1111", "collect": "voice_self"}))
@@ -1562,6 +1562,8 @@ class SpeakerTest(unittest.TestCase):
         self.assertAlmostEqual(sp["f0_ratio"][1], 0.8)
         self.assertEqual(rows[0]["plan"], "ne=111")
         self.assertAlmostEqual(rows[0]["f0_ratio_p50"], 0.8)
+        self.assertAlmostEqual(rows[0]["predict_p50"], 7.0)
+        self.assertAlmostEqual(rows[0]["fbank_p50"], 2.0)
         en = sp["enroll"]["aaaa1111"]
         self.assertEqual(en["collect"], "voice_self")
         self.assertEqual(en["points"], [(5.0, 0.61), (10.0, 0.74), (15.0, 0.78)])
@@ -1606,3 +1608,71 @@ class SpeakerTest(unittest.TestCase):
         self.assertEqual(app("voiceGapS"), c["voice_gap_s"])
         self.assertEqual(app("maxSpanS"), c["max_span_s"])
         self.assertEqual(app("hopS"), c["hop_s"])
+
+
+class EnrollCheckTest(unittest.TestCase):
+    """本人の声の登録の数える決まり（v1.10.3〜、enroll_check.py とアプリの SpeakerSelfGate.decide）"""
+
+    def record(self, d):
+        import json
+        t0 = 1_800_000_000_000
+        lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "person_id": "aaaa1111", "speaker_on": True})]
+        lines.append(json.dumps({"type": "event", "t_ms": t0 + 1000, "kind": "speaker_enroll", "value": "取り直し", "person_id": "aaaa1111", "collect": "voice_self"}))
+        # 2〜12秒：本人の声。0.5秒ごとの区切りの中で、コマが交互に true と false（pitch）＝声の高さが範囲の外
+        # 12〜14秒：口が動いていない（false、no_mouth）が混じる。14〜16秒：f0 が取れない（null）だけ
+        for k in range(0, 16000 // 33):
+            t = 2000 + k * 33
+            if t < 12000:
+                v, r = (True, None) if k % 2 == 0 else (False, "pitch")
+            elif t < 14000:
+                v, r = (True, None) if k % 3 else (False, "no_mouth")
+            else:
+                v, r = None, None
+            lines.append(json.dumps({"type": "frame", "t_ms": t0 + t, "face": True, "voice_self": v, **({"voice_self_reason": r} if r else {})}))
+        for k in range(4, 32):   # 2.5〜16秒、0.5秒ごと、3秒のまとまり
+            lines.append(json.dumps({"type": "speaker", "t_ms": t0 + 500 * k + 450, "window_ms": 3000, "scores": {}, "calc_ms": 1.0}))
+        p = Path(d) / "enroll.jsonl"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def test_old_and_new_rule(self):
+        import enroll_check
+        with tempfile.TemporaryDirectory() as d:
+            r = enroll_check.check(enroll_check.load(self.record(d)))
+        self.assertEqual(len(r), 1)
+        r = r[0]
+        self.assertEqual(r["chunks"], 28)
+        g1, g2 = r["gate1"]["count"], r["gate2"]["count"]
+        # 前の決まり：pitch の false で全部外れる（null だけの区間は no_f0）
+        self.assertEqual(g1.get("counted", 0), 0)
+        # 今の決まり：2〜12秒（2.45〜11.95秒で終わる 20個）は数える。no_mouth の区間（14.45秒で終わる1個は 13.95〜14秒の no_mouth を含む）・null だけの区間は数えない
+        self.assertEqual(g2.get("counted", 0), 20)
+        self.assertEqual(g2.get("not_self", 0), 5)
+        self.assertEqual(g2.get("no_f0", 0), 3)
+        self.assertAlmostEqual(r["gate2"]["seconds"]["counted"], 10.0)
+
+    def test_same_as_app(self):
+        """作り物のコマで、enroll_check.gate2 とアプリ（SpeakerCheck --gate）が同じ結果"""
+        import json
+        import random
+        import subprocess
+        import enroll_check
+        import speaker_check
+        rnd = random.Random(3)
+        frames, chunks = [], []
+        for k in range(3000):
+            if k % 15 == 0:   # 約0.5秒ごとに、どの声が入るかの並びを変える
+                pool = rnd.choice([[True, False], [None], [False], [None, False], [True, None], [True]])
+            v = rnd.choice(pool)
+            frames.append([k * 33, v, rnd.choice(["pitch", "pitch", "no_mouth", "no_face"]) if v is False else None])
+        for k in range(150):
+            end = 3500 + k * 600 + rnd.randint(0, 40)
+            chunks.append([end, rnd.choice([3.0, 1.2, 0.3])])
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "g.json"
+            p.write_text(json.dumps({"frames": frames, "chunks": chunks}), encoding="utf-8")
+            app = subprocess.run([str(speaker_check.build()), "--gate", str(p)], check=True, capture_output=True, text=True).stdout.split()
+        fr = [tuple(f) for f in frames]
+        mine = [enroll_check.gate2(fr, e, s) for e, s in chunks]
+        self.assertEqual(app, mine)
+        self.assertGreater(len(set(mine)), 2)

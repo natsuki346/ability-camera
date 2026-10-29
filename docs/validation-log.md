@@ -15,6 +15,28 @@
 
 ---
 
+## 2026-10-29 本人の声の登録が進むようにする・計算時間の内訳（v1.10.3、記録 ability-cam-20261029-123404 から）
+- **何を試したか**：v1.10.2 続き（4471e61）を iPhone で使った記録 `ability-cam-20261029-123404.jsonl`。この Mac には記録が無いので、数値は記録を見た人から
+- **結果**：
+  1. 249秒に「取り直し」（本人の登録）を始めてから約130秒で、計算した声のまとまり 117個のうち数えたのは 8個（4秒）。98個が notSelf。
+     この区間は本人の声が 160〜190Hz に上がり、声の高さの範囲（〜158Hz）を外れたコマ（`voice_self: false`、`voice_self_reason: "pitch"`）が多かった。記録に `final` の行は無かった
+  2. 1回の計算が iPhone で中央値 146ms・95% 174ms（Mac 1.3ms）。`speaker_model` の `plan` は ne 111/111。`load_ms` 5032
+- **分かったこと**：前の決まりは、まとまり全体（最大3秒）に `false` が1つでもあれば数えなかったので、声の高さが普段の範囲の外にある本人の声をほとんど捨てていた。
+  計算時間は、Neural Engine で動く予定なのに Mac の100倍かかっていて、どこにかかっているか（fbank・prediction・キューの待ち）が記録から分からない。モデルは記録ごとに読み込み直していた
+- **決めたこと**：
+  - 数える決まりを gate 2 にした：数える 0.5秒だけを見て、`true` が1つ以上あり、`false` が `pitch` だけなら数える。`no_mouth`・`no_face`（・`timing`）の `false` があれば数えない。
+    `analysis/enroll_check.py` を作り、アプリ（`SpeakerCheck --gate`）と同じ結果になることを作り物のコマ 150個で確かめた
+  - **この記録で前の決まりと今の決まりを数え直すのは、まだ**（記録がこの Mac に無い）。`python enroll_check.py ability-cam-20261029-123404.jsonl` で数え、ここに書く。
+    記録を見た人が数えた今の決まりの値は 76個。enroll_check.py は「今の決まりで null があれば数えない」も参考に出すので、76個がどちらの数え方かも合わせて確かめる
+  - `speaker_enroll_progress` を計算した声の5秒ごとにも書き、理由ごとの秒数（`not_self_s`・`no_f0_s`・`no_frames_s`）を足した。裏に回ったときの1行と、アプリが終わるときに記録を閉じる処理を足した
+  - `speaker` 行に `fbank_ms`・`predict_ms`・`wait_ms`。キューの優先度・computeUnits を「確かめる用の設定」と起動引数で切り替えられるようにした。モデルはアプリの中で1回だけ読み込む
+- **まだ確かめていないこと（実機で）**：
+  1. 同じ場面を、優先度 `utility` / `userInitiated` × computeUnits `cpuAndNeuralEngine` / `all` / `cpuOnly` で各2分記録し、`perf_check.py` で `predict_ms`・`wait_ms`・解析コマ/秒を比べる。
+     `predict_ms` が大きければ Core ML の中（Neural Engine の取り合い・切り替え）、`wait_ms` が大きければキューの優先度。1回 50ms 以下に届かなければ、間隔を広げる案と比べて決める
+  2. 2回目からの記録で `speaker_model` の `cached` が true、`load_ms` が前の値のままで、記録の始めに待たないこと
+  3. 本人の登録（声を高くした区間も）が 30秒たまるまでの時間と、`not_self_s`・`no_f0_s` の内訳
+  4. 上にスワイプしてアプリを閉じたとき、記録の最後に `final: true` の行と要約があること
+
 ## 2026-10-29 話者の区別を、f0 の取れない声でも・速く動かす（v1.10.2、記録 ability-cam-20261029-114906 から）
 - **何を試したか**：v1.10 を iPhone で使った記録 `ability-cam-20261029-114906.jsonl`（この Mac には無いので、数値は記録を見た人から）。
   計算の速さは、Fluid Inference の変換（前）と、このリポジトリで変換し直したもの（後）を、Mac の Core ML（`MLComputePlan`・計算時間）と `analysis/speaker_check.py` で比べた。

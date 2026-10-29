@@ -137,6 +137,10 @@ struct CameraShell: View {
         .onChange(of: cameraLens) { model.applyLens() }   // 設定で広角／超広角を変えた
         .onChange(of: baselineSeconds) { model.applyBaselineLength() }   // 設定で普段の長さを変えた
         .onDisappear { model.shutdown() }   // 役割を「見る側」に変えた
+        // アプリが終わる（上にスワイプして閉じた・裏で時間が尽きた）ときも、記録を閉じて要約する（v1.10.3〜。登録の途中の final の行も書く）
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)) { _ in model.shutdown() }
+        // 話者の区別のモデルを、アプリを開いたときに1回だけ読み込む（v1.10.3〜。設定がオンのときだけ）
+        .onAppear { if UserDefaults.standard.bool(forKey: "speakerRecord") { SpeakerModelStore.shared.preload() } }
         .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {
             case .active: Task { await model.appBecameActive() }   // 開いたら記録（新しいセッション、5秒以内なら同じセッション）

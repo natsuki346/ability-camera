@@ -76,27 +76,52 @@ if args.first == "--selftest" {
     var q2 = SpeakerEnrollPartial(model: SpeakerCriteria.model, sum: [], embeddings: 0, validS: 4.8, startedMs: 0, consentBy: "x", consentMs: 0)
     if SpeakerMath.addWithProgress(&q2, embedding: [1, 0], spanS: 0.5) != nil { bad.append("初めの1つで書いた") }
     if SpeakerMath.addWithProgress(&q2, embedding: [1, 0], spanS: 0.5) != nil { bad.append("区切りを越えないのに書いた") }
-    // 本人を登録するときの決め方（v1.10.1〜）
-    func gate(_ vs: [(Int64, Bool?)], end: Int64, span: Double) -> SpeakerSelfGate<Int>.Outcome? {
+    // 本人を登録するときの決め方（v1.10.3〜：数える 0.5秒だけを見る。true が1つ以上で、false が pitch だけなら数える）
+    func gate(_ vs: [(Int64, Bool?, String?)], end: Int64, span: Double) -> SpeakerSelfGate<Int>.Outcome? {
         var g = SpeakerSelfGate<Int>()
         g.embedding(endMs: end, spanS: span, item: 1)
-        for (t, v) in vs { g.frame(tMs: t, voiceSelf: v) }
+        for (t, v, r) in vs { g.frame(tMs: t, voiceSelf: v, reason: r) }
         return g.ready(nowMs: end).first?.outcome
     }
-    let allTrue = stride(from: Int64(0), through: 3000, by: 33).map { ($0, Optional(true)) }
+    let allTrue: [(Int64, Bool?, String?)] = stride(from: Int64(0), through: 3000, by: 33).map { ($0, true, nil) }
+    func with(_ f: @escaping (Int64) -> (Bool?, String?)?) -> [(Int64, Bool?, String?)] { allTrue.map { x in f(x.0).map { (x.0, $0.0, $0.1) } ?? x } }
+    let inCount = { (t: Int64) in t >= 2470 }   // 終わり 2970 から 0.5秒
     if gate(allTrue, end: 2970, span: 3) != .counted { bad.append("本人の声だけなのに数えない") }
-    if gate(allTrue.map { ($0.0, $0.0 == 1023 ? false : $0.1) }, end: 2970, span: 3) != .notSelf { bad.append("ほかの人の声が混じっても数えた") }
-    if gate(allTrue.map { ($0.0, $0.0 > 2700 ? nil : $0.1) }, end: 2970, span: 3) != .noF0 { bad.append("数える分に分からないコマがあっても数えた") }
-    if gate(allTrue.map { ($0.0, $0.0 < 2400 ? nil : $0.1) }, end: 2970, span: 3) != .counted { bad.append("前の方が分からないだけで数えない") }
+    if gate(with { $0 == 1023 ? (false, "no_mouth") : nil }, end: 2970, span: 3) != .counted { bad.append("数える分の外の false で数えなかった（まとまり全体は見ない）") }
+    if gate(with { inCount($0) && $0 % 2 == 0 ? (false, "pitch") : nil }, end: 2970, span: 3) != .counted { bad.append("false が pitch だけなのに数えない") }
+    if gate(with { $0 == 2706 ? (false, "no_mouth") : nil }, end: 2970, span: 3) != .notSelf { bad.append("数える分に no_mouth の false があっても数えた") }
+    if gate(with { $0 == 2706 ? (false, "no_face") : nil }, end: 2970, span: 3) != .notSelf { bad.append("数える分に no_face の false があっても数えた") }
+    if gate(with { inCount($0) ? (false, "pitch") : nil }, end: 2970, span: 3) != .notSelf { bad.append("pitch の false だけ（true 無し）で数えた") }
+    if gate(with { $0 > 2700 ? (nil, nil) : nil }, end: 2970, span: 3) != .counted { bad.append("true があるのに null が混じって数えない") }
+    if gate(with { inCount($0) ? (nil, nil) : nil }, end: 2970, span: 3) != .noF0 { bad.append("数える分が全部 null なのに noF0 でない") }
+    if gate(with { inCount($0) ? ($0 % 2 == 0 ? (nil, nil) : (false, "pitch")) : nil }, end: 2970, span: 3) != .noF0 { bad.append("null と pitch だけで noF0 でない") }
     if gate(allTrue.filter { $0.0 < 2900 }, end: 2970, span: 3) != nil { bad.append("終わりのコマを待たない") }
     var g = SpeakerSelfGate<Int>()
     g.embedding(endMs: 1000, spanS: 0.5, item: 7)
     if let r = g.ready(nowMs: 1000 + SpeakerCriteria.selfGateWaitMs + 1).first, r.outcome != .noFrames || r.item != 7 { bad.append("待ちすぎたのに数えた") }
-    // f0 が取れず数えなかった（skipped_no_f0_s）と、ほかの人の声（false）は分ける：false があれば null があっても notSelf
-    if gate(allTrue.map { ($0.0, $0.0 > 2700 ? nil : ($0.0 == 99 ? false : $0.1)) }, end: 2970, span: 3) != .notSelf { bad.append("false と null が両方あるのに notSelf でない") }
-    if gate(allTrue.map { ($0.0, Optional<Bool>.none) }, end: 2970, span: 3) != .noF0 { bad.append("全部 null なのに noF0 でない") }
+    // 登録の途中の数え（v1.10.3〜）：計算した声が 5秒の区切りを越えたら true、理由ごとに足す
+    var tally = SpeakerEnrollTally()
+    var hits: [Double] = []
+    let outs: [SpeakerSelfGate<Int>.Outcome] = [.counted, .notSelf, .noF0, .noFrames]
+    for k in 0..<24 { if tally.add(outs[k % 4], seconds: 0.5) { hits.append(tally.computedS) } }
+    if hits != [5, 10] { bad.append("計算した声の 5秒ごとが違う \(hits)") }
+    if tally != SpeakerEnrollTally(computedS: 12, notSelfS: 3, noF0S: 3, noFramesS: 3) { bad.append("理由ごとの秒数が違う \(tally)") }
     print(bad.isEmpty ? "OK" : bad.joined(separator: "\n"))
     exit(bad.isEmpty ? 0 : 1)
+}
+// --gate 入力.json：本人の登録の数える決まり（SpeakerSelfGate.decide）。{"frames": [[t_ms, voice_self, reason], ...], "chunks": [[end_ms, span_s], ...]}
+// → 1行に1つ counted / not_self / no_f0 / no_frames（analysis/enroll_check.py と同じかをテストで確かめる）
+if args.first == "--gate", args.count >= 2, let d = FileManager.default.contents(atPath: args[1]),
+   let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+    let frames: [(Int64, Bool?, String?)] = ((o["frames"] as? [[Any]]) ?? []).map { f in
+        ((f[0] as! NSNumber).int64Value, f[1] is NSNull ? nil : (f[1] as! Bool), f[2] as? String)
+    }
+    for c in (o["chunks"] as? [[NSNumber]]) ?? [] {
+        switch SpeakerSelfGate<Int>.decide(frames, endMs: c[0].int64Value, spanS: c[1].doubleValue) {
+        case .counted: print("counted"); case .notSelf: print("not_self"); case .noF0: print("no_f0"); case .noFrames: print("no_frames")
+        }
+    }
+    exit(0)
 }
 // --fbank 音.wav：fbank（SpeakerFbank）を JSON で出す（analysis のテストで torchaudio の値と比べる）
 if args.first == "--fbank", args.count >= 2, let (x0, sr) = readWav(args[1]) {
@@ -142,7 +167,7 @@ for path in args.dropFirst() {
         guard t >= span, t - last >= step - 1e-9 else { continue }
         last = t
         let t0 = CFAbsoluteTimeGetCurrent()
-        guard let e = emb.embed(window: ring.window(), spanS: span) else { continue }
+        guard let e = emb.embed(window: ring.window(), spanS: span)?.embedding else { continue }
         let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
         let o: [String: Any] = ["file": (path as NSString).lastPathComponent, "t": t, "span": span, "calc_ms": ms, "embedding": e.map(Double.init)]
         print(String(decoding: try! JSONSerialization.data(withJSONObject: o), as: UTF8.self))

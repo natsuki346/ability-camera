@@ -10,6 +10,8 @@ struct ContentView: View {
     @State private var cameraLarge = false
     @State private var showSettings = false
     @AppStorage("liveTab") private var tab = LiveTab.now.rawValue   // 前に開いていたタブ
+    @AppStorage("cameraCorner") private var cornerRaw = Corner.topTrailing.rawValue   // 映像の小さな窓の場所（四隅、v1.14〜）
+    @State private var drag: CGSize = .zero
     @State private var confirmEnd = false   // 「記録を終えますか？」（v1.11.2〜。記録中は人を変えない）
     @ObservedObject private var people = PersonStore.shared
 
@@ -25,13 +27,13 @@ struct ContentView: View {
             if tab == LiveTab.data.rawValue {
                 DataTab(model: model)
             } else {
-                HStack(alignment: .top, spacing: 10) {
-                    camera
-                    NowSide(model: model)
-                }
-                NowDifferences(model: model)
+                // v1.14〜：真ん中に状態のカード（いちばん大きく、画面の高さに合わせて縮む）。映像はカードの角の小さな窓。家族の印と場面は大きく
+                NowCard(model: model, windowCorner: cameraCorner, windowReserve: Self.windowWidth + 12)
+                    .overlay(alignment: cameraCorner.alignment) { cameraWindow.padding(8) }
+                    .frame(maxHeight: .infinity)
+                pastMarksLine
                 marks
-                scenes
+                if model.markDetailPrompt != nil { markDetailChips } else { scenes }
             }
         }
         .padding(.horizontal)
@@ -114,41 +116,64 @@ struct ContentView: View {
         return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
     }
 
-    /// 小さいカメラ映像（網目つき）。タップで大きく
-    private var camera: some View {
-        // 1つのカメラに映像の層は1つだけにする（大きく出している間は、こちらは黒）
-        Group { if cameraLarge { Color.black } else { CameraPreview(camera: model.camera, fill: true, lens: model.lensInUse) } }
-            .overlay {
-                // 網目は解析の遅れの分だけ映像より遅れて見える（即時性そのものなので、隠さない）
-                if model.meshEnabled, let mesh = model.mesh, !cameraLarge { MeshOverlay(mesh: mesh, fill: true) }
+    private var cameraCorner: Corner { Corner(rawValue: cornerRaw) ?? .topTrailing }
+    static let windowWidth: CGFloat = 100
+
+    /// 映像の小さな窓（v1.14〜、Zoom の自分の映像のように）：カードの角に重ねる。網目つき。ドラッグで四隅に動かし、タップで大きく。
+    /// 窓の下に小さなアイコン2つ：顔（読めている／読めない）、声（本人／本人以外／無し）
+    private var cameraWindow: some View {
+        VStack(spacing: 4) {
+            // 1つのカメラに映像の層は1つだけにする（大きく出している間は、こちらは黒）
+            Group { if cameraLarge { Color.black } else { CameraPreview(camera: model.camera, fill: true, lens: model.lensInUse) } }
+                .overlay {
+                    // 網目は解析の遅れの分だけ映像より遅れて見える（即時性そのものなので、隠さない）
+                    if model.meshEnabled, let mesh = model.mesh, !cameraLarge { MeshOverlay(mesh: mesh, fill: true) }
+                }
+                .frame(width: Self.windowWidth, height: Self.windowWidth * 4 / 3)
+                .background(Color.black)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.7), lineWidth: 1.5))
+                .shadow(color: .black.opacity(0.25), radius: 4, y: 2)
+            HStack(spacing: 6) {
+                statusIcon(model.faceReadable && model.cameraActive ? "face.smiling" : "face.dashed",
+                           color: Palette.face, dim: !(model.faceReadable && model.cameraActive))
+                    .accessibilityLabel(model.faceReadable && model.cameraActive ? "顔：読めています" : "顔：読めません")
+                statusIcon(model.otherVoice ? "person.2.wave.2" : "waveform", color: Palette.voice, dim: !model.otherVoice && !model.selfVoiceNow)
+                    .accessibilityLabel(model.otherVoice ? "声：本人以外の声" : model.selfVoiceNow ? "声：本人" : "声：無し")
             }
-            .overlay(alignment: .topLeading) { cameraBadges.padding(5) }
-            .aspectRatio(3 / 4, contentMode: .fit)
-            .containerRelativeFrame(.horizontal) { w, _ in w * 0.48 }   // 画面幅の半分くらい（左上）
-            .background(Color.black)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .contentShape(Rectangle())
-            .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { cameraLarge = true } }
-            .accessibilityLabel("カメラ映像（タップで大きく）")
-    }
-
-    /// 映像の上に小さく：「顔：読めています」「声：本人／本人以外の声」（v1.11.3〜）
-    private var cameraBadges: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            badge(!model.cameraActive ? "顔：–" : model.faceReadable ? "顔：読めています" : "顔：読めません",
-                  icon: model.faceReadable ? "face.smiling" : "face.dashed", color: Palette.face)
-            badge(model.otherVoice ? "声：本人以外の声" : model.selfVoiceNow ? "声：本人" : "声：–",
-                  icon: "waveform", color: Palette.voice, strong: model.otherVoice)
         }
+        .offset(drag)
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { cameraLarge = true } }
+        .gesture(DragGesture(minimumDistance: 8)
+            .onChanged { drag = $0.translation }
+            .onEnded { v in
+                // 動かした向きで、いちばん近い角へ
+                var c = cameraCorner
+                if v.translation.width < -40 { c = c.withLeading(true) } else if v.translation.width > 40 { c = c.withLeading(false) }
+                if v.translation.height > 40 { c = c.withTop(false) } else if v.translation.height < -40 { c = c.withTop(true) }
+                withAnimation(.spring(duration: 0.25)) { cornerRaw = c.rawValue; drag = .zero }
+            })
+        .accessibilityElement(children: .contain)
+        .accessibilityHint("タップで映像を大きく。ドラッグで四隅に動かす")
     }
 
-    private func badge(_ text: String, icon: String, color: Color, strong: Bool = false) -> some View {
-        Label(text, systemImage: icon)
-            .font(.caption2.weight(strong ? .bold : .semibold))
-            .foregroundStyle(color)
-            .lineLimit(1).minimumScaleFactor(0.7)
-            .padding(.horizontal, 6).padding(.vertical, 2)
+    private func statusIcon(_ name: String, color: Color, dim: Bool) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(color.opacity(dim ? 0.4 : 1))
+            .frame(width: 28, height: 22)
             .background(.regularMaterial, in: Capsule())
+    }
+
+    /// 前に同じ組み合わせのとき、家族が付けた印（v1.13〜）：あれば、カードの下に1行小さく
+    @ViewBuilder private var pastMarksLine: some View {
+        let past = model.pastMarkSummaryNow()
+        if !past.isEmpty {
+            Text("前に同じ組み合わせのとき、家族が付けた印：" + past.map(\.text).joined(separator: "、"))
+                .font(.caption).foregroundStyle(Palette.face).lineLimit(1).minimumScaleFactor(0.7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     /// 大きいカメラ映像。もう一度タップで戻る
@@ -170,7 +195,7 @@ struct ContentView: View {
         .transition(.opacity)
     }
 
-    /// 家族の印。介助しながら片手で押せる大きさ
+    /// 家族の印（v1.14〜：画面幅いっぱいの3つ、高さ 80pt 以上、title 太字）。介助しながら片手で押せる大きさ
     private var marks: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(model.markMessage ?? "家族の印").font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -178,54 +203,57 @@ struct ContentView: View {
                 ForEach(Mark.allCases) { m in
                     Button { model.tapMark(m) } label: {
                         Text(m.rawValue)
-                            .font(.title2.bold())
+                            .font(.title.bold())
                             .minimumScaleFactor(0.6)
                             .lineLimit(1)
-                            .frame(maxWidth: .infinity, minHeight: 64)
+                            .frame(maxWidth: .infinity, minHeight: 80)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(m == .pleasant ? .teal : m == .unpleasant ? .indigo : .gray)
                 }
             }
             .disabled(!model.running)
-            markDetailChips
         }
     }
 
-    /// 家族の印を押したあとに数秒だけ出す「詳しく（任意）」（v1.13〜、快・不快のとき）。押さなければ消え、記録はワンタップの分だけ
+    /// 家族の印を押したあとに10秒だけ出す「詳しく（任意）」（v1.13〜、快・不快のとき。v1.14〜：場面の場所に、折り返して大きく。押したら消える）。
+    /// 押さなければ消え、記録はワンタップの分だけ
     @ViewBuilder private var markDetailChips: some View {
         if let p = model.markDetailPrompt {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    Text("詳しく（任意）：\(p.mark.rawValue)").font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("詳しく（任意）：\(p.mark.rawValue)").font(.caption).foregroundStyle(.secondary)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 8)], spacing: 8) {
                     ForEach(p.options, id: \.self) { o in
                         Button { model.chooseMarkDetail(o) } label: {
-                            Text(o).font(.callout).lineLimit(1)
-                                .padding(.horizontal, 12).frame(minHeight: 44)
+                            Text(o).font(.body.weight(.semibold)).lineLimit(2).minimumScaleFactor(0.7)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 8).frame(maxWidth: .infinity, minHeight: 52)
                                 .foregroundStyle(Self.navy)
-                                .background(Self.paleSlate, in: Capsule())
+                                .background(Self.paleSlate, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                         }
                         .buttonStyle(.plain)
                     }
                 }
             }
             .transition(.opacity)
+            .accessibilityElement(children: .contain)
             .accessibilityLabel("家族の印の詳しい中身（任意）")
         }
     }
 
-    /// 場面。1行のチップ（横にスクロール）。同時に一つだけ、もう一度押すと「場面なし」
+    /// 場面（v1.14〜：横スクロールをやめて3列のグリッドで全部見える、高さ 52pt 以上）。同時に一つだけ、もう一度押すと「場面なし」
     private var scenes: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                Text("場面").font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 4) {
+            Text("場面").font(.caption).foregroundStyle(.secondary)
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
                 ForEach(CareScene.allCases) { s in
                     let on = model.scene == s
                     Button { model.tapScene(s) } label: {
-                        Text(s.rawValue).font(.callout).lineLimit(1)
-                            .padding(.horizontal, 14).padding(.vertical, 9)
+                        Text(s.rawValue).font(.callout.weight(.semibold)).lineLimit(2).minimumScaleFactor(0.7)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity, minHeight: 52)
                             .foregroundStyle(on ? Color.white : Self.navy)
-                            .background(on ? Self.navy : Self.paleSlate, in: Capsule())
+                            .background(on ? Self.navy : Self.paleSlate, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(on ? .isSelected : [])
@@ -234,6 +262,26 @@ struct ContentView: View {
         }
         .disabled(!model.running)
         .opacity(model.running ? 1 : 0.5)
+    }
+}
+
+/// 映像の小さな窓の場所（四隅、v1.14〜）
+enum Corner: String {
+    case topLeading, topTrailing, bottomLeading, bottomTrailing
+    var alignment: Alignment {
+        switch self {
+        case .topLeading: .topLeading
+        case .topTrailing: .topTrailing
+        case .bottomLeading: .bottomLeading
+        case .bottomTrailing: .bottomTrailing
+        }
+    }
+    var isTop: Bool { self == .topLeading || self == .topTrailing }
+    var isLeading: Bool { self == .topLeading || self == .bottomLeading }
+    func withTop(_ top: Bool) -> Corner { Corner(top: top, leading: isLeading) }
+    func withLeading(_ leading: Bool) -> Corner { Corner(top: isTop, leading: leading) }
+    init(top: Bool, leading: Bool) {
+        self = top ? (leading ? .topLeading : .topTrailing) : (leading ? .bottomLeading : .bottomTrailing)
     }
 }
 

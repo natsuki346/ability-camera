@@ -34,12 +34,17 @@ struct SketchPalette {
     }()
 }
 
+/// 顔の部位（撮る側の「いま」の状態のカードで、違いが出ている部位を光らせる。v1.14〜）
+enum FaceRegion: Hashable { case brows, eyes, nose, mouth }
+
 /// 動きを写す顔の絵。blendshape の値に比例して形を変えるだけで、表情の名前・色・誇張は付けない
 struct FaceSketch: View {
     /// ならした blendshape の値。nil のときは形を中立に戻して灰色で描く
     let shape: [String: Double]?
     var size: CGFloat = 120
     var tone: SketchTone = .medium
+    /// 光らせる部位とその色（指標の色、v1.14〜）。顔の色そのものは変えず、部位のまわりに縁取りと薄い光を足すだけ
+    var highlights: [FaceRegion: Color] = [:]
 
     /// 左右がこれを超えると、表情の数値は当てにならない
     static let sideLimit = 35.0
@@ -142,6 +147,23 @@ struct FaceSketch: View {
         ctx.fill(face, with: .color(pal.skin))
         stroke(face, pal.line, 1.3)
         for side in earsFront { ear(side) }
+
+        // 違いが出ている部位（v1.14〜）：部位のまわりに、指標の色の薄い光と縁取り（顔の色・形は変えない）
+        func glow(_ cx: Double, _ cy: Double, _ rx: Double, _ ry: Double, _ color: Color) {
+            let a = P(cx - rx, cy - ry, 0.8), b = P(cx + rx, cy + ry, 0.8)
+            let rect = CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
+            let path = Path(roundedRect: rect, cornerRadius: rect.height / 2)
+            ctx.fill(path, with: .color(color.opacity(0.28)))
+            ctx.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: max(2, 2.2 * lw), dash: []))
+        }
+        for (region, color) in highlights {
+            switch region {
+            case .brows: for side in [-1.0, 1.0] { glow(side * 0.30, -0.34, 0.22, 0.09, color) }
+            case .eyes: for side in [-1.0, 1.0] { glow(side * 0.31, -0.10, 0.19, 0.11, color) }
+            case .nose: glow(0, 0.17, 0.15, 0.13, color)
+            case .mouth: glow(0, 0.52, 0.30, 0.14, color)
+            }
+        }
 
         // 横を向いているときは、表情の部分を薄くする（参考程度）
         if turnedAway { ctx.opacity = 0.3 }

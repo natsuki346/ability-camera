@@ -1981,6 +1981,33 @@ class StartScreenTest(unittest.TestCase):
             for mode in ("light", "dark"):
                 self.assertTrue((root / "docs" / "screenshots" / f"start-{n}people_{mode}.png").exists())
 
+    def test_now_tab_v114(self):
+        """「いま」のタブ（v1.14〜）：状態のカード（中立のイラストの部位を光らせる）・小さな映像の窓・大きな印と場面。絵文字は使わない"""
+        import re
+        root = review.HERE.parent
+        app = root / "ios" / "AbilityCam"
+        cv = (app / "ContentView.swift").read_text(encoding="utf-8")
+        live = (app / "LivePages.swift").read_text(encoding="utf-8")
+        sketch = (app / "FaceSketch.swift").read_text(encoding="utf-8")
+        model = (app / "AnalysisModel.swift").read_text(encoding="utf-8")
+        guide = (root / "docs" / "wording-guide.md").read_text(encoding="utf-8")
+        self.assertIn("highlights", sketch)
+        self.assertIn("NowCard(model: model", cv)
+        self.assertIn("FaceSketch(shape: model.cameraActive && model.faceReadable ? [:] : nil", live)   # 表情は変えない中立の形
+        self.assertIn(".font(.largeTitle.bold())", live)
+        self.assertIn("minHeight: 80", cv)                                   # 家族の印
+        self.assertGreaterEqual(cv.count("minHeight: 52"), 2)                # 詳しく（任意）と場面
+        self.assertNotIn("ScrollView(.horizontal", cv)                       # 横スクロールはやめた
+        self.assertIn("static let markDetailSeconds = 10.0", model)
+        self.assertIn("static let windowWidth: CGFloat = 100", cv)
+        self.assertIsNone(re.search(r"[\U0001F600-\U0001F64F]", cv + live))   # 気持ちを表す絵文字は使わない
+        for w in ("いまの状態", "眉を寄せる動きが強い（4秒）", "絵文字"):
+            self.assertIn(w, guide)
+        for st in ("calm", "diff", "detail"):
+            for mode in ("light", "dark"):
+                for dev in ("17", "se"):
+                    self.assertTrue((root / "docs" / "screenshots" / f"now-{st}_{mode}_{dev}.png").exists())
+
     def test_live_tabs(self):
         """記録中の画面（v1.11.3〜）：「いま」と「データ」を segmented で切り替え、前のタブを覚える。横スワイプのページは無い"""
         root = review.HERE.parent
@@ -1995,7 +2022,7 @@ class StartScreenTest(unittest.TestCase):
         self.assertNotIn("MeterTrack(", cv)                     # いま：メーターは出さない（データだけ）
         self.assertIn("MeterTrack(", live)
         self.assertIn("GraphPage(graph: graph)", live)
-        for w in ("いつも通りです", "いつもと違うこと", "声：本人以外の声", "声：本人"):
+        for w in ("いつも通りです", "いまの状態", "声：本人以外の声", "声：本人"):
             self.assertIn(w, live + cv)
         for w in ("いつも通りです", "声：本人以外の声", "「いま」", "「データ」"):
             self.assertIn(w, guide)

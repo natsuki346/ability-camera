@@ -53,6 +53,7 @@ final class AnalysisModel: ObservableObject {
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
     @Published var differences: [String] = []
     @Published var diffTargets: [DiffTarget] = []    // differences と同じ順の種類（文字の印の色、v1.10.5〜）
+    @Published var diffItems: [DiffItem] = []        // differences と同じ順の種類・向き・続いている秒数（「いま」の状態のカード、v1.14〜）
     @Published var faceReadable = true
     @Published var scene: CareScene?
     @Published var markMessage: String?
@@ -63,7 +64,7 @@ final class AnalysisModel: ObservableObject {
     @Published var lensInUse: CameraLens?    // 今使っているカメラ（設定で超広角を選んでも、無い端末では広角）
     /// 家族の印を押したあとに数秒出す「詳しく（任意）」（v1.13〜。快・不快のときだけ）
     @Published var markDetailPrompt: (tMs: Int64, mark: Mark, options: [String])?
-    static let markDetailSeconds = 6.0
+    static let markDetailSeconds = 10.0   // v1.14〜 10秒（v1.13 は 6秒）。押したら消える
     private var markCombos: [Int64: (combo: String?, value: String, detail: String?)] = [:]   // 印を付けたときの「いつもとの違い」の組み合わせ
     private var pastMarks = PastMarks()                                      // 前に同じ組み合わせのとき、家族が付けた印（v1.13〜）
     @Published var startNote: String?        // 記録を始められなかった理由（「だれを記録しますか」の下に出す、v1.11〜）
@@ -228,14 +229,20 @@ final class AnalysisModel: ObservableObject {
         sessionStartedAt = Date().addingTimeInterval(-754)
         comparing = .today; baselineReady = true; faceReadable = true
         faceShape = ["yaw": 24, "pitch": -4, "roll": 2]
-        differences = ["眉を寄せる動きが、いつもより強い（4秒）", "目を閉じている（3秒）", "声が、いつもより大きい（2秒）"]
-        diffTargets = [.metric(.browDown), .eyesClosed, .metric(.rmsDb)]
-        diffMetrics = [.browDown: true, .rmsDb: true]
+        // スクリーンショット用（v1.14〜）：-previewCalm で「いつも通り」、無ければ眉＋声の違い
+        if ProcessInfo.processInfo.arguments.contains("-previewCalm") {
+            differences = []; diffTargets = []; diffItems = []; diffMetrics = [:]
+        } else {
+            differences = ["眉を寄せる動きが、いつもより強い（4秒）", "声が、いつもより大きい（2秒）"]
+            diffTargets = [.metric(.browDown), .metric(.rmsDb)]
+            diffItems = [DiffItem(target: .metric(.browDown), above: true, seconds: 4), DiffItem(target: .metric(.rmsDb), above: true, seconds: 2)]
+            diffMetrics = [.browDown: true, .rmsDb: true]
+        }
         meterZ = [.mouthSmile: 0.3, .browDown: 2.6, .eyeSquint: -0.4, .jawOpen: 0.8, .rmsDb: 2.2, .f0Hz: -0.6]
         baselineStats = Dictionary(uniqueKeysWithValues: Metric.allCases.map { ($0, DiffEngine.Stat(mean: 0, sd: 1)) })
         voiceSec = 6; voiceWait = "口が動いていません"
         speakerEnrollNote = "自分の声を集めています（8/15秒）。黙っている間は数えません"
-        otherVoice = true; otherVoiceBySpeaker = true; selfVoiceNow = false
+        otherVoice = false; otherVoiceBySpeaker = true; selfVoiceNow = true
         speakerLast = (0.21, 0.52, 2600)
         fps = 29.8; procMs = 11; latMs = 43; faceRatio = 0.96; rmsDb = -41; f0Hz = 182; pitchRatio = 0.62
         lensInUse = .wide; analyzedRatio = 0.99
@@ -446,7 +453,7 @@ final class AnalysisModel: ObservableObject {
             videoSending = false
             PersonStore.shared.inSession = false
             sessionStartedAt = nil
-            baselineSec = nil; baselineReady = false; differences = []; diffTargets = []; insufficient = []
+            baselineSec = nil; baselineReady = false; differences = []; diffTargets = []; diffItems = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false; selfVoiceNow = false
             voiceWait = nil; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false; speakerEnrollNote = nil
@@ -906,6 +913,9 @@ final class AnalysisModel: ObservableObject {
         setMarkDetail(tMs: p.tMs, detail: detail, by: nil)
     }
 
+    /// 前に同じ組み合わせのとき、家族が付けた印（今の「いつもとの違い」の組み合わせ。撮る側の「いま」のカードの下、v1.14〜）
+    func pastMarkSummaryNow() -> [LivePastMark] { running ? pastMarks.summary(for: PastMarks.key(lastChange?.diffs ?? [])) : [] }
+
     private func rememberMark(tMs: Int64, value: String) {
         let combo = PastMarks.key(lastChange?.diffs ?? [])
         markCombos[tMs] = (combo, value, nil)
@@ -939,7 +949,7 @@ final class AnalysisModel: ObservableObject {
         stats = [:]
         baselineValidS = 0; baselineLastT = nil; lastValidHost = -.infinity
         baselineTarget = Self.selectedBaselineSeconds
-        baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []; diffTargets = []
+        baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []; diffTargets = []; diffItems = []
         // 違いの数：取り直した部分の違いだけを数え直す（v1.9.3〜、SessionStats と同じ）。表情だけなら、続いている声の違いは数え直さない
         lastChange = keepVoice ? lastChange.map { (BaselinePart.keysAfterRestart($0.diffs, part: .face), $0.faceReadable) } : nil
         squintPending = []
@@ -1576,6 +1586,8 @@ final class AnalysisModel: ObservableObject {
         let keys = shown.map(\.key)
         let diffKeys = keys.filter { !$0.hasPrefix(DiffTarget.voiceOnKey + ":") }   // 声が出たは違いの数に入れない（v1.7〜）
         if differences != messages { differences = messages; diffTargets = shown.map(\.target) }
+        let items = shown.map { DiffItem(target: $0.target, above: $0.above, seconds: Int(max(0, latestT - $0.startT))) }
+        if diffItems != items { diffItems = items }
         if meterZ != engine.z { meterZ = engine.z }
         let dm = Dictionary(uniqueKeysWithValues: shown.compactMap { s in s.metric.map { ($0, s.above) } })
         if diffMetrics != dm { diffMetrics = dm }

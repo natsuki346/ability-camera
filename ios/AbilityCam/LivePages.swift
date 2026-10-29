@@ -47,68 +47,111 @@ final class GraphStore: ObservableObject {
     }
 }
 
-/// 「いま」のタブ（v1.11.3〜）の、映像の右：記録の状態（普段）と、進み具合・声の補足を小さく。「普段を取り直す」
-struct NowSide: View {
-    @ObservedObject var model: AnalysisModel
+/// 違い1つ（「いま」の状態のカード、v1.14〜）：種類・向き・続いている秒数
+struct DiffItem: Equatable {
+    let target: DiffTarget
+    let above: Bool
+    let seconds: Int
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            NoteLine(text: LiveText.baseline(model), icon: "record.circle", color: Palette.face, lines: 3)
-            if model.comparing == nil, let sec = model.baselineSec {
-                ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget).tint(Palette.progress)
-                NoteLine(text: model.baselineWait ?? "落ち着いているときに。顔が映っている間だけ数えます", icon: "info.circle", color: Palette.progress, font: .caption2, lines: 2)
-            }
-            LiveNotes(model: model, showOther: false)
-            Spacer(minLength: 0)
-            // 表情だけ／声だけ／両方を選ぶ（v1.9.2〜）
-            Menu("普段を取り直す") {
-                ForEach(AnalysisModel.RestartPart.allCases) { p in
-                    Button(p.rawValue) { model.restart(p) }
-                }
-            }
-            .font(.caption)
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(!model.running)
+    /// カードの大きな文字の短い言い方（見出し「いつもと違うこと」の下なので「いつもより」は省く。docs/wording-guide.md）
+    var shortText: String {
+        switch target {
+        case .eyesClosed: DiffTarget.eyesClosedLabel
+        case .voiceOn: DiffTarget.voiceOnLabel
+        case .metric(.rmsDb): above ? "声が大きい" : "声が小さい"
+        case .metric(.f0Hz): above ? "声が高い" : "声が低い"
+        case .metric(let m): "\(m.label)動きが\(above ? "強い" : "弱い")"
         }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
+
+    /// 光らせる顔の部位（声は顔の外に音の波のアイコン）
+    var region: FaceRegion? {
+        switch target {
+        case .eyesClosed, .metric(.eyeSquint), .metric(.orbit): .eyes
+        case .metric(.browDown): .brows
+        case .metric(.noseLip): .nose
+        case .metric(.mouthSmile), .metric(.jawOpen), .metric(.mouthTense), .metric(.cheekRaise): .mouth
+        default: nil
+        }
+    }
+    var isVoice: Bool { target == .voiceOn || target == .metric(.rmsDb) || target == .metric(.f0Hz) }
 }
 
-/// 「いま」のタブの真ん中：いつもと違うことを文で大きく（種類の色で太く）。無ければ「いつも通りです」
-struct NowDifferences: View {
+/// 「いま」のタブの真ん中（v1.14〜）：状態のカード。顔のイラスト（表情は変えない中立の形）の、違いが出ている部位を指標の色で光らせ、
+/// 声の違いは横に音の波のアイコン。その下に大きな文字で「いつも通りです」か、違いを2つまで（種類の色、続いた秒数を添える）。
+/// 気持ちを表す絵文字・表情は使わない（docs/wording-guide.md）
+struct NowCard: View {
     @ObservedObject var model: AnalysisModel
-    static let maxLines = 4
+    /// 映像の小さな窓の場所と幅：窓が上の角なら絵を、下の角なら文字を、窓の反対側へ寄せて重ならないようにする
+    var windowCorner: Corner = .topTrailing
+    var windowReserve: CGFloat = 0
+    static let maxLines = 2
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("いつもと違うこと").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
-            if model.comparing == nil, model.baselineSec != nil {
-                Label("普段を記録しています", systemImage: "hourglass").font(.title2.bold()).foregroundStyle(Palette.progress)
-                // 普段を記録している間も、普段と比べないもの（声が出た・目を閉じている）は出す
-                lines
-            } else if model.differences.isEmpty {
-                Text(model.faceReadable ? "いつも通りです" : "声は、いつも通りです")
-                    .font(.title.weight(.semibold)).foregroundStyle(Palette.face)
-                    .lineLimit(1).minimumScaleFactor(0.6)
-            } else {
-                lines
+        GeometryReader { geo in
+            let face = max(96, min(200, geo.size.height * 0.48))
+            VStack(spacing: 6) {
+                Text("いまの状態").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Spacer(minLength: 0)
+                HStack(spacing: 10) {
+                    FaceSketch(shape: model.cameraActive && model.faceReadable ? [:] : nil, size: face, highlights: highlights)
+                    if !voiceItems.isEmpty {
+                        VStack(spacing: 8) {
+                            ForEach(Array(voiceItems.enumerated()), id: \.offset) { _, d in
+                                Image(systemName: "waveform").font(.system(size: face * 0.2, weight: .bold))
+                                    .foregroundStyle(Palette.marker(d.target))
+                            }
+                        }
+                        .accessibilityHidden(true)
+                    }
+                }
+                .padding(windowCorner.isLeading ? .leading : .trailing, windowCorner.isTop ? windowReserve : 0)
+                Spacer(minLength: 0)
+                headline
+                    .padding(windowCorner.isLeading ? .leading : .trailing, windowCorner.isTop ? 0 : windowReserve)
             }
-            Spacer(minLength: 0)
+            .padding(12)
+            .frame(width: geo.size.width, height: geo.size.height)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.secondary.opacity(0.25)))
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .accessibilityElement(children: .combine)
     }
 
-    @ViewBuilder private var lines: some View {
-        let all = LiveText.diffLines(model)
-        ForEach(Array(all.prefix(Self.maxLines)), id: \.text) {
-            DiffLineView(text: $0.text, target: $0.target, font: .title2.bold(), markerSize: 12)
+    private var collecting: Bool { model.comparing == nil && model.baselineSec != nil }
+
+    /// 光らせる部位：最初に出ている違いの色（普段を記録している間・いつも通りのときは光らせない）
+    private var highlights: [FaceRegion: Color] {
+        var h: [FaceRegion: Color] = [:]
+        for d in model.diffItems { if let r = d.region, h[r] == nil { h[r] = Palette.marker(d.target) } }
+        return h
+    }
+    private var voiceItems: [DiffItem] { model.diffItems.filter(\.isVoice) }
+
+    @ViewBuilder private var headline: some View {
+        VStack(spacing: 2) {
+            if !model.diffItems.isEmpty {
+                ForEach(Array(model.diffItems.prefix(Self.maxLines).enumerated()), id: \.offset) { _, d in
+                    let line = Text(d.shortText).font(.largeTitle.bold()) + Text("（\(d.seconds)秒）").font(.title3.weight(.semibold))
+                    // 1行で（途中で折り返すと読みにくいので、入らないときは縮める）
+                    line.lineLimit(1).minimumScaleFactor(0.55)
+                        .foregroundStyle(Palette.text(d.target))
+                }
+                if model.diffItems.count > Self.maxLines {
+                    Text("ほか\(model.diffItems.count - Self.maxLines)つ").font(.headline).foregroundStyle(.secondary)
+                }
+            } else if collecting {
+                Text("普段を記録しています").font(.title.bold()).foregroundStyle(Palette.progress).lineLimit(1).minimumScaleFactor(0.5)
+                if let sec = model.baselineSec {
+                    ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget).tint(Palette.progress)
+                        .frame(maxWidth: 260)
+                }
+            } else {
+                Text(model.faceReadable ? "いつも通りです" : "声は、いつも通りです")
+                    .font(.largeTitle.bold()).foregroundStyle(Palette.face).lineLimit(1).minimumScaleFactor(0.5)
+            }
         }
-        if all.count > Self.maxLines {
-            Text("ほか\(all.count - Self.maxLines)件").font(.callout).foregroundStyle(.secondary)
-        }
+        .frame(maxWidth: .infinity)
     }
 }
 

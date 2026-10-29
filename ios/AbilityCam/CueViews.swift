@@ -55,6 +55,11 @@ struct CueResultView: View {
         NavigationStack {
             List {
                 Section {
+                    // v1.19〜：どちらの数が今使われているかを先に出す
+                    Label("この結果は、今の普段の下限で比べたもの。最大から決めた下限は次の普段から使います", systemImage: "info.circle")
+                        .font(.callout).foregroundStyle(ContentView.navyText)
+                }
+                Section {
                     ForEach([CueKind.frown, .smile], id: \.self) { k in
                         compare(Self.names[k] ?? "", hitText(result.before.hit(k)), result.after.map { hitText($0.hit(k)) })
                     }
@@ -99,8 +104,8 @@ struct CueResultView: View {
     private func compare(_ label: String, _ before: String, _ after: String?) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label).font(.subheadline.bold())
-            Text("今の下限：\(before)").font(.caption)
-            Text("その人の最大から：\(after ?? "–")").font(.caption)
+            Text("今の下限（今使っている）：\(before)").font(.caption)
+            Text("最大から決めた下限（次の普段から）：\(after ?? "–")").font(.caption)
         }
     }
 

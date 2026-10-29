@@ -44,6 +44,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
     private var sentAt: [Int: CFTimeInterval] = [:]
     private var lastTs = -1
     private var submitted = 0      // 解析に渡したコマの数（解析コマ/秒が落ちていないか見る）
+    private var notSubmitted = 0   // 解析に渡せなかったコマ（探す顔の数を変えて作り直している間・時刻が戻った・画像にできなかった。v1.19〜）
+    private var returned = 0       // 結果が返ってきたコマ（v1.19〜。渡したのに返らないコマは MediaPipe が捨てたもの）
     private var imageSize = CGSize.zero
     private var mirrored = false   // 解析に渡す映像が鏡（前面カメラ）。記録の値を背面と同じ意味に直す（v1.6.1〜）
     private let lock = NSLock()
@@ -61,6 +63,12 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
     func submittedCount() -> Int {
         lock.lock(); defer { lock.unlock() }
         return submitted
+    }
+
+    /// 解析に渡した・渡せなかった・結果が返ったコマの数（v1.19〜、記録の frame_gap）
+    func counts() -> (submitted: Int, notSubmitted: Int, returned: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (submitted, notSubmitted, returned)
     }
 
     /// 普段の顔の位置と大きさ（標準偏差には下限 0.05 をかける）
@@ -117,8 +125,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
     func process(_ sampleBuffer: CMSampleBuffer) {
         let ms = Int(CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * 1000)
         lock.lock()
-        guard let landmarker else { lock.unlock(); return }
-        guard ms > lastTs else { lock.unlock(); return }   // 時刻は必ず増えていく必要がある
+        guard let landmarker else { notSubmitted += 1; lock.unlock(); return }   // 探す顔の数を変えて作り直している間
+        guard ms > lastTs else { notSubmitted += 1; lock.unlock(); return }   // 時刻は必ず増えていく必要がある
         lastTs = ms
         submitted += 1
         if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
@@ -134,7 +142,7 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
             let image = try MPImage(sampleBuffer: sampleBuffer, orientation: .up)
             try landmarker.detectAsync(image: image, timestampInMilliseconds: ms)
         } catch {
-            lock.lock(); sentAt[ms] = nil; lock.unlock()
+            lock.lock(); sentAt[ms] = nil; submitted -= 1; notSubmitted += 1; lock.unlock()
         }
     }
 
@@ -168,6 +176,7 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         let now = CACurrentMediaTime()
         lock.lock()
         let sent = sentAt.removeValue(forKey: timestampInMilliseconds), size = imageSize, pref = preferred, mir = mirrored
+        returned += 1
         lock.unlock()
 
         // 顔が2つ映ったら、普段の位置・大きさに近いほうを本人として使う（普段がまだ無ければ大きいほう）

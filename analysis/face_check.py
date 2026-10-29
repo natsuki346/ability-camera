@@ -182,7 +182,7 @@ def cue_trial(rec: review.Recording, c: dict) -> dict | None:
     if not cues:
         return None
     mx = maxima(rec, cues, c)
-    before = cue_report(review.analyze(review.with_floors(rec, c, "defaults"), c), cues, c)
+    before = cue_report(review.analyze(review.with_floors(rec, c, "recorded"), c), cues, c)   # 試すモードの間に使っていた下限（v1.19〜）
     after = cue_report(review.analyze(review.with_floors(rec, c, "calibrated", mx), c), cues, c) if mx else None
     return {"max": mx, "before": before, "after": after}
 
@@ -193,7 +193,8 @@ CUE_NAMES = {"frown": "眉を寄せる", "smile": "笑う", "calm": "何もし�
 def cue_text(tr: dict) -> list[str]:
     """アプリの試すモードの結果と同じ並び（人が読む用）"""
     out = []
-    for label, rep in (("今の下限", tr["before"]), ("その人の最大から決めた下限", tr["after"])):
+    out.append("この結果は、今の普段の下限で比べたもの。最大から決めた下限は次の普段から使います")
+    for label, rep in (("今の下限（今使っている）", tr["before"]), ("最大から決めた下限（次の普段から）", tr["after"])):
         if rep is None:
             out.append(f"■ {label}：その人の最大が求まらなかった")
             continue

@@ -34,6 +34,21 @@ if CommandLine.arguments.contains("--geo-selftest") {
     exit(bad.isEmpty ? 0 : 1)
 }
 
+// コマが来なかった間の理由（v1.19〜、FrameGap）
+if CommandLine.arguments.contains("--gap-selftest") {
+    var bad: [String] = []
+    func want(_ got: String?, _ w: String?, _ label: String) { if got != w { bad.append("\(label)：\(got ?? "nil")（\(w ?? "nil") のはず）") } }
+    want(FrameGap.reason(notes: ["inactive", "inactive"], delivered: 1, dropped: 0, dropReason: nil, submitted: 1, returned: 1),
+         "inactive,no_camera_frames", "コントロールセンターでカメラが止まった")
+    want(FrameGap.reason(notes: [], delivered: 30, dropped: 0, dropReason: nil, submitted: 30, returned: 1), "no_result", "解析が返らない")
+    want(FrameGap.reason(notes: [], delivered: 3, dropped: 20, dropReason: "late", submitted: 3, returned: 3), "camera_drop:late", "カメラが遅れたコマを捨てた")
+    want(FrameGap.reason(notes: ["face_reload"], delivered: 15, dropped: 0, dropReason: nil, submitted: 1, returned: 1), "face_reload", "探す顔の数を変えた")
+    want(FrameGap.reason(notes: ["rotation"], delivered: 10, dropped: 0, dropReason: nil, submitted: 10, returned: 10), "rotation", "回転の組み直し")
+    want(FrameGap.reason(notes: [], delivered: 12, dropped: 0, dropReason: nil, submitted: 12, returned: 12), nil, "分からない")
+    print(bad.isEmpty ? "OK" : bad.joined(separator: "\n"))
+    exit(bad.isEmpty ? 0 : 1)
+}
+
 // 顔の点の距離の計算時間（v1.17〜）：1コマ分（FaceGeometry.values・geo_pts を作る・その2つを JSON にする）を何度も回して、1回あたりの µs を出す。
 // Mac で測るので iPhone の値ではないが、1コマ 33ms に対してどのくらいかの目安（docs/validation-log.md）
 if CommandLine.arguments.contains("--geo-bench") {

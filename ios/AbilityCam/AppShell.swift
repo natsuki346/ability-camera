@@ -151,9 +151,11 @@ struct CameraShell: View {
         .onAppear { if UserDefaults.standard.bool(forKey: "speakerRecord") { SpeakerModelStore.shared.preload() } }
         .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {
-            case .active: Task { await model.appBecameActive() }   // 開いたら記録（新しいセッション、5秒以内なら同じセッション）
+            case .active: model.writeAppState("active"); Task { await model.appBecameActive() }   // 開いたら記録（新しいセッション、5秒以内なら同じセッション）
             case .background: model.appEnteredBackground()          // 裏に回ったら止めて、整理する
-            default: break
+            // コントロールセンター・通知・App スイッチャーなど（v1.19〜）：止めない（カメラは動いたまま。止まるならカメラの割り込みとして記録される）
+            case .inactive: model.writeAppState("inactive")
+            @unknown default: break
             }
         }
     }

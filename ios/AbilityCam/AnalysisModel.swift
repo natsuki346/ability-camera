@@ -124,6 +124,9 @@ final class AnalysisModel: ObservableObject {
     @Published var cueResult: CueTrial?        // 終わったときの結果（画面に出す）
     @Published var cueError: String?
     fileprivate var cueTask: Task<Void, Never>?
+    // コマが来なかった間（v1.19〜、記録の frame_gap）
+    fileprivate var gapLast: (tMs: Int64, cam: (delivered: Int, dropped: Int, dropReason: String?), face: (submitted: Int, notSubmitted: Int, returned: Int))?
+    fileprivate var gapNotes: [(tMs: Int64, reason: String)] = []
     private var thermalObserver: NSObjectProtocol?
     /// 顔の点の距離を、今日の普段がたまるのを待っている（v1.17〜。保存した普段では比べない。データのタブ）
     @Published var geoWaitingToday = false
@@ -335,6 +338,7 @@ final class AnalysisModel: ObservableObject {
 
     /// アプリが裏に回った：カメラとマイクを止め、5秒たっても戻らなければファイルを閉じて要約する
     func appEnteredBackground() {
+        writeAppState("background")   // v1.19〜（5秒以内に戻れば同じ記録のまま、その間のコマが無い）
         link.stop()   // 裏に回るとつながりは切れる。戻ったら、見る側が自動でつなぎ直す
         video.configure(enabled: false, interval: VideoSender.fastest)
         videoSending = false
@@ -453,6 +457,7 @@ final class AnalysisModel: ObservableObject {
         running = true
         PersonStore.shared.inSession = true
         writeThermal()   // 始めたときの端末の熱の状態（v1.18〜）
+        gapLast = nil; gapNotes = []
         // 前に同じ組み合わせのとき家族が付けた印（v1.13〜）：同じ人のこれまでの記録から、裏で数える
         pastMarks = PastMarks(); markCombos = [:]
         if let pid = PersonStore.shared.selectedID {
@@ -547,6 +552,9 @@ final class AnalysisModel: ObservableObject {
         }
         // 解析に渡す映像の向き・鏡（v1.6.1〜）：鏡なら記録の値を直す。横長の映像が届いたら回転を決め直す
         camera.onOrientation = { [weak face] m in face?.setMirrored(m) }
+        // コマが来なくなる理由（v1.19〜）：回転の組み直し・カメラの割り込み
+        camera.onRotationChange = { [weak self] _ in MainActor.assumeIsolated { self?.noteGap("rotation") } }
+        camera.onInterruption = { [weak self] reason in MainActor.assumeIsolated { self?.cameraInterrupted(reason) } }
         face.onImageSize = { [weak camera] s in camera?.checkPortrait(s) }
         do {
             try face.load()
@@ -1405,6 +1413,7 @@ final class AnalysisModel: ObservableObject {
 
     private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64, voiceSelf: Bool?, voiceFaceValid: Bool,
                         voiceReason: VoiceSelfTracker.Reason? = nil) {
+        watchGap(tMs: tMs)   // コマが来なかった間（v1.19〜）
         guard cameraActive else { return }
         collectVoice(tMs: tMs, voiceSelf: voiceSelf, faceValid: r.face && voiceFaceValid, reason: voiceReason, audio: a)
         speakerGateFrame(tMs: tMs, voiceSelf: voiceSelf, reason: voiceReason?.rawValue)
@@ -1673,6 +1682,7 @@ final class AnalysisModel: ObservableObject {
         guard maxFaces > 1, !videoSending, Double(done) < Double(sent) * 0.9 else { return }
         do { try face.setNumFaces(1) } catch { return }
         maxFaces = 1
+        noteGap("face_reload")   // 作り直している間は解析に渡せない（v1.19〜、frame_gap の理由）
         let msg = String(format: "解析コマ/秒が落ちたため、探す顔の数を1にしました（カメラ %.1f → 解析 %.1f コマ/秒）",
                          Double(sent) / (now - c.host), Double(done) / (now - c.host))
         var e = EventRecord(tMs: Self.nowMs(), kind: "faces_limit", value: .text(msg))
@@ -1864,4 +1874,49 @@ extension AnalysisModel {
         }
         logger.write(EventRecord(tMs: Self.nowMs(), kind: "thermal", value: .text(s)))
     }
+}
+
+// MARK: コマが来なかった間（v1.19〜）
+extension AnalysisModel {
+    /// コマが来なくなる理由になりうることがあった（frame_gap の reason に入れる）
+    func noteGap(_ reason: String) {
+        let now = Self.nowMs()
+        gapNotes.append((now, reason))
+        gapNotes.removeAll { $0.tMs < now - 120_000 }
+    }
+
+    /// アプリの状態（inactive：コントロールセンター・通知・App スイッチャーなど。background：裏に回った）を記録に書く
+    func writeAppState(_ state: String) {
+        guard running else { return }
+        if state != "active" { noteGap(state) }
+        logger.write(EventRecord(tMs: Self.nowMs(), kind: "app_state", value: .text(state)))
+    }
+
+    /// カメラの割り込み（AVCaptureSession.wasInterrupted の理由 / 終わりは nil）
+    func cameraInterrupted(_ reason: String?) {
+        guard running else { return }
+        if let reason { noteGap("camera_interrupted:\(reason)") }
+        logger.write(EventRecord(tMs: Self.nowMs(), kind: reason == nil ? "camera_interruption_ended" : "camera_interrupted",
+                                 value: reason.map { .text($0) }))
+    }
+
+    /// コマが届いた：前のコマから frameGapMinMs 以上空いていたら event frame_gap を書く（t_ms＝前のコマ、end_ms＝このコマ）
+    fileprivate func watchGap(tMs: Int64) {
+        guard running else { gapLast = nil; return }
+        let cam = camera.frameCounts(), fc = face.counts()
+        defer { gapLast = (tMs, cam, fc) }
+        guard let last = gapLast, tMs - last.tMs >= FrameGap.minMs else { return }
+        var e = EventRecord(tMs: last.tMs, kind: "frame_gap", value: nil)
+        e.endMs = tMs; e.gapMs = tMs - last.tMs
+        let delivered = cam.delivered - last.cam.delivered, dropped = cam.dropped - last.cam.dropped
+        let submitted = fc.submitted - last.face.submitted, notSub = fc.notSubmitted - last.face.notSubmitted
+        let returned = fc.returned - last.face.returned
+        e.cameraFrames = delivered; e.droppedFrames = dropped; e.submittedFrames = submitted
+        e.notSubmittedFrames = notSub; e.returnedFrames = returned
+        e.reason = FrameGap.reason(notes: gapNotes.filter { $0.tMs >= last.tMs - 500 && $0.tMs <= tMs }.map(\.reason),
+                                  delivered: delivered, dropped: dropped, dropReason: cam.dropReason, submitted: submitted, returned: returned)
+        logger.write(e)
+    }
+
+
 }

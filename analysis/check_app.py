@@ -21,7 +21,7 @@ import review
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / "ios" / "AbilityCam"
-SOURCES = [APP / n for n in ("Replay.swift", "FaceSketch.swift", "HeadTurn.swift", "Baseline.swift", "DiffEngine.swift", "Pitch.swift", "MarkDetail.swift", "Cues.swift")] \
+SOURCES = [APP / n for n in ("Replay.swift", "FaceSketch.swift", "HeadTurn.swift", "Baseline.swift", "DiffEngine.swift", "Pitch.swift", "MarkDetail.swift", "Cues.swift", "FrameGap.swift")] \
     + [ROOT / "ios" / "Tools" / "DiffCheck" / "main.swift"]
 TOL_S = 0.0015      # 時刻は ms で書かれているので、1.5ms までの差は同じとみなす
 TOL_Z = 1e-6

@@ -171,7 +171,7 @@ struct CueReport: Codable, Equatable {
 }
 
 /// 試すモードの結果を、記録のファイルから出す（v1.18〜。アプリが終わったときと DiffCheck --cues で同じ）。
-/// before：今の下限（指標ごとの下限）、after：この記録の「いちばん強く・大きく」から求めたその人の最大で決めた下限。
+/// before：今の下限（試すモードの間に使っていた下限＝記録の baseline 行の std_floor、無ければ指標ごとの下限。v1.19〜）、after：この記録の「いちばん強く・大きく」から求めたその人の最大で決めた下限。
 /// 記録の中の最後の試すモードの指示だけを使う（同じ記録で2回試したときは後の方）
 struct CueTrial: Codable, Equatable {
     var max: [String: Double]        // この記録から求めたその人の最大（Calibration.maxima）
@@ -179,7 +179,7 @@ struct CueTrial: Codable, Equatable {
     var after: CueReport?            // 最大が1つも求まらなければ nil
 
     static func run(data: Data, name: String) throws -> CueTrial? {
-        let d = try ReplayData(data: data, name: name, floorMode: .defaults, keepZ: true)
+        let d = try ReplayData(data: data, name: name, floorMode: .recorded, keepZ: true)
         let cues = lastRun(d.cues)
         guard !cues.isEmpty else { return nil }
         let mx = Calibration.maxima(frames: d.rawFace, cues: cues)

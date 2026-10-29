@@ -207,6 +207,29 @@ iPhone をつないで実行。初回は、iPhone の 設定 > 一般 > VPNと�
 - 振り返りレポート・リプレイは、`voice_self` の無い古い記録では、同じ決まりで本人の声を決め直す
 - 声の普段の進み具合が3秒増えないときは、理由を小さく出す（v1.6.2〜）：「声の普段が増えない理由：声の高さが取れていません」／「口が動いていません」／「顔が読めていません」（見る側の声の欄にも）
 
+## コマが来なかった間を記録する・試すモードの結果の見出し（v1.19）
+記録 234627（v1.16、前面）の解析コマ/秒 24.1 は、解析時間（8.5〜9.0ms で一定）ではなく、コマが来なかった時間（26.3秒 0.8秒、44.3秒 1.2秒、45.7秒 0.9秒、50.4秒 10.0秒、68.3秒 0.6秒、69.0秒 0.5秒）によるものだった（記録を見た人が調べた）。
+- **「裏に回って5秒で新しい記録」との関係（コードで確かめたこと）**：新しい記録になるのは、`scenePhase` が `.background` になったとき（`CameraShell` → `appEnteredBackground`：カメラを止め、5秒の `finalizeTask` で閉じる）だけ。
+  5秒以内に戻れば同じ記録を続ける（`appBecameActive` が `finalizeTask` を取り消す）。カメラを止めるのは、この裏に回ったときと `shutdown`（役割を見る側に変えた）だけ。
+  `.inactive`（コントロールセンター・通知センター・App スイッチャー・システムのダイアログなど）では何もしていなかった：カメラも止めず、5秒の決まりも動かない。設定のシート・サイドバーの設定・これまでの記録を開いても、カメラは止めない。
+  なので、同じ記録のまま 10.0秒コマが無いのは、(a) `.inactive` の間に iOS がカメラを止めた（割り込み）か、(b) 裏に回って5秒以内に戻った（その場合は裏の時間 + カメラを動かし直す時間で、10秒より短いはず）のどちらかと考えられるが、
+  v1.18 までの記録には、どちらかを見分けるもの（アプリの状態・カメラの割り込み）が書かれていなかった
+- **`frame_gap`**：0.3秒以上（`FrameGap.minMs`）コマが来なかったら、次のコマが来たときに `event`（`kind: "frame_gap"`、`t_ms`＝前のコマ、`end_ms`＝次のコマ、`gap_ms`、`reason`）を書く。
+  その間の数も書く：`camera_frames`（カメラが届けた）・`dropped_frames`（カメラが捨てた）・`submitted_frames`（解析に渡した）・`not_submitted_frames`（渡せなかった）・`returned_frames`（結果が返った）。
+  `reason`（分かったものをカンマで）：`inactive` / `background`（アプリの状態）、`camera_interrupted:理由`（`AVCaptureSession.wasInterrupted` の理由：`not_available_in_background`・`multiple_foreground_apps`・`system_pressure`・`video_in_use_by_another_client` など）、
+  `rotation`（解析に渡す映像の回転を変えた。前面は端末の傾きで RotationCoordinator が角度を変え、つながりが組み直される）、`face_reload`（探す顔の数を変えて作り直した）、`camera_drop:late` など（カメラが遅れたコマを捨てた）、
+  `no_camera_frames`（カメラがコマを届けていない）、`no_result`（解析に渡したのに結果が返らない＝MediaPipe が捨てた）。
+  あわせて `app_state`（`inactive` / `active` / `background`）、`camera_interrupted`（理由）・`camera_interruption_ended` を書く
+- **顔を大きく横に向けたときのコマの抜け（44〜46秒、yaw 40° くらい）**：コードでは、顔の数・顔を見失ったこと・yaw でカメラのコマを捨てるところは無かった（|yaw| > 25° は点の距離を書かないだけ、> 35° は判定しないだけで、コマは記録する。顔が無いコマも `face: false` で書く）。
+  コマが記録されない道は次の4つ：① 探す顔の数を 2 → 1 に変えた直後、作り直している間（`faces_limit` の event と同時。1回だけ）、② カメラが遅れたコマを捨てる（`alwaysDiscardsLateVideoFrames`）、
+  ③ MediaPipe（liveStream）が忙しいときに、結果を返さずにコマを捨てる（顔を見失うと顔の検出をやり直すので、そのコマが重くなることがある）、④ 前面で端末が傾いて回転を変えたとき。
+  結果が返ったコマの解析時間は記録されるが、返らなかったコマは記録に残らないので、v1.18 までの記録ではこのどれかを見分けられない。v1.19 からは `frame_gap` の数と `reason` で分かる
+  （`camera_frames` が多く `returned_frames` が少なければ ③、`dropped_frames` があれば ②、`rotation` なら ④）
+- **試すモードの結果**：先頭に「この結果は、今の普段の下限で比べたもの。最大から決めた下限は次の普段から使います」。行の名前を「今の下限（今使っている）」「最大から決めた下限（次の普段から）」にした。
+  「今の下限」は、試すモードの間に使っていた下限（記録の `baseline` 行の `std_floor`、無ければ指標ごとの下限。前に保存した最大があればそれで決めた下限）で数える（v1.18 は指標ごとの下限で数えていた）
+- `perf_check.py` に、記録のコマから見つけたコマの来ない間（0.3秒以上の回数・合計・始まりからの秒と長さ）と、`frame_gap` の理由の数の列を足した
+- テスト：`DiffCheck --gap-selftest`（理由の決め方）、`FrameGapTest`（記録 234627 と同じように 50.4秒から 10秒・26.3秒から 0.8秒のコマを抜いた作り物の記録で、perf_check.py が見つける）、試すモードの「今の下限」が記録の `std_floor` を使い、アプリと一致する
+
 ## 試すモード・眉の点の距離の候補・その人の動く幅（v1.18）
 記録 `ability-cam-20261029-234627`・`234756`（v1.16、前面）では、眉を5回寄せたはずが、はっきり取れたのは 22・40・68〜74秒だけだった（browDown 0.05〜0.12、普段 0.001、標準偏差の下限 0.03）。
 区間を値から推定していると、取れなかったのが「動かしていない」のか「取れていない」のかが分からない。正解つきで確かめられるようにした（どれも仮の値で、記録を見て決め直す）。
@@ -738,6 +761,9 @@ v1.12〜の表情のまとまり：`orbit`（max(eyeSquint, cheekSquint) の左�
 | `cue_run` | `start` / `end` / `stopped` | 試すモードを始めた・終えた・やめた（v1.18〜） |
 | `calibration` | なし | その人の最大（v1.18〜）。`max`（指標 → 値）・`camera` |
 | `thermal` | `nominal` / `fair` / `serious` / `critical` | 端末の熱の状態（v1.18〜、始めたときと変わったとき） |
+| `frame_gap` | なし | 0.3秒以上コマが来なかった（v1.19〜）。`t_ms`＝前のコマ、`end_ms`＝次のコマ、`gap_ms`、`reason`、`camera_frames`・`dropped_frames`・`submitted_frames`・`not_submitted_frames`・`returned_frames` |
+| `app_state` | `inactive` / `active` / `background` | アプリの状態が変わった（v1.19〜） |
+| `camera_interrupted` / `camera_interruption_ended` | 理由 / なし | カメラの割り込み（v1.19〜、`AVCaptureSession.wasInterrupted`） |
 | `saved_baseline_skipped` | 理由 | 選んだ人の保存した普段があるが、カメラが違うので保存した普段の行を書かなかった（v1.2.1〜）。`camera`（今）、`saved_camera`（保存した普段） |
 
 `change` には、どちらの普段で比べたか（`baseline`：`"today"` / `"saved"`、v1.2〜）も付く。

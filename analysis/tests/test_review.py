@@ -2273,3 +2273,55 @@ class CueTest(unittest.TestCase):
         diffs, has = check_app.compare_cues(self.FIX, check_app.build(), review.load_criteria(review.HERE / "criteria.json", []))
         self.assertTrue(has)
         self.assertEqual(diffs, [])
+
+
+class FrameGapTest(unittest.TestCase):
+    """コマの来ない間（v1.19〜）：perf_check.py が記録のコマから見つけ、アプリの frame_gap の理由を数える。アプリの FrameGap と同じ 0.3秒"""
+
+    def test_gaps(self):
+        import json
+        import re
+        import shutil
+        import perf_check
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "FrameGap.swift").read_text(encoding="utf-8")
+        self.assertEqual(int(re.search(r"static let minMs: Int64 = (\d+)", src).group(1)) / 1000, perf_check.GAP_S)
+        lines = (review.HERE / "tests" / "fixture_basic.jsonl").read_text(encoding="utf-8").splitlines()
+        objs = [json.loads(x) for x in lines]
+        t0 = objs[0]["started_at_ms"]
+        # 50.4秒から 10秒・26.3秒から 0.8秒のコマを抜く（記録 234627 のように）
+        keep = [o for o in objs if o.get("type") != "frame" or not (50_400 < o["t_ms"] - t0 < 60_400 or 26_300 < o["t_ms"] - t0 < 27_100)]
+        keep.append({"type": "event", "t_ms": t0 + 50_400, "kind": "frame_gap", "end_ms": t0 + 60_400, "gap_ms": 10000, "reason": "inactive,no_camera_frames"})
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "gap.jsonl"
+            p.write_text("\n".join(json.dumps(o) for o in keep) + "\n", encoding="utf-8")
+            r = perf_check.summary(p)
+        self.assertEqual(r["gap_n"], 2)
+        self.assertAlmostEqual(r["gap_s"], 10.8, delta=0.1)
+        self.assertIn("50.4s 10.0秒", r["gaps"])
+        self.assertEqual(r["gap_reasons"], "inactive 1、no_camera_frames 1")
+        if shutil.which("swiftc"):
+            import check_app
+            import subprocess
+            p = subprocess.run([str(check_app.build()), "--gap-selftest"], capture_output=True, text=True)
+            self.assertEqual(p.stdout.strip(), "OK", p.stdout + p.stderr)
+
+    def test_cue_before_uses_recorded_floor(self):
+        """試すモードの「今の下限」は、試すモードの間に使っていた下限（baseline 行の std_floor、v1.19〜）。アプリと一致"""
+        import json
+        import shutil
+        import face_check
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        objs = [json.loads(x) for x in (review.HERE / "tests" / "fixture_cues.jsonl").read_text(encoding="utf-8").splitlines()]
+        for o in objs:
+            if o.get("type") == "baseline":
+                o["std_floor"] = {"brow_down": 0.014}
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "cues_floor.jsonl"
+            p.write_text("\n".join(json.dumps(o, ensure_ascii=False) for o in objs) + "\n", encoding="utf-8")
+            tr = face_check.cue_trial(review.load(p), c)
+            self.assertEqual(next(h for h in tr["before"]["hits"] if h["kind"] == "frown")["hit"], 4)
+            self.assertIn("この結果は、今の普段の下限で比べたもの", "\n".join(face_check.cue_text(tr)))
+            if shutil.which("swiftc"):
+                import check_app
+                diffs, has = check_app.compare_cues(p, check_app.build(), c)
+                self.assertEqual((diffs, has), ([], True))

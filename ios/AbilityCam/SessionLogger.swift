@@ -147,12 +147,22 @@ struct EventRecord: Encodable {
     var startMs: Int64?
     // calibration（v1.18〜）：その人の最大（指標 → 値）
     var max: [String: Double]?
+    // frame_gap（v1.19〜、0.3秒以上コマが来なかった。t_ms は前のコマ、end_ms は次のコマ）
+    var gapMs: Int64?
+    var reason: String?          // 分かった理由（カンマ区切り。inactive / background / camera_interrupted:… / rotation / face_reload / camera_drop:… / no_result / no_camera_frames）
+    var cameraFrames: Int?       // その間にカメラが届けたコマ
+    var droppedFrames: Int?      // その間にカメラが捨てたコマ
+    var submittedFrames: Int?    // その間に解析に渡したコマ
+    var notSubmittedFrames: Int? // その間に解析に渡せなかったコマ
+    var returnedFrames: Int?     // その間に結果が返ったコマ
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
         case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part, median, iqr
         case collect, validS = "valid_s", score, computedS = "computed_s", notSelfS = "not_self_s", noF0S = "no_f0_s", noFramesS = "no_frames_s", final, gateVersion = "gate_version", cached, computeUnits = "compute_units", loadMs = "load_ms", plan, audio
         case endMs = "end_ms", durationS = "duration_s", above, metrics, groups, atEnd = "at_end", ratio, windowS = "window_s", faceFrames = "face_frames", closedFrames = "closed_frames", detail, detailAt = "detail_at", startMs = "start_ms", max
+        case gapMs = "gap_ms", reason, cameraFrames = "camera_frames", droppedFrames = "dropped_frames", submittedFrames = "submitted_frames"
+        case notSubmittedFrames = "not_submitted_frames", returnedFrames = "returned_frames"
     }
 }
 

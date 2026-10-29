@@ -69,6 +69,48 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     /// カメラのスレッドから呼ばれる
     var onFrame: ((CMSampleBuffer) -> Void)?
 
+    // コマが来なくなった理由を見分けるため（v1.19〜、記録の frame_gap）
+    private let countLock = NSLock()
+    private var delivered = 0, dropped = 0, lastDropReason: String?
+    /// 解析に渡す映像の回転が変わった（main スレッド。回転を変えると、つながりが組み直されてコマが抜けることがある）
+    var onRotationChange: ((CGFloat) -> Void)?
+    /// カメラの割り込み（main スレッド）：始まり（理由の名前）・終わり（nil）
+    var onInterruption: ((String?) -> Void)?
+    private var observers: [NSObjectProtocol] = []
+
+    /// カメラが届けたコマの数・捨てたコマの数（遅れなど）・最後に捨てた理由
+    func frameCounts() -> (delivered: Int, dropped: Int, dropReason: String?) {
+        countLock.lock(); defer { countLock.unlock() }
+        return (delivered, dropped, lastDropReason)
+    }
+
+    override init() {
+        super.init()
+        let nc = NotificationCenter.default
+        observers.append(nc.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: .main) { [weak self] n in
+            let raw = (n.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber)?.intValue
+            self?.onInterruption?(Self.interruptionName(raw))
+        })
+        observers.append(nc.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main) { [weak self] _ in
+            self?.onInterruption?(nil)
+        })
+        observers.append(nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { [weak self] _ in
+            self?.onInterruption?("runtime_error")
+        })
+    }
+
+    static func interruptionName(_ raw: Int?) -> String {
+        guard let raw, let r = AVCaptureSession.InterruptionReason(rawValue: raw) else { return "unknown" }
+        switch r {
+        case .videoDeviceNotAvailableInBackground: return "not_available_in_background"
+        case .audioDeviceInUseByAnotherClient: return "audio_in_use_by_another_client"
+        case .videoDeviceInUseByAnotherClient: return "video_in_use_by_another_client"
+        case .videoDeviceNotAvailableWithMultipleForegroundApps: return "multiple_foreground_apps"
+        case .videoDeviceNotAvailableDueToSystemPressure: return "system_pressure"
+        default: return "other_\(raw)"
+        }
+    }
+
     /// 初めの1回だけ組み立てる。使ったカメラを返す
     @discardableResult
     func configureIfNeeded(lens wanted: CameraLens) throws -> CameraLens {
@@ -135,7 +177,11 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard let c = output?.connection(with: .video) else { return }
         let angle = coordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
         if c.isVideoRotationAngleSupported(angle) {
-            if c.videoRotationAngle != angle { c.videoRotationAngle = angle }
+            if c.videoRotationAngle != angle {
+                c.videoRotationAngle = angle
+                let a = angle
+                if Thread.isMainThread { onRotationChange?(a) } else { DispatchQueue.main.async { self.onRotationChange?(a) } }
+            }
             rotationAngle = angle
         }
         analysisMirrored = c.isVideoMirroringSupported && c.isVideoMirrored
@@ -168,6 +214,19 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     func stop()  { sessionQueue.async { if self.session.isRunning { self.session.stopRunning() } } }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        countLock.lock(); delivered += 1; countLock.unlock()
         onFrame?(sampleBuffer)
+    }
+
+    /// カメラがコマを捨てた（alwaysDiscardsLateVideoFrames で遅れたコマ・バッファが足りない など。v1.19〜）
+    func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let r = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason, attachmentModeOut: nil) as? String
+        let name: String = switch r {
+        case String(kCMSampleBufferDroppedFrameReason_FrameWasLate): "late"
+        case String(kCMSampleBufferDroppedFrameReason_OutOfBuffers): "out_of_buffers"
+        case String(kCMSampleBufferDroppedFrameReason_Discontinuity): "discontinuity"
+        default: "unknown"
+        }
+        countLock.lock(); dropped += 1; lastDropReason = name; countLock.unlock()
     }
 }

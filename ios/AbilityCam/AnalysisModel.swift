@@ -46,6 +46,7 @@ final class AnalysisModel: ObservableObject {
     @Published var baselineEyesClosedLong = false   // 普段の間に目を閉じていた時間が、数えた時間の2割を超えた（v1.4〜）
     @Published var voiceSec: Int?             // 声の普段を集めている：本人の声の秒数（画面に出すときだけ。v1.6〜）
     @Published var otherVoice = false         // 本人以外の声（と言えない声）だけが入っている（直近1秒）
+    @Published var selfVoiceNow = false       // 本人の声が入っている（直近1秒に voice_self が true、本人以外の声だけではない。「いま」の映像の上の「声：本人」、v1.11.3〜。表示だけ）
     @Published var otherVoiceBySpeaker = false   // 「本人以外の声」を声紋で決めている（選んでいる人の声の登録があるとき、v1.10.5〜）
     @Published var speakerLast: (score: Double, other: Double?, windowMs: Int)?   // 「数字」：選んでいる人との直近の似ている度合い・ほかに登録した人のいちばん高い似ている度合い（v1.11〜）・使った声の長さ（v1.10.5〜）
     @Published var voiceRetaking = false      // 声の普段だけを取り直している（v1.9.3〜：この間は声の高さの範囲を使わず、口の動きだけで本人の声を数える）
@@ -172,16 +173,24 @@ final class AnalysisModel: ObservableObject {
         if Self.uiPreviewStart { PersonStore.shared.fillPreview(count: Self.previewPeopleCount) }
         #endif
         // 記録する人（v1.11〜）：選んだらその人で始める。記録中なら今の記録を閉じてから新しく始める（1本の記録には1人だけ）
-        PersonStore.shared.onStartRecording = { [weak self] id in self?.startRecording(personID: id) }
+        PersonStore.shared.onStartRecording = { [weak self] id, lens in self?.startRecording(personID: id, lens: lens) }
     }
 
-    /// 人を選んだ：その人で記録を始める（記録中は人を変えない、v1.11.2〜。呼ばれても何もしない）
-    func startRecording(personID id: String) {
+    /// 人を選んだ：その人で記録を始める。lens：カメラも変える（v1.11.3〜、設定で記録中に変えたとき）。
+    /// 記録中なら、今の記録を閉じてから（カメラは止めずに）新しい記録にする（1本の記録には1人・1つのカメラ。設定で「いまの記録を閉じて、新しく始めますか？」に「はい」）
+    func startRecording(personID id: String, lens: CameraLens? = nil) {
         Task {
             while activating { try? await Task.sleep(for: .milliseconds(50)) }
-            guard !running else { return }
             activating = true
             defer { activating = false }
+            if running {
+                if micOn { audio.stop() }   // startSession でつなぎ直す
+                finalizeSession()
+            }
+            if let lens, lens.rawValue != CameraLens.selected.rawValue {
+                UserDefaults.standard.set(lens.rawValue, forKey: "cameraLens")
+                applyLens()   // 記録していないので、切り替えるだけ（記録には新しい記録のヘッダに書く）
+            }
             PersonStore.shared.selectedID = id
             PersonStore.shared.awaitingPerson = false
             startNote = nil
@@ -223,10 +232,25 @@ final class AnalysisModel: ObservableObject {
         baselineStats = Dictionary(uniqueKeysWithValues: Metric.allCases.map { ($0, DiffEngine.Stat(mean: 0, sd: 1)) })
         voiceSec = 6; voiceWait = "口が動いていません"
         speakerEnrollNote = "自分の声を集めています（8/15秒）。黙っている間は数えません"
-        otherVoice = true; otherVoiceBySpeaker = true
+        otherVoice = true; otherVoiceBySpeaker = true; selfVoiceNow = false
         speakerLast = (0.21, 0.52, 2600)
         fps = 29.8; procMs = 11; latMs = 43; faceRatio = 0.96; rmsDb = -41; f0Hz = 182; pitchRatio = 0.62
         lensInUse = .wide; analyzedRatio = 0.99
+        // データのタブ用（v1.11.3〜）：記録する人と、直近60秒のグラフ（作り物の波）
+        PersonStore.shared.fillPreview(count: 1)
+        let now = Date().timeIntervalSince1970
+        let stats = baselineStats
+        for i in 0..<600 {
+            let t = now - 60 + Double(i) * 0.1
+            var z: [Metric: Double] = [:], v: [Metric: Double] = [:]
+            for (k, m) in Metric.allCases.enumerated() {
+                let base = sin(t / (3 + Double(k)) + Double(k)) * 1.2
+                z[m] = m == .browDown && i > 520 ? 2.6 : m == .rmsDb && i > 560 ? 2.2 : base
+                v[m] = m.isFace ? 0.1 + 0.05 * base : m == .rmsDb ? -45 + 4 * base : 160 + 10 * base
+            }
+            graph.append(t: t, z: z, values: v, baseline: stats)
+        }
+        graph.addEvent(t: now - 25, label: "家族の印：快", isMark: true)
     }
     #endif
 
@@ -398,7 +422,7 @@ final class AnalysisModel: ObservableObject {
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; diffTargets = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
-            todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false
+            todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false; selfVoiceNow = false
             voiceWait = nil; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false; speakerEnrollNote = nil
             speakerOther.clear(); otherVoiceSourceLogged = nil; speakerLast = nil; otherVoiceBySpeaker = false
             PersonStore.shared.voiceRestarting = nil
@@ -1183,6 +1207,8 @@ final class AnalysisModel: ObservableObject {
         let other = running && (bySpeaker ? speakerOther.other(nowMs: tMs)
                                           : tNow - lastOtherVoiceT <= 1 && tNow - lastSelfVoiceT > 1)
         if otherVoice != other { otherVoice = other }
+        let selfNow = running && !other && tNow - lastSelfVoiceT <= 1
+        if selfVoiceNow != selfNow { selfVoiceNow = selfNow }
         if otherVoiceBySpeaker != bySpeaker { otherVoiceBySpeaker = bySpeaker }
         let source = bySpeaker ? "speaker" : "voice_self"
         if running, otherVoiceSourceLogged != source {   // どちらで決めたかを記録に（記録の始め・変わったとき）

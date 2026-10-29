@@ -47,37 +47,109 @@ final class GraphStore: ObservableObject {
     }
 }
 
-/// 1. いま：大きく「いつもとの違い」（最大3行）、小さいメーター6本、状態の小さな表示
-struct NowPage: View {
+/// 「いま」のタブ（v1.11.3〜）の、映像の右：記録の状態（普段）と、進み具合・声の補足を小さく。「普段を取り直す」
+struct NowSide: View {
     @ObservedObject var model: AnalysisModel
-    static let maxLines = 3
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .center, spacing: 6) {
-                NoteLine(text: statusText, icon: "record.circle", color: Palette.face, lines: 2)   // 記録の状態
-                Spacer(minLength: 2)
-                // 表情だけ／声だけ／両方を選ぶ（v1.9.2〜）
-                Menu("普段を取り直す") {
-                    ForEach(AnalysisModel.RestartPart.allCases) { p in
-                        Button(p.rawValue) { model.restart(p) }
-                    }
-                }
-                .font(.caption)
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-                .disabled(!model.running)
+        VStack(alignment: .leading, spacing: 5) {
+            NoteLine(text: LiveText.baseline(model), icon: "record.circle", color: Palette.face, lines: 3)
+            if model.comparing == nil, let sec = model.baselineSec {
+                ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget).tint(Palette.progress)
+                NoteLine(text: model.baselineWait ?? "落ち着いているときに。顔が映っている間だけ数えます", icon: "info.circle", color: Palette.progress, font: .caption2, lines: 2)
             }
-            differences
-            meters
+            LiveNotes(model: model, showOther: false)
+            Spacer(minLength: 0)
+            // 表情だけ／声だけ／両方を選ぶ（v1.9.2〜）
+            Menu("普段を取り直す") {
+                ForEach(AnalysisModel.RestartPart.allCases) { p in
+                    Button(p.rawValue) { model.restart(p) }
+                }
+            }
+            .font(.caption)
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(!model.running)
         }
-        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+}
+
+/// 「いま」のタブの真ん中：いつもと違うことを文で大きく（種類の色で太く）。無ければ「いつも通りです」
+struct NowDifferences: View {
+    @ObservedObject var model: AnalysisModel
+    static let maxLines = 4
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("いつもと違うこと").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+            if model.comparing == nil, model.baselineSec != nil {
+                Label("普段を記録しています", systemImage: "hourglass").font(.title2.bold()).foregroundStyle(Palette.progress)
+                // 普段を記録している間も、普段と比べないもの（声が出た・目を閉じている）は出す
+                lines
+            } else if model.differences.isEmpty {
+                Text(model.faceReadable ? "いつも通りです" : "声は、いつも通りです")
+                    .font(.title.weight(.semibold)).foregroundStyle(Palette.face)
+                    .lineLimit(1).minimumScaleFactor(0.6)
+            } else {
+                lines
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.secondary.opacity(0.25)))
     }
 
-    /// 「顔：読めています・普段：記録しました」。保存した普段で比べているときは「顔：読めています・普段：保存した普段（10/28 15:10）」
+    @ViewBuilder private var lines: some View {
+        let all = LiveText.diffLines(model)
+        ForEach(Array(all.prefix(Self.maxLines)), id: \.text) {
+            DiffLineView(text: $0.text, target: $0.target, font: .title2.bold(), markerSize: 12)
+        }
+        if all.count > Self.maxLines {
+            Text("ほか\(all.count - Self.maxLines)件").font(.callout).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// 進み具合・声の補足（小さく。違いには数えない）。「いま」とデータの両方で使う
+struct LiveNotes: View {
+    @ObservedObject var model: AnalysisModel
+    var showOther = true   // 「声：本人以外の声が入っています」（「いま」では映像の上に出すので出さない）
+
+    var body: some View {
+        if model.running {
+            if model.baselineEyesClosedLong {   // 画面に出して取った普段の間に、目を閉じていた時間が長い（保存した普段で比べているときは出ない）
+                NoteLine(text: "普段の間に目を閉じていた時間が長いです（取り直せます）", icon: "eye.slash", color: Palette.eyes, font: .caption.bold(), lines: 2)
+            }
+            if let v = model.voiceSec {
+                NoteLine(text: "声の高さ：普段を集めています（本人の声 \(v)/\(Int(DiffCriteria.voiceBaselineS))秒）", icon: "hourglass", color: Palette.progress, lines: 2)
+                if model.voiceRetaking {   // 声の高さの範囲を外している（v1.9.3〜）
+                    NoteLine(text: "声の普段を集め直しています。この間は口の動きだけで本人の声を数えます", icon: "arrow.clockwise", color: Palette.progress, lines: 2)
+                }
+                if let w = model.voiceWait {   // 進み具合が3秒増えていないとき（v1.6.2〜）
+                    NoteLine(text: "声の普段が増えない理由：\(w)", icon: "info.circle", color: Palette.progress, font: .caption2, lines: 2)
+                }
+            }
+            if model.voiceSpreadWide, model.voiceSec == nil {   // 保存した声の普段で比べているとき（v1.9.1〜）
+                NoteLine(text: "声の普段のばらつきが大きいです（取り直せます）", icon: "waveform", color: Palette.voice, lines: 2)
+            }
+            if let n = model.speakerEnrollNote {   // 声の登録（v1.10.1〜）
+                NoteLine(text: n, icon: "person.wave.2", color: Palette.progress, lines: 3)
+            }
+            if showOther, model.otherVoice {
+                NoteLine(text: "声：本人以外の声が入っています", icon: "waveform", color: Palette.voice, font: .caption.weight(.semibold))
+            }
+        }
+    }
+}
+
+/// 画面の文（「いま」とデータで同じもの）
+@MainActor
+enum LiveText {
+    /// 「顔：読めています・普段：記録しました」。保存した普段で比べているときは「普段：保存した普段（10/28 15:10）」
     /// だけを出す（うしろで記録している今日の普段は出さない、v1.3〜）
-    private var statusText: String {
+    static func baseline(_ model: AnalysisModel) -> String {
         let face = !model.cameraActive ? "顔：–" : model.faceReadable ? "顔：読めています" : "顔：読めません"
         if model.comparing == .saved {
             let at = model.savedFromMs.map { PersonPickerView.date(Date(timeIntervalSince1970: Double($0) / 1000)) } ?? ""
@@ -90,94 +162,118 @@ struct NowPage: View {
         return "\(face)・普段：\(today)"
     }
 
-    private var differences: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if !model.running {
-                Text(PersonStore.shared.selected?.saved(for: (model.lensInUse ?? CameraLens.selected).rawValue) != nil
-                     ? "記録が始まると、保存した普段で比べ始めます（カメラが違うときは、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します）"
-                     : "記録が始まると、最初の\(Int(AnalysisModel.selectedBaselineSeconds))秒を「普段」として記録します")
-                    .font(.callout).foregroundStyle(Palette.progress).lineLimit(2).minimumScaleFactor(0.7)
-            } else if model.comparing == nil, let sec = model.baselineSec {
-                Label("普段を記録しています", systemImage: "hourglass").font(.title3.bold()).foregroundStyle(Palette.progress)
-                ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget)
-                    .tint(Palette.progress)
-                NoteLine(text: model.baselineWait ?? "落ち着いているときに。顔が映っている間だけ数えます", icon: "info.circle", color: Palette.progress)
-                eyesClosedNote
-                // 普段を記録している間も、普段と比べないもの（声が出た、v1.7〜）は出す
-                ForEach(Array(diffLines.prefix(Self.maxLines)), id: \.text) { DiffLineView(text: $0.text, target: $0.target, font: .callout.bold(), markerSize: 8) }
-            } else if model.differences.isEmpty {
-                Text(model.faceReadable ? "いつもと大きな違いはありません" : "声は、いつもと大きな違いはありません")
-                    .font(.title3.weight(.semibold)).foregroundStyle(Palette.face)
-                    .lineLimit(1).minimumScaleFactor(0.6)
-            } else {
-                // いつもとの違い（大事なもの）：メーターの点と同じ色の印と、種類の色の太い文字（v1.10.5〜）
-                ForEach(Array(diffLines.prefix(Self.maxLines)), id: \.text) { DiffLineView(text: $0.text, target: $0.target) }
-                if model.differences.count > Self.maxLines {
-                    Text("ほか\(model.differences.count - Self.maxLines)件").font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            if model.running, model.comparing == .today { eyesClosedNote }   // 画面に出して取った普段を、取り終えたあとも
-            voiceNote
-        }
-    }
-
     /// differences と、その種類（diffTargets、同じ順）
-    private var diffLines: [(text: String, target: DiffTarget?)] {
+    static func diffLines(_ model: AnalysisModel) -> [(text: String, target: DiffTarget?)] {
         model.differences.enumerated().map { ($0.element, $0.offset < model.diffTargets.count ? model.diffTargets[$0.offset] : nil) }
     }
+}
 
-    /// 声の普段を集めている間と、本人以外の声だけが入っているとき（v1.6〜。小さく出す。違いには数えない）。
-    /// v1.10.5〜：進み具合とその理由は青灰（理由はさらに小さく）、声のことは焦げ茶、それぞれ小さなアイコンを付ける
-    @ViewBuilder private var voiceNote: some View {
-        if model.running {
-            if let v = model.voiceSec {
-                NoteLine(text: "声の高さ：普段を集めています（本人の声 \(v)/\(Int(DiffCriteria.voiceBaselineS))秒）", icon: "hourglass", color: Palette.progress)
-                if model.voiceRetaking {   // 声の高さの範囲を外している（v1.9.3〜）
-                    NoteLine(text: "声の普段を集め直しています。この間は口の動きだけで本人の声を数えます", icon: "arrow.clockwise", color: Palette.progress, lines: 2)
+/// 「データ」のタブ（v1.11.3〜）：普段・顔の向き・本人の声の似ている度合い、指標ごとのずれのバー（数字付き）、直近60秒のグラフ、数字。
+/// 表示だけで、記録・判定・見る側に送るものは「いま」のタブと同じ
+struct DataTab: View {
+    @ObservedObject var model: AnalysisModel
+    @ObservedObject var graph: GraphStore
+
+    init(model: AnalysisModel) { self.model = model; self.graph = model.graph }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                section("普段") {
+                    NoteLine(text: LiveText.baseline(model), icon: "record.circle", color: Palette.face, font: .callout, lines: 2)
+                    if model.comparing == nil, let sec = model.baselineSec {
+                        ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget).tint(Palette.progress)
+                    }
+                    LiveNotes(model: model)
+                    Menu("普段を取り直す") {
+                        ForEach(AnalysisModel.RestartPart.allCases) { p in Button(p.rawValue) { model.restart(p) } }
+                    }
+                    .font(.callout).buttonStyle(.bordered).disabled(!model.running)
                 }
-                if let w = model.voiceWait {   // 進み具合が3秒増えていないとき（v1.6.2〜）
-                    NoteLine(text: "声の普段が増えない理由：\(w)", icon: "info.circle", color: Palette.progress, font: .caption2)
+                section("顔の向き") {
+                    Text(headText).font(.callout.weight(.medium)).foregroundStyle(Palette.head)
                 }
+                section("本人の声の似ている度合い（声紋）") { speaker }
+                section("指標ごとのずれ（帯＝いつもの範囲、点＝今）") { meters }
+                section("直近60秒") {
+                    GraphPage(graph: graph).frame(height: 230)
+                }
+                section("数字") { NumbersGrid(model: model) }
             }
-            if model.voiceSpreadWide, model.voiceSec == nil {   // 保存した声の普段で比べているとき（v1.9.1〜）
-                NoteLine(text: "声の普段のばらつきが大きいです（取り直せます）", icon: "waveform", color: Palette.voice)
-            }
-            if let n = model.speakerEnrollNote {   // 声の登録（v1.10.1〜）
-                NoteLine(text: n, icon: "person.wave.2", color: Palette.progress, lines: 2)
-            }
-            if model.otherVoice {
-                NoteLine(text: "声：本人以外の声が入っています", icon: "waveform", color: Palette.voice, font: .caption.weight(.semibold))
-            }
+            .padding(.vertical, 6)
         }
     }
 
-    /// 普段の間に目を閉じていた時間が、数えた時間の2割を超えたとき（保存した普段で比べながらうしろで取っている普段には出さない）
-    @ViewBuilder private var eyesClosedNote: some View {
-        if model.baselineEyesClosedLong {
-            NoteLine(text: "普段の間に目を閉じていた時間が長いです（取り直せます）", icon: "eye.slash", color: Palette.eyes, font: .caption.bold(), lines: 2)
+    private func section<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var headText: String {
+        guard model.cameraActive, let shape = model.faceShape else { return "顔の向き：読めません" }
+        return shape["yaw"] != nil ? "顔の向き：\(FaceSketch.directionText(shape))" : "顔の向き：–"
+    }
+
+    @ViewBuilder private var speaker: some View {
+        if let last = model.speakerLast {
+            // 本人とするのは、0.3 以上で、ほかに登録した人より 0.15 以上高いとき（ほかに登録した人がいなければ 0.45 以上。v1.11〜、SpeakerCriteria）
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
+                GridRow { Text("選んでいる人（直近）"); Text(String(format: "%.2f", last.score)).monospacedDigit().bold() }
+                GridRow {
+                    Text("ほかに登録した人でいちばん高い")
+                    Text(last.other.map { String(format: "%.2f", $0) } ?? "ほかに登録した人はいません").monospacedDigit()
+                }
+                GridRow { Text("その声の長さ"); Text(String(format: "%.1f秒", Double(last.windowMs) / 1000)).monospacedDigit() }
+            }
+            .font(.callout).foregroundStyle(Palette.voice)
+            Text(last.other == nil
+                 ? "本人とするのは \(String(format: "%.2f", SpeakerCriteria.selfThreshold)) 以上（1.5秒未満の声は使いません）"
+                 : "本人とするのは \(String(format: "%.2f", SpeakerCriteria.relMinScore)) 以上で、ほかに登録した人より \(String(format: "%.2f", SpeakerCriteria.relMargin)) 以上高いとき（1.5秒未満の声は使いません）")
+                .font(.caption).foregroundStyle(.secondary)
+        } else {
+            Text(model.otherVoiceBySpeaker ? "まだありません（声が出ると出ます）" : "記録する人の声の登録がないため、ありません（設定の「人」で登録できます）")
+                .font(.callout).foregroundStyle(.secondary)
         }
     }
 
-    /// 見る側の「いま」のメーターを小さくしたもの（縦1列6本。空いている高さに合わせて太くなる）。
-    /// いつもの範囲の帯と今の点、外れたらアンバー。顔が読めないときに薄くするのは表情の4本だけ（声の2本は普通の濃さ）
+    /// 指標ごとのずれのバー（見る側の「いま」と同じ描き方）と数字：ずれ（z）と、今の値（いつもの範囲）
     private var meters: some View {
-        VStack(spacing: 3) {
+        let last = graph.samples.last
+        return VStack(spacing: 8) {
             ForEach(Metric.allCases, id: \.self) { m in
-                HStack(spacing: 6) {
-                    Circle().fill(m.color).frame(width: 8, height: 8)
-                    Text(m.label).font(.footnote).lineLimit(1).minimumScaleFactor(0.7)
-                        .frame(width: 84, alignment: .leading)
-                    MeterTrack(z: model.meterZ[m], hasRange: model.baselineStats?[m] != nil,
-                               outside: model.diffMetrics[m] != nil)
-                        .frame(minHeight: 12, maxHeight: 26)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Circle().fill(m.color).frame(width: 9, height: 9)
+                        Text(m.label).font(.callout).lineLimit(1).minimumScaleFactor(0.7)
+                        Spacer()
+                        Text(model.meterZ[m].map { String(format: "ずれ %+.1f", $0) } ?? "ずれ –")
+                            .font(.callout.monospacedDigit().weight(model.diffMetrics[m] != nil ? .bold : .regular))
+                            .foregroundStyle(m.isFace ? Palette.face : Palette.voice)
+                    }
+                    MeterTrack(z: model.meterZ[m], hasRange: model.baselineStats?[m] != nil, outside: model.diffMetrics[m] != nil)
+                        .frame(height: 18)
+                    Text(valueLine(m, last)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
-                .frame(maxHeight: .infinity)
-                .opacity(m.isFace && !model.faceReadable ? 0.35 : 1)
+                .opacity(m.isFace && !model.faceReadable ? 0.4 : 1)
+                .accessibilityElement(children: .combine)
             }
+            Text("ずれは、今の値がいつもの平均から標準偏差の何倍離れているか（±2 の外が、いつもの範囲の外）").font(.caption2).foregroundStyle(.secondary)
         }
-        .frame(maxHeight: .infinity)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("指標ごとのメーター")
+    }
+
+    private func valueLine(_ m: Metric, _ s: GraphStore.Sample?) -> String {
+        var text = "今 \(s?.values[m].map(m.valueText) ?? "–")"
+        if let b = s?.baseline?[m] ?? model.baselineStats?[m] {
+            let r = m.valueBounds
+            let lo = min(max(b.mean - 2 * b.sd, r.lowerBound), r.upperBound), hi = min(max(b.mean + 2 * b.sd, r.lowerBound), r.upperBound)
+            text += "・いつもの範囲 \(m.valueText(lo))〜\(m.valueText(hi))"
+        } else {
+            text += "・いつもの範囲はまだありません"
+        }
+        return text
     }
 }
 
@@ -332,12 +428,12 @@ struct GraphPage: View {
     }
 }
 
-/// 3. 数字
-struct NumbersPage: View {
+/// 数字（データのタブの下。v1.11.2 までは「数字」のページ）
+struct NumbersGrid: View {
     @ObservedObject var model: AnalysisModel
 
     var body: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
             stat("顔が映っている割合", model.faceRatio.map { "\(Int($0 * 100))%" })
             stat("解析コマ/秒", model.fps.map { String(format: "%.1f", $0) })
             stat("解析時間 ms", model.procMs.map { String(format: "%.0f", $0) })
@@ -349,16 +445,7 @@ struct NumbersPage: View {
             stat("カメラ", model.lensInUse?.label)
             stat("探す顔の数", "\(model.maxFaces)")
             stat("解析できた割合（10秒）", model.analyzedRatio.map { "\(Int(($0 * 100).rounded()))%" })
-            if model.otherVoiceBySpeaker {   // 「本人以外の声」を声紋で決めているとき（v1.10.5〜）
-                // 本人とするのは、0.3 以上で、ほかに登録した人より 0.15 以上高いとき（ほかに登録した人がいなければ 0.45 以上。v1.11〜、SpeakerCriteria）
-                stat("選んでいる人との似ている度合い（直近）", model.speakerLast.map { String(format: "%.2f", $0.score) })
-                stat("ほかに登録した人でいちばん高い似ている度合い（本人は、これより \(String(format: "%.2f", SpeakerCriteria.relMargin)) 以上高く \(String(format: "%.2f", SpeakerCriteria.relMinScore)) 以上）",
-                     model.speakerLast.map { $0.other.map { String(format: "%.2f", $0) } ?? "ほかに登録した人はいません（本人は \(String(format: "%.2f", SpeakerCriteria.selfThreshold)) 以上）" })
-                stat("その声の長さ（1.5秒未満は使わない）", model.speakerLast.map { String(format: "%.1f秒", Double($0.windowMs) / 1000) })
-            }
         }
-        .padding(10)
-        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private func stat(_ label: String, _ value: String?) -> some View {

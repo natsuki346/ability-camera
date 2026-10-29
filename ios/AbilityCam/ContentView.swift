@@ -1,32 +1,38 @@
 import AVFoundation
 import SwiftUI
 
-/// 撮る側の「いま」：スクロールなしの1画面。小さい iPhone（SE の高さ）でも家族の印のボタンまで見える。
-/// 真ん中は横にスワイプして「いま」「グラフ」「数字」を切り替える（LivePages.swift）
+/// 撮る側の記録中の画面（v1.11.3〜）：上の切り替え（segmented）で「いま」と「データ」を選ぶ（前に開いていた方を覚える）。
+/// いま＝直感（小さい映像・いつもと違うこと・家族の印・場面）、データ＝数字とグラフ（LivePages.swift）。
+/// どちらを開いていても、記録・判定・見る側に送るものは同じ（表示だけの違い）。横スワイプのページ（いま／グラフ／数字）はやめた
 struct ContentView: View {
     @ObservedObject var model: AnalysisModel
     var openMenu: (() -> Void)?            // サイドバーを開く（iPad のサイドバーがあるときは nil）
     @State private var cameraLarge = false
     @State private var showSettings = false
-    @State private var middlePage = 0
+    @AppStorage("liveTab") private var tab = LiveTab.now.rawValue   // 前に開いていたタブ
     @State private var confirmEnd = false   // 「記録を終えますか？」（v1.11.2〜。記録中は人を変えない）
     @ObservedObject private var people = PersonStore.shared
-    @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
 
-    static let sketchSize: CGFloat = 140
-    static let dotsHeight: CGFloat = 26   // ページの点の分（中身と重ならないように）
 
     var body: some View {
         VStack(spacing: 8) {
-            topBar   // v1.11.2〜：前面カメラの帯は出さない（カメラは最初の画面で選び、記録中は変えない）
-            ViewersBar(link: model.link)
-            HStack(alignment: .top, spacing: 12) {
-                faceSketch
-                camera
+            topBar   // 前面カメラの帯は出さない（カメラは最初の画面か設定で選ぶ、v1.11.2〜）
+            Picker("表示", selection: $tab) {
+                ForEach(LiveTab.allCases) { Text($0.title).tag($0.rawValue) }
             }
-            middle
-            marks
-            scenes
+            .pickerStyle(.segmented)
+            ViewersBar(link: model.link)
+            if tab == LiveTab.data.rawValue {
+                DataTab(model: model)
+            } else {
+                HStack(alignment: .top, spacing: 10) {
+                    camera
+                    NowSide(model: model)
+                }
+                NowDifferences(model: model)
+                marks
+                scenes
+            }
         }
         .padding(.horizontal)
         .padding(.bottom, 8)
@@ -108,20 +114,6 @@ struct ContentView: View {
         return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
     }
 
-    /// 真ん中：横にスワイプして切り替えるページ（下にページの点）。グラフのページでは、グラフの外でスワイプする
-    private var middle: some View {
-        TabView(selection: $middlePage) {
-            NowPage(model: model).padding(.bottom, Self.dotsHeight).tag(0)
-            GraphPage(graph: model.graph).padding(.bottom, Self.dotsHeight).tag(1)
-            NumbersPage(model: model).padding(.bottom, Self.dotsHeight).tag(2)
-        }
-        .tabViewStyle(.page(indexDisplayMode: .always))
-        .indexViewStyle(.page(backgroundDisplayMode: .always))
-        .padding(.bottom, 2)
-        .frame(maxHeight: .infinity)
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
-    }
-
     /// 小さいカメラ映像（網目つき）。タップで大きく
     private var camera: some View {
         // 1つのカメラに映像の層は1つだけにする（大きく出している間は、こちらは黒）
@@ -130,13 +122,33 @@ struct ContentView: View {
                 // 網目は解析の遅れの分だけ映像より遅れて見える（即時性そのものなので、隠さない）
                 if model.meshEnabled, let mesh = model.mesh, !cameraLarge { MeshOverlay(mesh: mesh, fill: true) }
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: Self.sketchSize * 4 / 3 * 0.9)
+            .overlay(alignment: .topLeading) { cameraBadges.padding(5) }
+            .aspectRatio(3 / 4, contentMode: .fit)
+            .containerRelativeFrame(.horizontal) { w, _ in w * 0.48 }   // 画面幅の半分くらい（左上）
             .background(Color.black)
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .contentShape(Rectangle())
             .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { cameraLarge = true } }
             .accessibilityLabel("カメラ映像（タップで大きく）")
+    }
+
+    /// 映像の上に小さく：「顔：読めています」「声：本人／本人以外の声」（v1.11.3〜）
+    private var cameraBadges: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            badge(!model.cameraActive ? "顔：–" : model.faceReadable ? "顔：読めています" : "顔：読めません",
+                  icon: model.faceReadable ? "face.smiling" : "face.dashed", color: Palette.face)
+            badge(model.otherVoice ? "声：本人以外の声" : model.selfVoiceNow ? "声：本人" : "声：–",
+                  icon: "waveform", color: Palette.voice, strong: model.otherVoice)
+        }
+    }
+
+    private func badge(_ text: String, icon: String, color: Color, strong: Bool = false) -> some View {
+        Label(text, systemImage: icon)
+            .font(.caption2.weight(strong ? .bold : .semibold))
+            .foregroundStyle(color)
+            .lineLimit(1).minimumScaleFactor(0.7)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(.regularMaterial, in: Capsule())
     }
 
     /// 大きいカメラ映像。もう一度タップで戻る
@@ -156,35 +168,6 @@ struct ContentView: View {
         .contentShape(Rectangle())
         .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { cameraLarge = false } }
         .transition(.opacity)
-    }
-
-    /// 動きを写す顔の絵（映像と同じ見え方・同じ向き）。読めないときは灰色で中立
-    private var faceSketch: some View {
-        let shape = model.cameraActive ? model.faceShape : nil
-        let sketch = FaceSketch(shape: shape, size: Self.sketchSize, tone: sketchTone)
-        return VStack(spacing: 2) {
-            sketch
-                .contextMenu {   // 長押しで絵の色を選ぶ
-                    Picker("絵の色", selection: $sketchTone) {
-                        ForEach(SketchTone.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                }
-            Group {
-                if !model.cameraActive {
-                    Text(" ")
-                } else if let shape {
-                    Text(sketch.turnedAway ? "横向き：表情は参考程度"
-                         : shape["yaw"] != nil ? "顔の向き：\(FaceSketch.directionText(shape))" : " ")
-                        .foregroundStyle(Palette.head).fontWeight(.medium)   // 顔の向き（v1.10.5〜、藍）
-                } else {
-                    Text("読めません").foregroundStyle(.secondary)
-                }
-            }
-            .font(.caption)
-            .lineLimit(1)
-            .minimumScaleFactor(0.7)
-        }
-        .frame(width: Self.sketchSize)
     }
 
     /// 家族の印。介助しながら片手で押せる大きさ
@@ -229,6 +212,13 @@ struct ContentView: View {
         .disabled(!model.running)
         .opacity(model.running ? 1 : 0.5)
     }
+}
+
+/// 記録中の画面のタブ（v1.11.3〜）
+enum LiveTab: String, CaseIterable, Identifiable {
+    case now, data
+    var id: String { rawValue }
+    var title: String { self == .now ? "いま" : "データ" }
 }
 
 /// 見ている端末（だれが見ているか）と、見たいという申し込みの確認

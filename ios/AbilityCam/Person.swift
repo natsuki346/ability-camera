@@ -121,16 +121,27 @@ final class PersonStore: ObservableObject {
     /// 人を選んで記録を始めるのを待っている（開いたあと・記録を閉じたあと）。AnalysisModel が入れる。
     /// 初めから true（v1.11.2〜）：カメラの許可のダイアログなどで前に出る前も、記録中の画面ではなく最初の画面を出す
     @Published var awaitingPerson = true
-    /// この人で記録を始める。AnalysisModel が入れる
-    var onStartRecording: ((String) -> Void)?
+    /// この人で記録を始める（記録中なら閉じてから新しく。lens：カメラも変える）。AnalysisModel が入れる
+    var onStartRecording: ((String, CameraLens?) -> Void)?
 
     /// 人を選んだ：記録していなければその人で始める。記録中は人を変えない（v1.11.2〜。記録を終えてから選ぶ）。返り値：始めたか
     @discardableResult
     func choose(_ id: String) -> Bool {
         guard !inSession, people.contains(where: { $0.id == id }) else { return false }
         selectedID = id
-        onStartRecording?(id)
+        onStartRecording?(id, nil)
         return true
+    }
+
+    /// 設定で記録中に人かカメラを変えた：「いまの記録を閉じて、新しく始めますか？」で「はい」（v1.11.3〜）。今の記録を閉じて、新しい記録にする
+    func restartRecording(personID id: String? = nil, lens: CameraLens? = nil) {
+        guard let pid = id ?? selectedID, people.contains(where: { $0.id == pid }) else { return }
+        onStartRecording?(pid, lens)
+    }
+
+    static let restartQuestion = "いまの記録を閉じて、新しく始めますか？"
+    static func restartMessage(_ what: String) -> String {
+        "1本の記録には1人・1つのカメラです。いまの記録を閉じて要約し、\(what)で新しい記録を始めます"
     }
 
     /// 選んだ人の一覧の順：前回の人（selectedID）をいちばん上に
@@ -347,6 +358,7 @@ struct PersonEditView: View {
     @State private var askConsent = false          // 声の登録の前に、だれが同意したかを聞く（v1.10〜）
     @State private var consentName = ""
     @State private var speakerNote: String?
+    @State private var askRestart = false           // 「いまの記録を閉じて、新しく始めますか？」（v1.11.3〜）
     @AppStorage("speakerRecord") private var speakerRecord = false
     @Environment(\.dismiss) private var dismiss
 
@@ -383,20 +395,18 @@ struct PersonEditView: View {
         }
     }
 
-    /// 記録する人（v1.11〜）：記録していないときだけ選べる。記録中は「記録を終えてから選べます」（v1.11.2〜）
+    /// 記録する人（v1.11〜）：記録中にほかの人を選ぶと「いまの記録を閉じて、新しく始めますか？」と確かめる（v1.11.3〜。人を変えるのは設定と最初の画面だけ）
     @ViewBuilder private func recordSection(_ p: Person?) -> some View {
         Section {
-            if store.inSession {
-                if store.selectedID == id {
-                    Label("この人を記録しています", systemImage: "record.circle").foregroundStyle(Palette.face)
-                } else {
-                    Label("記録を終えてから選べます", systemImage: "info.circle").foregroundStyle(Palette.progress)
-                }
+            if store.inSession, store.selectedID == id {
+                Label("この人を記録しています", systemImage: "record.circle").foregroundStyle(Palette.face)
             } else if let p {
-                Button("この人で記録する") { store.choose(p.id) }
+                Button("この人で記録する") {
+                    if store.inSession { askRestart = true } else { store.choose(p.id) }
+                }
             }
         } header: { Text("記録する人") } footer: {
-            Text("1本の記録には1人だけです。記録中は人を変えません（上の「記録中」を押して記録を終えてから選びます）。名前を変える・声を登録する・普段を取り直すは、記録中もできます")
+            Text("1本の記録には1人だけです。記録中にほかの人にすると、いまの記録を閉じて、その人で新しい記録を始めます。名前を変える・声を登録する・普段を取り直すは、記録中もできます（記録する人は変わりません）")
         }
     }
 
@@ -465,6 +475,12 @@ struct PersonEditView: View {
                     Button("この人を消す") { confirmDelete = true }
                 }
             }
+        }
+        .alert(PersonStore.restartQuestion, isPresented: $askRestart) {
+            Button("はい") { store.restartRecording(personID: id) }
+            Button("いいえ", role: .cancel) {}
+        } message: {
+            Text(PersonStore.restartMessage(p?.displayName ?? ""))
         }
         .alert("声の登録", isPresented: $askConsent) {
             TextField("同意した人の名前", text: $consentName)

@@ -1806,17 +1806,38 @@ class StartScreenTest(unittest.TestCase):
         self.assertIn("記録を終える", cv)
         self.assertNotIn("PersonPickerView()", cv)
         self.assertNotIn("前面カメラ（試す用）", cv)
-        self.assertIn("記録を終えてから選べます", person)
-        self.assertIn(".disabled(people.inSession)", settings)
-        for src_ in (cv, person, guide):
-            self.assertNotIn("新しく始めますか？」（「はい」", src_)
-        self.assertNotIn("switchRecording", person)
-        for w in ("記録を終えますか？", "記録を終えてから選べます"):
-            self.assertIn(w, guide)
+        # 設定で記録中に人・カメラを変えたら、確かめて新しく始める（v1.11.3〜）
+        self.assertIn("いまの記録を閉じて、新しく始めますか？", person)
+        self.assertIn("restartRecording(personID: id)", person)
+        self.assertIn("restartRecording(lens:", settings)
+        self.assertIn("いまの記録を閉じて、新しく始めますか？", guide)
+        self.assertIn("記録を終えますか？", guide)
         self.assertGreaterEqual(min(int(x) for x in re.findall(r"minHeight: (?:large \? \d+ : )?(\d+)", src)), 44)
         for n in (0, 1, 3):
             for mode in ("light", "dark"):
                 self.assertTrue((root / "docs" / "screenshots" / f"start-{n}people_{mode}.png").exists())
+
+    def test_live_tabs(self):
+        """記録中の画面（v1.11.3〜）：「いま」と「データ」を segmented で切り替え、前のタブを覚える。横スワイプのページは無い"""
+        root = review.HERE.parent
+        app = root / "ios" / "AbilityCam"
+        cv = (app / "ContentView.swift").read_text(encoding="utf-8")
+        live = (app / "LivePages.swift").read_text(encoding="utf-8")
+        guide = (root / "docs" / "wording-guide.md").read_text(encoding="utf-8")
+        self.assertIn(".pickerStyle(.segmented)", cv)
+        self.assertIn('@AppStorage("liveTab")', cv)
+        self.assertNotIn(".tabViewStyle(.page", cv)
+        self.assertNotIn("FaceSketch(", cv)                     # いま：顔の絵は出さない
+        self.assertNotIn("MeterTrack(", cv)                     # いま：メーターは出さない（データだけ）
+        self.assertIn("MeterTrack(", live)
+        self.assertIn("GraphPage(graph: graph)", live)
+        for w in ("いつも通りです", "いつもと違うこと", "声：本人以外の声", "声：本人"):
+            self.assertIn(w, live + cv)
+        for w in ("いつも通りです", "声：本人以外の声", "「いま」", "「データ」"):
+            self.assertIn(w, guide)
+        for tab in ("now", "data"):
+            for mode in ("light", "dark"):
+                self.assertTrue((root / "docs" / "screenshots" / f"recording-{tab}_{mode}.png").exists())
 
 
 class PaletteTest(unittest.TestCase):

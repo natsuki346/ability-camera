@@ -73,6 +73,7 @@ struct SettingsView: View {
     @AppStorage(SpeakerSettings.qosKey) private var speakerQoS = "utility"                       // 確かめる用（v1.10.3〜）
     @AppStorage(SpeakerSettings.unitsKey) private var speakerUnits = "cpuAndNeuralEngine"
     @State private var speakerDevOpen = false
+    @State private var pendingLens: CameraLens?   // 記録中に選んだカメラ（確かめてから、閉じて新しく始める。v1.11.3〜）
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -93,20 +94,18 @@ struct SettingsView: View {
                 }
                 if link != nil {
                     Section {
-                        Picker("カメラ", selection: $cameraLens) {
+                        // 記録中に変えたときは「いまの記録を閉じて、新しく始めますか？」（v1.11.3〜。1本の記録には1つのカメラ）
+                        Picker("カメラ", selection: Binding(get: { cameraLens }, set: { v in
+                            if people.inSession, v != cameraLens { pendingLens = CameraLens(rawValue: v) } else { cameraLens = v }
+                        })) {
                             ForEach(CameraLens.allCases) { l in
                                 Text(l.available ? l.label : "\(l.label)（この端末にはありません）").tag(l.rawValue)
                                     .disabled(!l.available)
                             }
                         }
                         .pickerStyle(.segmented)
-                        .disabled(people.inSession)   // 記録中は変えない（v1.11.2〜。最初の画面かここで、記録を始める前に選ぶ）
-                        if people.inSession {
-                            Label("記録中は変えられません。記録を終えてから選べます", systemImage: "info.circle")
-                                .font(.callout).foregroundStyle(Palette.progress)
-                        }
                     } header: { Text("カメラ") } footer: {
-                        Text("記録を始める前に、最初の画面（だれを記録しますか）の下の「カメラ」か、ここで選びます。初めは広角。超広角は広く映るので顔が画面から外れにくくなりますが、画角の端では顔が歪み、表情の数値が変わることがあります。前面は自分の顔で試すためのもので、胸に着けて使うのは背面です（前面でも左右は背面と同じ意味になるよう、反転せずに解析します）。使ったカメラは記録の先頭に書きます。保存した普段は、同じカメラのときだけ使います")
+                        Text("最初の画面（だれを記録しますか）の下の「カメラ」か、ここで選びます。記録中に変えると、いまの記録を閉じて、新しい記録を始めます（確かめてから）。初めは広角。超広角は広く映るので顔が画面から外れにくくなりますが、画角の端では顔が歪み、表情の数値が変わることがあります。前面は自分の顔で試すためのもので、胸に着けて使うのは背面です（前面でも左右は背面と同じ意味になるよう、反転せずに解析します）。使ったカメラは記録の先頭に書きます。保存した普段は、同じカメラのときだけ使います")
                     }
                     Section {
                         Picker("普段の長さ", selection: $baselineSeconds) {
@@ -175,6 +174,15 @@ struct SettingsView: View {
             }
             .navigationTitle("設定")
             .onAppear { allowed = AllowedViewers.all() }
+            .alert(PersonStore.restartQuestion, isPresented: Binding(get: { pendingLens != nil }, set: { if !$0 { pendingLens = nil } })) {
+                Button("はい") {
+                    if let l = pendingLens { people.restartRecording(lens: l) }
+                    pendingLens = nil
+                }
+                Button("いいえ", role: .cancel) { pendingLens = nil }
+            } message: {
+                Text(PersonStore.restartMessage("\(pendingLens?.label ?? "")のカメラ"))
+            }
             .toolbar {
                 if inSidebar {
                     MenuToolbar(openMenu: openMenu)

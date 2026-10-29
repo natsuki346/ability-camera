@@ -1388,6 +1388,33 @@ def candidates(a: Analysis) -> list[Candidate]:
 
 # ---------------------------------------------------------------- 記録の質
 
+def speaker_self_id(rec: Recording) -> str | None:
+    """選んでいる人（本人）の id：ヘッダの person_id、無ければ speaker_enrolled の role self"""
+    pid = rec.header.get("person_id")
+    if pid:
+        return pid
+    return next((x.get("id") for x in rec.header.get("speaker_enrolled") or [] if x.get("role") == "self"), None)
+
+
+def speaker_self_rel(rec: Recording, row: dict, c: dict | None) -> bool | None:
+    """声紋で本人の声か・比べる決め方（self_by_speaker_rel、v1.11〜）。選んでいる人の似ている度合いが rel_min_score 以上で、
+    ほかに登録した人のいちばん高い似ている度合いより rel_margin 以上高ければ True。ほかに登録した人がいなければ self_threshold 以上で True。
+    選んでいる人の登録が無ければ None。記録に書いてあればそれを使い、書いていない記録（v1.11 より前）は行の scores から決め直す"""
+    if "self_by_speaker_rel" in row:
+        return row["self_by_speaker_rel"]
+    sp = (c or {}).get("speaker") or {}
+    me, scores = speaker_self_id(rec), row.get("scores") or {}
+    if me is None or me not in scores:
+        return None
+    s = float(scores[me])
+    others = [float(v) for k, v in scores.items() if k != me]
+    if not others:
+        return s >= float(rec.header.get("speaker_self_threshold", sp.get("self_threshold", 0.45))) - 1e-9
+    lo = float(rec.header.get("speaker_rel_min_score", sp.get("rel_min_score", 0.3)))
+    margin = float(rec.header.get("speaker_rel_margin", sp.get("rel_margin", 0.15)))
+    return s >= lo - 1e-9 and s - max(others) >= margin - 1e-9
+
+
 def quality(a: Analysis, calm: bool) -> dict:
     rec, t, c = a.rec, a.rec.t, a.criteria
     dt = frame_dt(t)
@@ -1461,6 +1488,13 @@ def quality(a: Analysis, calm: bool) -> dict:
         q["speaker_self"] = {"all": (sum(v is True for v, _ in sb), sum(v is False for v, _ in sb), sum(v is None for v, _ in sb)),
                              "long": (sum(v is True for v, lg in sb if lg), sum(v is False for v, lg in sb if lg)),
                              "threshold": rec.header.get("speaker_self_threshold")} if sb else None
+        rel = [(speaker_self_rel(rec, r, c), r.get("window_ms", 0) >= 1500) for r in rec.speaker]   # v1.11〜（前の記録は scores から決め直す）
+        rel = [(v, lg) for v, lg in rel if v is not None]
+        q["speaker_self_rel"] = {"all": (sum(v is True for v, _ in rel), sum(v is False for v, _ in rel)),
+                                 "long": (sum(v is True for v, lg in rel if lg), sum(v is False for v, lg in rel if lg)),
+                                 "recorded": any("self_by_speaker_rel" in r for r in rec.speaker),
+                                 "min": rec.header.get("speaker_rel_min_score", (c.get("speaker") or {}).get("rel_min_score")),
+                                 "margin": rec.header.get("speaker_rel_margin", (c.get("speaker") or {}).get("rel_margin"))} if rel else None
         q["speaker"] = {"n": len(rec.speaker), "short": int((win < 1500).sum()), "win": tuple(np.percentile(win, [10, 50, 90])),
                         "f0_ratio": tuple(np.percentile(f0r, [10, 50, 90])) if len(f0r) else None,
                         "f0_none": int((f0r == 0).sum()),
@@ -1978,6 +2012,12 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
             qrows.append([f"声紋で本人の声か（self_by_speaker、v1.10.5〜。選んでいる人の似ている度合い ≥ {ss['threshold']}。判定には使わない）",
                           f"全部の行：本人 {ss['all'][0]}・本人でない {ss['all'][1]}・登録なし {ss['all'][2]}。"
                           f"使った声が1.5秒以上の行：本人 {ss['long'][0]}・本人でない {ss['long'][1]}"])
+        if q.get("speaker_self_rel"):
+            sr = q["speaker_self_rel"]
+            qrows.append([f"声紋で本人の声か・ほかに登録した人と比べる（self_by_speaker_rel、v1.11〜。似ている度合い ≥ {sr['min']} で、ほかに登録した人より {sr['margin']} 以上高い。"
+                          f"ほかに登録した人がいなければ ≥ {ss['threshold'] if q.get('speaker_self') else 0.45}。「本人以外の声」に使う。"
+                          + ("記録に書いてあるもの" if sr["recorded"] else "記録に無いので、似ている度合いから決め直したもの") + "）",
+                          f"全部の行：本人 {sr['all'][0]}・本人でない {sr['all'][1]}。使った声が1.5秒以上の行：本人 {sr['long'][0]}・本人でない {sr['long'][1]}"])
         cl = {"voice_self": "本人の声とされた時間だけ", "voiced": "声が出ている時間すべて", None: "集めたものが書かれていない"}
         for k, v in sp.get("enroll", {}).items():
             qrows.append([f"声の登録の途中 {k[:8]}（{cl.get(v['collect'], v['collect'])}。たまった秒数：その時点までの登録と最新の声の似ている度合い）",

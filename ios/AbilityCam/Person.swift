@@ -104,6 +104,40 @@ final class PersonStore: ObservableObject {
 
     var selected: Person? { people.first { $0.id == selectedID } }
 
+    // MARK: 記録する人（v1.11〜：開いたら人を選んでから記録を始める。1本の記録には1人だけ）
+
+    /// 記録している（ファイルが開いている）か。AnalysisModel が入れる
+    @Published var inSession = false
+    /// 人を選んで記録を始めるのを待っている（開いたあと・記録を閉じたあと）。AnalysisModel が入れる
+    @Published var awaitingPerson = false
+    /// この人で記録を始める（記録中なら、今の記録を閉じてから新しく始める）。AnalysisModel が入れる
+    var onStartRecording: ((String) -> Void)?
+
+    enum ChooseResult { case started, same, needsConfirm }
+
+    /// 人を選んだ：記録していなければその人で始める。記録中でほかの人なら、閉じて新しく始めるかを聞く（呼んだ画面が聞く）
+    func choose(_ id: String) -> ChooseResult {
+        if inSession {
+            return id == selectedID ? .same : .needsConfirm
+        }
+        selectedID = id
+        onStartRecording?(id)
+        return .started
+    }
+
+    /// 「いまの記録を閉じて、〇〇で新しく始めますか？」で「はい」
+    func switchRecording(to id: String) {
+        guard people.contains(where: { $0.id == id }) else { return }
+        onStartRecording?(id)   // 今の記録を閉じてから selectedID を変える（AnalysisModel）
+    }
+
+    /// 選んだ人の一覧の順：前回の人（selectedID）をいちばん上に
+    var chooseOrder: [Person] {
+        people.filter { $0.id == selectedID } + people.filter { $0.id != selectedID }
+    }
+
+    static func switchQuestion(_ name: String) -> String { "いまの記録を閉じて、\(name)で新しく始めますか？" }
+
     /// 記録中にその場で声の普段を集め直している人（v1.9.2〜。設定の「人」に「声の普段を集め直しています」と出す）
     @Published var voiceRestarting: String?
     /// 撮る側が、記録中ならその場で声の普段を集め直し始める（始めたら true）。AnalysisModel が入れる
@@ -230,56 +264,132 @@ final class PersonStore: ObservableObject {
         save()
     }
 
+    /// 記録している人を消すときは、先に記録を閉じる（呼ぶ側。onCloseRecording）
+    var onCloseRecording: (() -> Void)?
+
     func remove(_ id: String) {
+        if inSession, selectedID == id { onCloseRecording?() }   // 1本の記録には1人だけ：記録している人を消したら、記録を閉じて人を選び直す
         people.removeAll { $0.id == id }
         if selectedID == id { selectedID = nil }
         save()
     }
 }
 
-/// 上の帯をタップしたときの「人を選ぶ」
+/// 上の帯をタップしたときの「記録する人を変える」（v1.11〜。記録中にほかの人を選ぶと、今の記録を閉じて新しく始めるかを聞く）
 struct PersonPickerView: View {
-    @ObservedObject var store = PersonStore.shared
     @Environment(\.dismiss) private var dismiss
-    @State private var newName = ""
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    Button { store.selectedID = nil; dismiss() } label: { row("人を選ばない", selected: store.selectedID == nil) }
-                    ForEach(store.people) { p in
-                        Button { store.selectedID = p.id; dismiss() } label: {
-                            row(p.displayName, detail: Self.savedSummary(p),
-                                selected: store.selectedID == p.id)
-                        }
-                    }
-                } footer: {
-                    Text("選んだ人の普段を、この端末の中にだけ保存します（数値だけ。映像・顔の形は保存しません）。名前は記録のファイルにも見る側にも送りません。名前を変える・消すは設定から")
+            PersonChooseList(onDone: { dismiss() })
+                .navigationTitle("記録する人")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("閉じる") { dismiss() } } }
+        }
+    }
+}
+
+/// 撮る側を開いたとき（記録していないとき）の「だれを記録しますか」（v1.11〜）。人を選ぶと、その人で記録を始める
+struct PersonStartView: View {
+    let openMenu: (() -> Void)?
+    var note: String?   // 記録を始められなかった理由
+
+    var body: some View {
+        NavigationStack {
+            PersonChooseList(note: note)
+                .navigationTitle("だれを記録しますか")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { MenuToolbar(openMenu: openMenu) }
+        }
+    }
+}
+
+/// 人の一覧（前回の人がいちばん上）と「人を足す」。選んだら記録を始める（記録中なら、閉じて新しく始めるかを聞く）
+struct PersonChooseList: View {
+    @ObservedObject var store = PersonStore.shared
+    var note: String?
+    var onDone: () -> Void = {}
+    @State private var newName = ""
+    @State private var switchTo: Person?
+
+    var body: some View {
+        List {
+            if let note {
+                Section { Label(note, systemImage: "info.circle").font(.callout).foregroundStyle(Palette.progress) }
+            }
+            Section {
+                if store.people.isEmpty {
+                    Text("まだ人がいません。下の「人を足す」で名前を入れてください").foregroundStyle(.secondary)
                 }
-                Section("人を足す") {
-                    HStack {
-                        TextField("名前（例 姉）", text: $newName)
-                        Button("足す") {
-                            let p = store.add(name: newName)
-                            store.selectedID = p.id
-                            newName = ""
-                            dismiss()
-                        }
-                        .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
+                ForEach(store.chooseOrder) { p in
+                    Button { pick(p.id) } label: {
+                        PersonPickerView.row(p.displayName, tag: Self.tag(p, store), detail: PersonPickerView.savedSummary(p),
+                                             selected: store.inSession && store.selectedID == p.id)
                     }
+                }
+            } header: {
+                Text(store.inSession ? "記録する人" : "人")
+            } footer: {
+                Text(store.inSession
+                     ? "ほかの人を選ぶと、いまの記録を閉じて、その人で新しい記録を始めます（1本の記録には1人だけ）。"
+                     : "人を選ぶと、その人で記録を始めます。1本の記録には1人だけです。")
+                + Text("選んだ人の普段を、この端末の中にだけ保存します（数値だけ。映像・顔の形は保存しません）。名前は記録のファイルには書きません（見る側には、記録している人の名前を出します）。名前を変える・消すは設定から")
+            }
+            Section("人を足す") {
+                HStack {
+                    TextField("名前（例 姉）", text: $newName)
+                    Button(store.inSession ? "足す" : "足して記録する") {
+                        let p = store.add(name: newName)
+                        newName = ""
+                        pick(p.id)
+                    }
+                    .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
-            .navigationTitle("人を選ぶ")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("閉じる") { dismiss() } } }
+        }
+        .personSwitchAlert($switchTo, onDone: onDone)
+    }
+
+    private func pick(_ id: String) {
+        switch store.choose(id) {
+        case .started, .same: onDone()
+        case .needsConfirm: switchTo = store.people.first { $0.id == id }
         }
     }
 
-    private func row(_ title: String, detail: String? = nil, selected: Bool) -> some View {
+    /// 行の右上の小さな印：「記録している人」「前回」
+    static func tag(_ p: Person, _ store: PersonStore) -> String? {
+        guard store.selectedID == p.id else { return nil }
+        return store.inSession ? "記録している人" : "前回"
+    }
+}
+
+extension View {
+    /// 「いまの記録を閉じて、〇〇で新しく始めますか？」（v1.11〜。上の帯の一覧・設定の「人」で同じもの）
+    func personSwitchAlert(_ target: Binding<Person?>, onDone: @escaping () -> Void = {}) -> some View {
+        alert(PersonStore.switchQuestion(target.wrappedValue?.displayName ?? ""),
+              isPresented: Binding(get: { target.wrappedValue != nil }, set: { if !$0 { target.wrappedValue = nil } }),
+              presenting: target.wrappedValue) { p in
+            Button("はい") { PersonStore.shared.switchRecording(to: p.id); target.wrappedValue = nil; onDone() }
+            Button("いいえ", role: .cancel) { target.wrappedValue = nil }
+        } message: { p in
+            Text("いまの記録を閉じて要約し、\(p.displayName)の新しい記録を始めます。1本の記録には1人だけです")
+        }
+    }
+}
+
+extension PersonPickerView {
+    static func row(_ title: String, tag: String? = nil, detail: String? = nil, selected: Bool) -> some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).foregroundStyle(.primary)
+                HStack(spacing: 6) {
+                    Text(title).foregroundStyle(.primary)
+                    if let tag {
+                        Text(tag).font(.caption2.bold()).foregroundStyle(Palette.face)
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(ContentView.paleSlate.opacity(0.6), in: Capsule())
+                    }
+                }
                 if let detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
             }
             Spacer()
@@ -310,11 +420,7 @@ struct PeopleSettingsSection: View {
         Section {
             ForEach(store.people) { p in
                 NavigationLink { PersonEditView(id: p.id) } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(p.displayName)
-                        Text(PersonPickerView.savedSummary(p))
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
+                    PersonPickerView.row(p.displayName, tag: PersonChooseList.tag(p, store), detail: PersonPickerView.savedSummary(p), selected: false)
                 }
             }
             HStack {
@@ -323,7 +429,7 @@ struct PeopleSettingsSection: View {
                     .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         } header: { Text("人") } footer: {
-            Text("人ごとに、普段の数値（指標ごとの n・平均・標準偏差、普段の長さ、保存した日時、顔の位置と大きさ）だけをこの端末に保存します。表情の普段はカメラ（広角・超広角・前面）ごとに1つずつ、声の普段はどのカメラでも使う1つです。名前は外に送りません")
+            Text("人ごとに、普段の数値（指標ごとの n・平均・標準偏差、普段の長さ、保存した日時、顔の位置と大きさ）だけをこの端末に保存します。表情の普段はカメラ（広角・超広角・前面）ごとに1つずつ、声の普段はどのカメラでも使う1つです。名前は記録のファイルには書かず（記録には id だけ）、見る側に記録している人の名前だけを送ります。人ごとの画面の「この人で記録する」で、記録する人を変えられます")
         }
     }
 }
@@ -336,6 +442,7 @@ struct PersonEditView: View {
     @State private var askConsent = false          // 声の登録の前に、だれが同意したかを聞く（v1.10〜）
     @State private var consentName = ""
     @State private var speakerNote: String?
+    @State private var switchTo: Person?            // 「いまの記録を閉じて、〇〇で新しく始めますか？」（v1.11〜）
     @AppStorage("speakerRecord") private var speakerRecord = false
     @Environment(\.dismiss) private var dismiss
 
@@ -369,6 +476,24 @@ struct PersonEditView: View {
             if !speakerRecord { Text("設定の「話者の区別を記録する」がオフのあいだは、集めず、記録にも書きません").font(.caption).foregroundStyle(.secondary) }
         } header: { Text("声の登録（話者の区別・記録に書くだけ）") } footer: {
             Text("記録しているときに、この人がひとりで話している間に押してください。声が\(target)秒たまると登録します（取り直すときは、たまるまで今の登録を残します）。声の特徴の数値はこの端末の中だけに置き、記録にはだれの声か分けるための似ている度合いだけを書きます。本人確認・認証には使いません")
+        }
+    }
+
+    /// 記録する人（v1.11〜）：記録中にほかの人を選ぶと、上の帯の一覧と同じく、今の記録を閉じて新しく始めるかを聞く
+    @ViewBuilder private func recordSection(_ p: Person?) -> some View {
+        Section {
+            if store.selectedID == id, store.inSession {
+                Label("この人を記録しています", systemImage: "record.circle").foregroundStyle(Palette.face)
+            } else if let p {
+                Button("この人で記録する") {
+                    switch store.choose(p.id) {
+                    case .needsConfirm: switchTo = p
+                    case .started, .same: break
+                    }
+                }
+            }
+        } header: { Text("記録する人") } footer: {
+            Text("1本の記録には1人だけです。記録中にほかの人にすると、いまの記録を閉じて、その人で新しい記録を始めます。声の登録は、記録する人を変えずにできます（下の「声を登録する」）")
         }
     }
 
@@ -428,11 +553,13 @@ struct PersonEditView: View {
             } header: { Text("保存した声の普段（どのカメラでも使う）") } footer: {
                 Text("「取り直す」と、記録中でこの人を選んでいればその場で、そうでなければ次に記録を始めたときから声の普段を集め直します。本人の声が10秒たまって保存し直すまで、今の声の普段は残します（途中で閉じたら今の声の普段のまま）")
             }
+            recordSection(p)
             speakerSection(p)
             Section {
                 Button("この人を消す") { confirmDelete = true }
             }
         }
+        .personSwitchAlert($switchTo)
         .alert("声の登録", isPresented: $askConsent) {
             TextField("同意した人の名前", text: $consentName)
             Button("同意して集める") {
@@ -450,7 +577,7 @@ struct PersonEditView: View {
             Button("消す") { store.remove(id); dismiss() }
             Button("やめる", role: .cancel) {}
         } message: {
-            Text("記録のファイルは消えません")
+            Text(store.inSession && store.selectedID == id ? "この人を記録しているので、いまの記録を閉じます。記録のファイルは消えません" : "記録のファイルは消えません")
         }
     }
 }

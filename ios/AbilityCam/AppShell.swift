@@ -121,6 +121,7 @@ struct MenuToolbar: ToolbarContent {
 /// 撮る側：記録は「いま」の画面がどこにあっても続ける（開いている間は記録する）
 struct CameraShell: View {
     @StateObject private var model = AnalysisModel()
+    @ObservedObject private var people = PersonStore.shared
     @State private var page = SidebarPage.now
     @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
     @AppStorage("baselineSeconds") private var baselineSeconds = AnalysisModel.defaultBaselineSeconds
@@ -129,7 +130,13 @@ struct CameraShell: View {
     var body: some View {
         SidebarShell(pages: [.now, .history, .settings], page: $page) { p, menu in
             switch p {
-            case .now: ContentView(model: model, openMenu: menu)
+            case .now:
+                // 開いたら、人を選んでから記録を始める（v1.11〜）
+                if people.awaitingPerson && !model.running {
+                    PersonStartView(openMenu: menu, note: model.startNote)
+                } else {
+                    ContentView(model: model, openMenu: menu)
+                }
             case .history: CameraHistoryView(sessions: model.sessions, openMenu: menu)
             case .settings: SettingsView(link: model.link, inSidebar: true, openMenu: menu)
             }

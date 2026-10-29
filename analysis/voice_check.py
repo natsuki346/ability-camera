@@ -19,6 +19,8 @@
 v1.10.5〜：記録に話者の区別の行（type: "speaker"、self_by_speaker）があれば、渡した区間ごとに
   voice_self で本人の割合（記録の voice_self。声が出ていたコマのうち true）と、
   self_by_speaker で本人の割合（全部／使った声が 1.5秒以上の行だけ）を並べた表も出す
+v1.11〜：self_by_speaker_rel（ほかに登録した人と比べる決め方。「本人以外の声」に使う）の割合も並べる。
+  v1.11 より前の記録（self_by_speaker_rel が無い）は、行の scores とヘッダの選んでいる人から決め直す
 """
 from __future__ import annotations
 
@@ -116,8 +118,8 @@ def report(rec, c, lab) -> list[list[str]]:
     return rows
 
 
-def speaker_table(rec: review.Recording, args, short_ms: int = 1500) -> list[list[str]]:
-    """区間ごとに、voice_self と self_by_speaker（声紋）で本人とした割合（v1.10.5〜）"""
+def speaker_table(rec: review.Recording, args, short_ms: int = 1500, c: dict | None = None) -> list[list[str]]:
+    """区間ごとに、voice_self と self_by_speaker（声紋、0.45）・self_by_speaker_rel（ほかに登録した人と比べる、v1.11〜）で本人とした割合（v1.10.5〜）"""
     t0 = float(rec.t[0])
     vs = rec.voice_self_rec
     rows = []
@@ -132,7 +134,10 @@ def speaker_table(rec: review.Recording, args, short_ms: int = 1500) -> list[lis
             long_ = [r for r in sp if r.get("window_ms", 0) >= short_ms]
             rows.append([f"{kind} {s}", pct(int((v == 1).sum()), len(v)),
                          pct(sum(r["self_by_speaker"] is True for r in sp), len(sp)),
-                         pct(sum(r["self_by_speaker"] is True for r in long_), len(long_))])
+                         pct(sum(r["self_by_speaker"] is True for r in long_), len(long_))]
+                        + [pct(sum(v is True for v in rel), len(rel))
+                           for rel in ([x for x in (review.speaker_self_rel(rec, r, c) for r in rows_) if x is not None]
+                                       for rows_ in (sp, long_))])
     return rows
 
 
@@ -166,10 +171,14 @@ def main(argv=None) -> int:
     for r in report(rec, c, lab):
         print("\t".join(r))
     if any(r.get("self_by_speaker") is not None for r in rec.speaker):
-        th = (c.get("speaker") or {}).get("self_threshold")
-        print(f"\n区間ごと：voice_self と声紋（self_by_speaker、選んでいる人の似ている度合い ≥ {th}）で本人とした割合")
-        print("区間\tvoice_self で本人（声のコマ）\tself_by_speaker で本人（全部の行）\tself_by_speaker で本人（1.5秒以上の行）")
-        for r in speaker_table(rec, args, int((c.get("speaker") or {}).get("short_window_ms", 1500))):
+        sc = c.get("speaker") or {}
+        print(f"\n区間ごと：voice_self と声紋（self_by_speaker：選んでいる人の似ている度合い ≥ {sc.get('self_threshold')}。"
+              f"self_by_speaker_rel：≥ {sc.get('rel_min_score')} で、ほかに登録した人より {sc.get('rel_margin')} 以上高い）で本人とした割合")
+        if not any("self_by_speaker_rel" in r for r in rec.speaker):
+            print("（self_by_speaker_rel は記録に無いので、行の似ている度合いとヘッダの選んでいる人から決め直した）")
+        print("区間\tvoice_self で本人（声のコマ）\tself_by_speaker で本人（全部の行）\tself_by_speaker で本人（1.5秒以上の行）"
+              "\tself_by_speaker_rel で本人（全部の行）\tself_by_speaker_rel で本人（1.5秒以上の行）")
+        for r in speaker_table(rec, args, int(sc.get("short_window_ms", 1500)), c):
             print("\t".join(r))
     return 0
 

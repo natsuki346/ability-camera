@@ -38,6 +38,7 @@ struct LiveState: Codable {
     var directionVersion: Int?        // 顔の向きの左右（v1.7.1〜は 2：本人から見て。古い撮る側は nil で、見る側が入れ替える）
     var voiceOn: Bool?                // 声が出た（v1.7〜）：本人の声のまとまりが続いているか（記録していない・古い撮る側では nil）。秒数は diffs の voice_on
     var voiceWait: String?            // 声の普段の進み具合が増えない理由（「声の高さが取れていません」など。集めていない・古い撮る側では nil）
+    var personName: String? = nil     // 記録している人の名前（v1.11〜。記録していない・古い撮る側では nil。記録のファイルには書かない）
 }
 
 /// いつもとの違い1つ

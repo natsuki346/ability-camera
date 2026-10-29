@@ -47,7 +47,7 @@ final class AnalysisModel: ObservableObject {
     @Published var voiceSec: Int?             // 声の普段を集めている：本人の声の秒数（画面に出すときだけ。v1.6〜）
     @Published var otherVoice = false         // 本人以外の声（と言えない声）だけが入っている（直近1秒）
     @Published var otherVoiceBySpeaker = false   // 「本人以外の声」を声紋で決めている（選んでいる人の声の登録があるとき、v1.10.5〜）
-    @Published var speakerLast: (score: Double, windowMs: Int)?   // 「数字」：選んでいる人との直近の似ている度合いと、使った声の長さ（v1.10.5〜）
+    @Published var speakerLast: (score: Double, other: Double?, windowMs: Int)?   // 「数字」：選んでいる人との直近の似ている度合い・ほかに登録した人のいちばん高い似ている度合い（v1.11〜）・使った声の長さ（v1.10.5〜）
     @Published var voiceRetaking = false      // 声の普段だけを取り直している（v1.9.3〜：この間は声の高さの範囲を使わず、口の動きだけで本人の声を数える）
     @Published var voiceSpreadWide = false    // 比べている保存した声の普段の声の高さのばらつきが大きい（v1.9.1〜、取り直せます）
     @Published var speakerEnrollNote: String?  // 撮る側の「いま」：声の登録の進み具合・登録した（v1.10.1〜）
@@ -64,6 +64,7 @@ final class AnalysisModel: ObservableObject {
     @Published var faceShape: [String: Double]?   // 顔の絵用に約0.2秒でならした値。読めないときは nil
     @Published var meshLagMs: Double?        // 撮影→網目を出すまで（解析の遅れ＋画面の間引き）
     @Published var lensInUse: CameraLens?    // 今使っているカメラ（設定で超広角を選んでも、無い端末では広角）
+    @Published var startNote: String?        // 記録を始められなかった理由（「だれを記録しますか」の下に出す、v1.11〜）
 
     let camera = CameraManager()
     private let face = FaceAnalyzer()
@@ -160,7 +161,44 @@ final class AnalysisModel: ObservableObject {
     static let minSamples = 30
     static let resumeGraceSeconds = 5.0   // 裏に回ってからこの秒数以内に戻れば、同じセッションを続ける
 
-    // MARK: セッション（開いている間は記録し、裏に回ったら閉じて要約する）
+    // MARK: セッション（開いたら人を選んで記録し、裏に回ったら閉じて要約する）
+
+    init() {
+        // 記録する人（v1.11〜）：選んだらその人で始める。記録中なら今の記録を閉じてから新しく始める（1本の記録には1人だけ）
+        PersonStore.shared.onStartRecording = { [weak self] id in self?.startRecording(personID: id) }
+        PersonStore.shared.onCloseRecording = { [weak self] in self?.closeRecording() }
+    }
+
+    /// 人を選んだ：その人で記録を始める。記録中なら、今の記録を閉じてから（カメラは止めずに）新しい記録にする
+    func startRecording(personID id: String) {
+        Task {
+            while activating { try? await Task.sleep(for: .milliseconds(50)) }
+            activating = true
+            defer { activating = false }
+            if running {
+                if micOn { audio.stop() }   // startSession でつなぎ直す
+                finalizeSession()
+            }
+            PersonStore.shared.selectedID = id
+            PersonStore.shared.awaitingPerson = false
+            startNote = nil
+            await startSession()
+            if !running {   // カメラ・記録を始められなかった
+                startNote = status
+                PersonStore.shared.awaitingPerson = true
+            }
+        }
+    }
+
+    /// 記録している人を消した：記録を閉じ、カメラとマイクを止めて、人を選ぶのを待つ
+    func closeRecording() {
+        guard running else { return }
+        stopCamera()
+        if micOn { audio.stop() }
+        finalizeSession()
+        UIApplication.shared.isIdleTimerDisabled = false
+        PersonStore.shared.awaitingPerson = true
+    }
 
     /// アプリが前に出た
     #if DEBUG
@@ -180,7 +218,7 @@ final class AnalysisModel: ObservableObject {
         voiceSec = 6; voiceWait = "口が動いていません"
         speakerEnrollNote = "自分の声を集めています（8/15秒）。黙っている間は数えません"
         otherVoice = true; otherVoiceBySpeaker = true
-        speakerLast = (0.21, 2600)
+        speakerLast = (0.21, 0.52, 2600)
         fps = 29.8; procMs = 11; latMs = 43; faceRatio = 0.96; rmsDb = -41; f0Hz = 182; pitchRatio = 0.62
         lensInUse = .wide; analyzedRatio = 0.99
     }
@@ -197,7 +235,13 @@ final class AnalysisModel: ObservableObject {
             t.cancel(); finalizeTask = nil
             endBackgroundTask()
         }
-        if running { await resumeSession() } else { await startSession() }
+        // 5秒以内なら同じセッション。そうでなければ、記録は自動で始めず「だれを記録しますか」を出す（v1.11〜。人を選ぶと startRecording）
+        if running {
+            await resumeSession()
+        } else {
+            PersonStore.shared.awaitingPerson = true
+            status = "だれを記録するか選んでください"
+        }
         link.start()
         if !recoveryDone {
             recoveryDone = true
@@ -249,6 +293,7 @@ final class AnalysisModel: ObservableObject {
         return ["speaker_on": true, "speaker_setting": setting, "speaker_model": SpeakerCriteria.model, "speaker_voiced_floor_db": Double(SpeakerCriteria.voicedFloorDb), "speaker_enrolled": enrolled,
                 "speaker_hop_s": SpeakerCriteria.hopS, "speaker_max_span_s": SpeakerCriteria.maxSpanS,
                 "speaker_self_threshold": SpeakerCriteria.selfThreshold, "speaker_short_window_ms": SpeakerCriteria.shortWindowMs,
+                "speaker_rel_min_score": SpeakerCriteria.relMinScore, "speaker_rel_margin": SpeakerCriteria.relMargin,   // self_by_speaker_rel（v1.11〜）
                 "speaker_qos": audio.speaker?.qosName ?? "", "speaker_compute_units": audio.speaker?.unitsName ?? ""]   // 確かめる用の切り替え（v1.10.3〜）
     }
 
@@ -309,6 +354,7 @@ final class AnalysisModel: ObservableObject {
         loadVoiceCarry()  // 途中まで集めた声の普段があれば、続きから（v1.7〜）
         applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
         running = true
+        PersonStore.shared.inSession = true
         sessionStartedAt = Date()
         // 記録していないときに設定の「人」で「声の普段を取り直す」を押していたら、このセッションで集め直す（1回だけ。途中で閉じたら古い声の普段のまま）
         if let p = PersonStore.shared.selected, p.voiceRetakePending {
@@ -334,6 +380,7 @@ final class AnalysisModel: ObservableObject {
             saveVoicePartial()   // 途中まで集めた声の普段は、次のセッションで続きから（v1.7〜）
             voiceCarry = nil; voiceCarryOwner = nil
             running = false
+            PersonStore.shared.inSession = false
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; diffTargets = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
@@ -522,15 +569,18 @@ final class AnalysisModel: ObservableObject {
         }
         let r1 = { (x: Double) in (x * 10).rounded() / 10 }
         let windowMs = Int((spanS * 1000).rounded())
-        let selScore = PersonStore.shared.selectedID.flatMap { scores[$0] }
+        let selID = PersonStore.shared.selectedID
+        let selScore = selID.flatMap { scores[$0] }
+        let others = scores.filter { $0.key != selID }.map(\.value)
         let selfBy = SpeakerMath.selfBySpeaker(score: selScore)
-        speakerOther.add(tMs: endMs, windowMs: windowMs, selfBySpeaker: selfBy)
-        speakerLast = selScore.map { ($0, windowMs) }
+        let selfRel = SpeakerMath.selfBySpeakerRel(score: selScore, others: others)   // v1.11〜：「本人以外の声」はこちらで
+        speakerOther.add(tMs: endMs, windowMs: windowMs, selfBySpeaker: selfRel)
+        speakerLast = selScore.map { ($0, others.max(), windowMs) }
         logger.write(SpeakerRecord(tMs: endMs, windowMs: Int((spanS * 1000).rounded()), scores: scores,
                                    calcMs: r1(timing.calcMs), model: SpeakerCriteria.model,
                                    f0Ratio: f0Ratio.map { ($0 * 100).rounded() / 100 },
                                    fbankMs: r1(timing.fbankMs), predictMs: r1(timing.predictMs), waitMs: r1(timing.waitMs),
-                                   selfBySpeaker: Nullable(selfBy)), notBefore: endMs)
+                                   selfBySpeaker: Nullable(selfBy), selfBySpeakerRel: Nullable(selfRel)), notBefore: endMs)
         guard let en = speakerEnroll else { return }
         switch en.collect {
         case .voiced:
@@ -930,23 +980,6 @@ final class AnalysisModel: ObservableObject {
         showMessage("\(p.displayName)の\(CameraLens(rawValue: t.camera)?.shortLabel ?? "")の普段を保存し直しました")
     }
 
-    /// 上の帯で人を変えた：記録に id を書く（名前は書かない）。今日の普段があれば、その人に保存する（あれば保存し直すか聞く）
-    func personChanged() {
-        let id = PersonStore.shared.selectedID
-        if running {
-            var e = EventRecord(tMs: Self.nowMs(), kind: "person", value: nil)
-            e.personId = id ?? ""
-            logger.write(e)
-            // 声の普段を集めている途中なら：前の人の途中まで集めた分を、このセッションで足す前に戻し、新しい人の分を読んで続ける
-            if !voiceDone, comparingVoice == nil {
-                if let owner = voiceCarryOwner, owner != id { PersonStore.shared.setVoicePartial(owner, voiceCarry) }
-                loadVoiceCarry()
-                voiceSavedSec = -1
-            }
-        }
-        saveTodayIfNew()
-    }
-
     /// 保存した普段がまだ無ければ自動で保存する。あるときは、今日の普段を画面に出して取ったときだけ保存し直すか聞く
     /// （うしろで黙って取った今日の普段は、記録に書くだけで保存しない）
     private func saveTodayIfNew() {
@@ -1324,7 +1357,8 @@ final class AnalysisModel: ObservableObject {
             voiceSec: running ? voiceSec : nil, voiceTotal: Int(DiffCriteria.voiceBaselineS), otherVoice: running ? otherVoice : nil,
             directionVersion: FaceDirection.version,
             voiceOn: running ? engine.active[.voiceOn] != nil : nil,
-            voiceWait: running && voiceSec != nil ? voiceWait : nil))
+            voiceWait: running && voiceSec != nil ? voiceWait : nil,
+            personName: running ? PersonStore.shared.selected?.displayName : nil))
     }
 
     /// 映っている顔の数が変わって0.5秒続いたら、event（kind: "faces"、count）を書く。最初に決まった数は書かない

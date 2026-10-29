@@ -1610,6 +1610,8 @@ class SpeakerTest(unittest.TestCase):
         self.assertEqual(app("hopS"), c["hop_s"])
         self.assertEqual(app("enrollTargetS"), c["enroll_target_s"])
         self.assertEqual(app("selfThreshold"), c["self_threshold"])
+        self.assertEqual(app("relMinScore"), c["rel_min_score"])
+        self.assertEqual(app("relMargin"), c["rel_margin"])
         self.assertEqual(app("shortWindowMs"), c["short_window_ms"])
         self.assertEqual(float(re.search(r"otherVoiceWindowMs: Int64 = (\d+)", src).group(1)) / 1000, c["other_voice_window_s"])
         self.assertEqual(c["self_gate"]["version"], 3)
@@ -1726,6 +1728,44 @@ class SpeakerSelfTest(unittest.TestCase):
         self.assertTrue(rows[0][3].startswith("100%"))       # 1.5秒以上の行だけ
         self.assertTrue(rows[1][1].startswith("0%") and rows[1][2].startswith("0%"))
         self.assertEqual(q["speaker_self"]["long"], (15, 15))
+
+    def test_self_rel(self):
+        """self_by_speaker_rel（v1.11〜）：書いてあればそれを、無ければ scores と選んでいる人から決め直す"""
+        import argparse
+        import json
+        import voice_check
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        rec = review.Recording.__new__(review.Recording)
+        rec.header = {"person_id": "me", "speaker_self_threshold": 0.45}
+        f = lambda scores, **kw: review.speaker_self_rel(rec, {"scores": scores, **kw}, c)
+        self.assertIs(f({"me": 0.40, "b": 0.20}), True)       # 0.3 以上で、ほかより 0.15 以上高い（0.45 未満でも）
+        self.assertIs(f({"me": 0.40, "b": 0.30}), False)      # 差が 0.15 に届かない
+        self.assertIs(f({"me": 0.29, "b": -0.2}), False)      # 0.3 に届かない
+        self.assertIs(f({"me": 0.30, "b": 0.15}), True)       # ちょうど
+        self.assertIs(f({"me": 0.44}), False)                 # ほかに登録した人がいなければ 0.45
+        self.assertIs(f({"me": 0.45}), True)
+        self.assertIsNone(f({"b": 0.9}))                      # 選んでいる人の登録が無い
+        self.assertIs(f({"me": 0.1}, self_by_speaker_rel=True), True)   # 書いてあればそれ
+        # voice_check.py の表：前の記録（self_by_speaker_rel が無い）は scores から決め直して、右の2列に出す
+        with tempfile.TemporaryDirectory() as d:
+            t0 = 1_800_000_000_000
+            lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "person_id": "me", "speaker_on": True})]
+            for k in range(300):
+                lines.append(json.dumps({"type": "frame", "t_ms": t0 + k * 33, "face": True, "f0_hz": 150.0, "rms_db": -40.0, "voice_self": True}))
+            for k in range(1, 20):   # 本人の声で 0.40（0.45 では本人でないが、ほかの人 0.1 より高い）
+                lines.append(json.dumps({"type": "speaker", "t_ms": t0 + 500 * k, "window_ms": 3000, "scores": {"me": 0.40, "b": 0.10},
+                                         "calc_ms": 1.0, "self_by_speaker": False}))
+            p = Path(d) / "rel.jsonl"
+            p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            r = review.load(p)
+            ns = argparse.Namespace()
+            setattr(ns, "self", ["0-9"]); ns.other = []
+            row = voice_check.speaker_table(r, ns, c=c)[0]
+            q = review.quality(review.analyze(r, c), calm=False)
+        self.assertTrue(row[3].startswith("0%"))     # 0.45
+        self.assertTrue(row[5].startswith("100%"))   # 比べる決め方
+        self.assertEqual(q["speaker_self_rel"]["long"][1], 0)
+        self.assertFalse(q["speaker_self_rel"]["recorded"])
 
     def test_fbank_fast_without_optimization(self):
         """SpeakerFbank（vDSP、v1.10.5〜）を -Onone（Xcode の Debug と同じ）でビルドしても、3秒の fbank が Mac で 3ms 以下（iPhone の目安 10ms）"""

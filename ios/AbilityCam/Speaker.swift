@@ -28,6 +28,12 @@ enum SpeakerCriteria {
     /// 声紋で本人の声か（v1.10.5〜、記録の self_by_speaker・「本人以外の声」）：選んでいる人の似ている度合いがこれ以上なら本人。仮の値。
     /// 記録 ability-cam-20261029-131619 の推定区間で、自分 0.7〜0.87・動画の人 -0.13〜0.27 だったため（この記録を見て決めた値。analysis/criteria.json の speaker.self_threshold）
     static let selfThreshold = 0.45
+    /// 声紋で本人の声か・比べる決め方（v1.11〜、記録の self_by_speaker_rel・「本人以外の声」）：選んでいる人の似ている度合いが relMinScore 以上で、
+    /// ほかに登録した人のいちばん高い似ている度合いより relMargin 以上高ければ本人。ほかに登録した人がいなければ selfThreshold（0.45）と同じ。
+    /// どちらも仮の値：記録 ability-cam-20261029-163456 を見て決めた（1.5秒以上の行で本人と判定した割合が、自分 97%・動画の人 4%・裏声 91%・声を上げた話し声 100%。
+    /// 0.45 だけでは裏声 55%）。登録していない人の声（テレビなど）は比べる相手がいないので、別に確かめる（analysis/criteria.json の speaker.rel_min_score・rel_margin）
+    static let relMinScore = 0.3
+    static let relMargin = 0.15
     /// これより短い声（ms）は、自分でも似ている度合いが下がる（0.4 前後）ので、「本人以外の声」には使わず、記録・レポートでは別に数える
     static let shortWindowMs = 1500
     /// 「本人以外の声」を声紋で決めるときに見る直近の長さ（ms）
@@ -39,7 +45,7 @@ enum SpeakerCriteria {
 }
 
 /// 「声：本人以外の声が入っています」を声紋で決める（v1.10.5〜。選んでいる人の声の登録があるとき）。
-/// 直近1秒に、使った声が1.5秒以上の行で self_by_speaker が false のものがあり、true が無ければ出す。1.5秒未満の行しか無いときは出さない
+/// 直近1秒に、使った声が1.5秒以上の行で self_by_speaker_rel（v1.11〜。v1.10.5 は self_by_speaker）が false のものがあり、true が無ければ出す。1.5秒未満の行しか無いときは出さない
 struct SpeakerOtherVoice {
     private var rows: [(t: Int64, windowMs: Int, selfBy: Bool?)] = []
 
@@ -189,6 +195,14 @@ enum SpeakerMath {
 
     /// 声紋で本人の声か（v1.10.5〜）：選んでいる人の似ている度合いが selfThreshold 以上なら true、未満なら false、登録が無ければ nil
     static func selfBySpeaker(score: Double?) -> Bool? { score.map { $0 >= SpeakerCriteria.selfThreshold - 1e-9 } }
+
+    /// 声紋で本人の声か・比べる決め方（v1.11〜）：選んでいる人の似ている度合いが relMinScore 以上で、ほかに登録した人のいちばん高い似ている度合いより
+    /// relMargin 以上高ければ true、そうでなければ false。ほかに登録した人がいなければ selfBySpeaker と同じ。選んでいる人の登録が無ければ nil
+    static func selfBySpeakerRel(score: Double?, others: [Double]) -> Bool? {
+        guard let s = score else { return nil }
+        guard let top = others.max() else { return selfBySpeaker(score: s) }
+        return s >= SpeakerCriteria.relMinScore - 1e-9 && s - top >= SpeakerCriteria.relMargin - 1e-9
+    }
 
     /// 声が出ているか（v1.10.2〜）：f0 がある、または声の大きさが voicedFloorDb 以上
     static func voiced(f0: Bool, rmsDb: Float?) -> Bool { f0 || (rmsDb.map { $0 >= SpeakerCriteria.voicedFloorDb } ?? false) }

@@ -350,7 +350,10 @@ struct NumbersPage: View {
             stat("探す顔の数", "\(model.maxFaces)")
             stat("解析できた割合（10秒）", model.analyzedRatio.map { "\(Int(($0 * 100).rounded()))%" })
             if model.otherVoiceBySpeaker {   // 「本人以外の声」を声紋で決めているとき（v1.10.5〜）
-                stat("選んでいる人との似ている度合い（直近、本人は \(String(format: "%.2f", SpeakerCriteria.selfThreshold)) 以上）", model.speakerLast.map { String(format: "%.2f", $0.score) })
+                // 本人とするのは、0.3 以上で、ほかに登録した人より 0.15 以上高いとき（ほかに登録した人がいなければ 0.45 以上。v1.11〜、SpeakerCriteria）
+                stat("選んでいる人との似ている度合い（直近）", model.speakerLast.map { String(format: "%.2f", $0.score) })
+                stat("ほかに登録した人でいちばん高い似ている度合い（本人は、これより \(String(format: "%.2f", SpeakerCriteria.relMargin)) 以上高く \(String(format: "%.2f", SpeakerCriteria.relMinScore)) 以上）",
+                     model.speakerLast.map { $0.other.map { String(format: "%.2f", $0) } ?? "ほかに登録した人はいません（本人は \(String(format: "%.2f", SpeakerCriteria.selfThreshold)) 以上）" })
                 stat("その声の長さ（1.5秒未満は使わない）", model.speakerLast.map { String(format: "%.1f秒", Double($0.windowMs) / 1000) })
             }
         }

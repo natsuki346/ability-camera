@@ -471,6 +471,10 @@ struct ViewerView: View {
                   systemImage: s?.recording == true ? "record.circle" : "pause.circle")
                 .font(.system(size: 22 * k, weight: .bold)).foregroundStyle(Palette.face)
             if let s, s.recording {
+                // 記録している人（v1.11〜。1本の記録には1人だけ）
+                Text("記録している人：\(s.personName ?? "—")")
+                    .font(.system(size: 20 * k, weight: .semibold)).foregroundStyle(Palette.face)
+                    .lineLimit(1).minimumScaleFactor(0.7)
                 if let sec = s.baselineSec {
                     Text("普段を記録中 \(sec)/\(s.baselineTotal)秒")
                     ProgressView(value: Double(sec), total: Double(s.baselineTotal)).tint(Self.slate)

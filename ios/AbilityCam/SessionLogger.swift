@@ -58,8 +58,12 @@ struct SpeakerRecord: Encodable {
     /// 声紋で本人の声か（v1.10.5〜）：選んでいる人の似ている度合いが speaker_self_threshold 以上なら true、未満なら false、選んでいる人の登録が無ければ null。
     /// 判定（voice_self）・画面には使わない（「本人以外の声」だけは、登録があるときこれで決める）。window_ms が 1500 未満の行は似ている度合いが下がる
     let selfBySpeaker: Nullable<Bool>
+    /// 声紋で本人の声か・比べる決め方（v1.11〜）：選んでいる人の似ている度合いが speaker_rel_min_score 以上で、ほかに登録した人のいちばん高い似ている度合いより
+    /// speaker_rel_margin 以上高ければ true、そうでなければ false。ほかに登録した人がいなければ self_by_speaker と同じ。選んでいる人の登録が無ければ null。
+    /// 「本人以外の声」はこれで決める（判定の voice_self には使わない）
+    let selfBySpeakerRel: Nullable<Bool>
     enum CodingKeys: String, CodingKey { case type, tMs = "t_ms", windowMs = "window_ms", scores, calcMs = "calc_ms", model, f0Ratio = "f0_ratio",
-        fbankMs = "fbank_ms", predictMs = "predict_ms", waitMs = "wait_ms", selfBySpeaker = "self_by_speaker" }
+        fbankMs = "fbank_ms", predictMs = "predict_ms", waitMs = "wait_ms", selfBySpeaker = "self_by_speaker", selfBySpeakerRel = "self_by_speaker_rel" }
 }
 
 /// nil のときも null と書く値（書いていない古い記録と見分けるため）

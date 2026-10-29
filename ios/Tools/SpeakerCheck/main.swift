@@ -104,6 +104,12 @@ if args.first == "--selftest" {
     if SpeakerMath.selfBySpeaker(score: 0.45) != true || SpeakerMath.selfBySpeaker(score: 0.449) != false || SpeakerMath.selfBySpeaker(score: nil) != nil {
         bad.append("self_by_speaker のしきい値が違う")
     }
+    // 比べる決め方（v1.11〜、self_by_speaker_rel）
+    let rel = SpeakerMath.selfBySpeakerRel
+    if rel(0.40, [0.20]) != true || rel(0.40, [0.30]) != false || rel(0.29, [-0.2]) != false || rel(0.30, [0.15]) != true
+        || rel(0.44, []) != false || rel(0.45, []) != true || rel(nil, [0.9]) != nil || rel(0.5, [0.1, 0.36]) != false {
+        bad.append("self_by_speaker_rel の決め方が違う")
+    }
     var ov = SpeakerOtherVoice()
     ov.add(tMs: 10_000, windowMs: 3000, selfBySpeaker: false)
     if !ov.other(nowMs: 10_500) { bad.append("長い声で本人でないのに出ない") }

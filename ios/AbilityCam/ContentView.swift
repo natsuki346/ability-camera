@@ -39,7 +39,6 @@ struct ContentView: View {
         .overlay { if cameraLarge { largeCamera } }
         .sheet(isPresented: $showSettings) { SettingsView(link: model.link) }
         .sheet(isPresented: $showPeople) { PersonPickerView() }
-        .onChange(of: people.selectedID) { model.personChanged() }
         // 「普段を取り直す」などで画面に出して取った今日の普段を、取り終えたとき（保存した普段がある人だけ）
         .alert("この普段で保存し直しますか？", isPresented: Binding(get: { model.askResave }, set: { if !$0 { model.askResave = false } })) {
             Button("保存し直す") { model.overwriteSaved() }
@@ -90,7 +89,7 @@ struct ContentView: View {
             .background(Self.paleSlate, in: Capsule())   // 薄い青灰
         }
         .buttonStyle(.plain)
-        .accessibilityHint("タップで人を選ぶ")
+        .accessibilityHint("タップで記録する人を変える")
     }
 
     static let navy = Color(red: 0x1F / 255, green: 0x3A / 255, blue: 0x5F / 255)   // 濃紺
@@ -270,7 +269,7 @@ struct ViewersBar: View {
                 Button("送らない", role: .cancel) { link.answer(r, send: false) }
             }
         } message: {
-            Text("顔の絵を動かす数値・顔の向き・いつもとの違い・記録の状態・家族の印と場面を、その場で送ります。音声・記録のファイルは送りません（映像は設定でオンにしたときだけ）。「送る」を選ぶと、この端末を覚えて次からは確認なしでつなぎます（設定で取り消せます）。")
+            Text("記録している人の名前・顔の絵を動かす数値・顔の向き・いつもとの違い・記録の状態・家族の印と場面を、その場で送ります。音声・記録のファイルは送りません（映像は設定でオンにしたときだけ）。「送る」を選ぶと、この端末を覚えて次からは確認なしでつなぎます（設定で取り消せます）。")
         }
     }
 }

@@ -206,11 +206,13 @@ final class AnalysisModel: ObservableObject {
 
     /// 話者の区別のヘッダ（v1.10〜）：使ったか・モデルの版・声を登録した人の id と役割（本人として撮る人か家族か）。名前・埋め込みは書かない
     private func speakerHeader() -> [String: Any] {
-        guard speakerOn else { return ["speaker_on": false] }
+        // speaker_setting：設定「話者の区別を記録する」（v1.10.2〜。オンでもモデルが無ければ speaker_on は false）
+        let setting = UserDefaults.standard.bool(forKey: "speakerRecord")
+        guard speakerOn else { return ["speaker_on": false, "speaker_setting": setting] }
         let selected = PersonStore.shared.selectedID
         let enrolled = PersonStore.shared.people.filter { $0.speaker?.model == SpeakerCriteria.model }
             .map { ["id": $0.id, "role": $0.id == selected ? "self" : "family"] }
-        return ["speaker_on": true, "speaker_model": SpeakerCriteria.model, "speaker_enrolled": enrolled,
+        return ["speaker_on": true, "speaker_setting": setting, "speaker_model": SpeakerCriteria.model, "speaker_voiced_floor_db": Double(SpeakerCriteria.voicedFloorDb), "speaker_enrolled": enrolled,
                 "speaker_hop_s": SpeakerCriteria.hopS, "speaker_max_span_s": SpeakerCriteria.maxSpanS]
     }
 
@@ -219,8 +221,18 @@ final class AnalysisModel: ObservableObject {
         // 話者の区別（v1.10〜）：設定でオンで、モデルがあるときだけ
         audio.speaker = UserDefaults.standard.bool(forKey: "speakerRecord") ? SpeakerFeed() : nil
         speakerOn = audio.speaker != nil
-        audio.speaker?.onEmbedding = { [weak self] endMs, span, calc, e in
-            Task { @MainActor in self?.speakerResult(endMs: endMs, spanS: span, calcMs: calc, embedding: e) }
+        PersonStore.shared.speakerInSession = speakerOn
+        audio.speaker?.onEmbedding = { [weak self] endMs, span, calc, f0r, e in
+            Task { @MainActor in self?.speakerResult(endMs: endMs, spanS: span, calcMs: calc, f0Ratio: f0r, embedding: e) }
+        }
+        // モデルを読み込んだら、どこで動かす予定かを記録に書く（v1.10.2〜、iPhone で Neural Engine を使っているかを確かめる）
+        audio.speaker?.onModel = { [weak self] plan, units, loadMs in
+            Task { @MainActor in
+                guard let self, self.running else { return }
+                var e = EventRecord(tMs: Self.nowMs(), kind: "speaker_model", value: .text(SpeakerCriteria.model))
+                e.computeUnits = units; e.loadMs = (loadMs * 10).rounded() / 10; e.plan = plan
+                self.logger.write(e)
+            }
         }
         PersonStore.shared.onSpeakerEnroll = { [weak self] id, consent in self?.startSpeakerEnroll(id, consentBy: consent) ?? false }
         PersonStore.shared.onSpeakerEnrollStop = { [weak self] in self?.stopSpeakerEnroll() }
@@ -234,7 +246,13 @@ final class AnalysisModel: ObservableObject {
         var note = ""
         micOn = await AVAudioApplication.requestRecordPermission()
         if micOn {
-            do { try audio.start() } catch { micOn = false; note = "（マイクを使えませんでした。声は記録していません）" }
+            do {
+                try audio.start()
+                // 音の設定（v1.10.2〜）：同じ端末やスピーカーの音を打ち消していないかを記録から確かめるため
+                var e = EventRecord(tMs: Self.nowMs(), kind: "audio_session", value: .text(audio.sessionSummary.category))
+                e.audio = audio.sessionSummary
+                logger.write(e)
+            } catch { micOn = false; note = "（マイクを使えませんでした。声は記録していません）" }
         } else {
             note = "（マイクの許可がないため、声は記録していません）"
         }
@@ -275,6 +293,7 @@ final class AnalysisModel: ObservableObject {
         finalizeTask?.cancel(); finalizeTask = nil
         if running {
             stopSpeakerEnroll()   // 途中まで集めた声の登録は残す（取り直しなら捨てる）
+            PersonStore.shared.speakerInSession = nil
             saveVoicePartial()   // 途中まで集めた声の普段は、次のセッションで続きから（v1.7〜）
             voiceCarry = nil; voiceCarryOwner = nil
             running = false
@@ -456,7 +475,7 @@ final class AnalysisModel: ObservableObject {
     // MARK: 話者の区別（v1.10〜、記録に書くだけ。画面には出さない）
 
     /// 埋め込みを1つ求めた：登録した人ごとの似ている度合いを記録に書き、声の登録を集めていれば足す
-    private func speakerResult(endMs: Int64, spanS: Double, calcMs: Double, embedding e: [Float]) {
+    private func speakerResult(endMs: Int64, spanS: Double, calcMs: Double, f0Ratio: Double?, embedding e: [Float]) {
         guard running, speakerOn else { return }
         var scores: [String: Double] = [:]
         for p in PersonStore.shared.people {
@@ -464,7 +483,8 @@ final class AnalysisModel: ObservableObject {
             scores[p.id] = (SpeakerMath.cosine(e, s.embedding) * 1000).rounded() / 1000
         }
         logger.write(SpeakerRecord(tMs: endMs, windowMs: Int((spanS * 1000).rounded()), scores: scores,
-                                   calcMs: (calcMs * 10).rounded() / 10, model: SpeakerCriteria.model), notBefore: endMs)
+                                   calcMs: (calcMs * 10).rounded() / 10, model: SpeakerCriteria.model,
+                                   f0Ratio: f0Ratio.map { ($0 * 100).rounded() / 100 }), notBefore: endMs)
         guard let en = speakerEnroll else { return }
         switch en.collect {
         case .voiced: addSpeakerEnroll(endMs: endMs, spanS: spanS, embedding: e)

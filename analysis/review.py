@@ -1456,7 +1456,11 @@ def quality(a: Analysis, calm: bool) -> dict:
         calc = np.array([r.get("calc_ms", np.nan) for r in rec.speaker], float)
         ids = sorted({k for r in rec.speaker for k in (r.get("scores") or {})})
         roles = {x.get("id"): x.get("role") for x in rec.header.get("speaker_enrolled") or []}
+        f0r = np.array([r["f0_ratio"] for r in rec.speaker if r.get("f0_ratio") is not None], float)   # v1.10.2〜
         q["speaker"] = {"n": len(rec.speaker), "short": int((win < 1500).sum()), "win": tuple(np.percentile(win, [10, 50, 90])),
+                        "f0_ratio": tuple(np.percentile(f0r, [10, 50, 90])) if len(f0r) else None,
+                        "f0_none": int((f0r == 0).sum()),
+                        "voiced_floor_db": rec.header.get("speaker_voiced_floor_db"),
                         "calc": (float(np.nanmedian(calc)), float(np.nanpercentile(calc, 95))) if np.isfinite(calc).any() else None,
                         "model": rec.header.get("speaker_model") or rec.speaker[0].get("model"),
                         "scores": {k: (roles.get(k, "?"), tuple(np.percentile([r["scores"][k] for r in rec.speaker if k in (r.get("scores") or {})], [10, 50, 90])))
@@ -1950,6 +1954,10 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         qrows.append(["話者の区別の行（v1.10〜、記録に書くだけ）",
                       f"{sp['n']}行（使った声が1.5秒未満 {sp['short']}行）。使った声の長さ 10% / 中央値 / 90%：" + " / ".join(f"{v / 1000:.1f}秒" for v in sp["win"])
                       + (f"。計算時間 中央値 {sp['calc'][0]:.1f}ms・95% {sp['calc'][1]:.1f}ms" if sp["calc"] else "") + f"。モデル {sp['model']}"])
+        if sp.get("f0_ratio"):
+            qrows.append(["話者の区別の行で、声の高さ（f0）が取れていた割合（v1.10.2〜。声が出ているのは f0 がある、または "
+                          + (f"{sp['voiced_floor_db']:g}dB" if sp.get("voiced_floor_db") is not None else "しきい値") + " 以上）",
+                          "10% / 中央値 / 90%：" + " / ".join(f"{v:.2f}" for v in sp["f0_ratio"]) + f"。f0 がまったく取れていなかった行 {sp['f0_none']}"])
         for k, (role, (p10, p50, p90)) in sp["scores"].items():
             qrows.append([f"声を登録した人 {k[:8]}（{rl.get(role, role)}）との似ている度合い（10% / 中央値 / 90%）", f"{p10:.2f} / {p50:.2f} / {p90:.2f}"])
         cl = {"voice_self": "本人の声とされた時間だけ", "voiced": "声が出ている時間すべて", None: "集めたものが書かれていない"}

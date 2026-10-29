@@ -1527,7 +1527,10 @@ class SpeakerTest(unittest.TestCase):
         if on:
             for k in range(20):
                 lines.append(json.dumps({"type": "speaker", "t_ms": t0 + 500 * (k + 1), "window_ms": 400 if k < 5 else 3000,
-                                         "scores": {"aaaa1111": 0.7, "bbbb2222": 0.3}, "calc_ms": 8.0 + k % 3, "model": "wespeaker-r34lm-fluid-coreml-v1"}))
+                                         "scores": {"aaaa1111": 0.7, "bbbb2222": 0.3}, "calc_ms": 8.0 + k % 3, "model": "wespeaker-r34lm-fluid-coreml-v1",
+                                         "f0_ratio": 0.0 if k < 4 else 0.8}))
+            lines.append(json.dumps({"type": "event", "t_ms": t0 + 50, "kind": "speaker_model", "value": "wespeaker-r34lm-3s-fp16-v2",
+                                     "compute_units": "cpuAndNeuralEngine", "load_ms": 120.0, "plan": {"ne": 111}}))
             lines.append(json.dumps({"type": "event", "t_ms": t0 + 100, "kind": "speaker_enroll", "value": "登録", "person_id": "aaaa1111", "collect": "voice_self"}))
             for k, sc in enumerate((0.61, 0.74, 0.78)):
                 lines.append(json.dumps({"type": "event", "t_ms": t0 + 5000 * (k + 1), "kind": "speaker_enroll_progress",
@@ -1553,6 +1556,50 @@ class SpeakerTest(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["fps"], 1000 / 33, delta=0.2)
         self.assertIn("オン", text)
         self.assertNotIn("embedding", raw)       # 記録に埋め込みは無い
+        self.assertEqual(sp["f0_none"], 4)
+        self.assertAlmostEqual(sp["f0_ratio"][1], 0.8)
+        self.assertEqual(rows[0]["plan"], "ne=111")
+        self.assertAlmostEqual(rows[0]["f0_ratio_p50"], 0.8)
         en = sp["enroll"]["aaaa1111"]
         self.assertEqual(en["collect"], "voice_self")
         self.assertEqual(en["points"], [(5.0, 0.61), (10.0, 0.74), (15.0, 0.78)])
+
+    def test_fbank_matches_torchaudio(self):
+        """アプリの fbank（SpeakerFbank、v1.10.2〜）が torchaudio の kaldi.fbank と同じ（作り物の音。答えは tests/fixture_fbank.json）"""
+        import json
+        sys.path.insert(0, str(Path(__file__).parent))
+        import fbank_signal
+        import speaker_check
+        exp = json.loads((Path(__file__).parent / "fixture_fbank.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as d:
+            w = Path(d) / "sig.wav"
+            fbank_signal.write_wav(w)
+            got = speaker_check.fbank(speaker_check.build(), w)
+        self.assertEqual(got.shape, (exp["frames"], 80))
+        diff = np.abs(got[exp["rows"]] - np.array(exp["fbank"]))
+        self.assertLess(float(diff.max()), 0.01)
+        self.assertLess(float(np.median(diff)), 0.001)
+
+    def test_model_runs_on_neural_engine(self):
+        """変換したモデル（v1.10.2〜）は、Mac の Core ML の計算の予定で、演算がすべて Neural Engine"""
+        import shutil
+        import speaker_check
+        if not shutil.which("xcrun"):
+            self.skipTest("xcrun が無い")
+        out = speaker_check.plan(speaker_check.build())
+        line = next(x for x in out.splitlines() if x.startswith("cpuAndNeuralEngine"))
+        self.assertIn("ne=", line)
+        self.assertNotIn("cpu=", line)
+        self.assertNotIn("gpu=", line)
+
+    def test_criteria_same_as_app(self):
+        """話者の区別の値が、アプリ（Speaker.swift）と criteria.json で同じ"""
+        import json
+        import re
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "Speaker.swift").read_text(encoding="utf-8")
+        c = json.loads((review.HERE / "criteria.json").read_text(encoding="utf-8"))["speaker"]
+        app = lambda name: float(re.search(rf"static let {name}(?:: \w+)? = (-?[\d.]+)", src).group(1))
+        self.assertEqual(app("voicedFloorDb"), c["voiced_floor_db"])
+        self.assertEqual(app("voiceGapS"), c["voice_gap_s"])
+        self.assertEqual(app("maxSpanS"), c["max_span_s"])
+        self.assertEqual(app("hopS"), c["hop_s"])

@@ -161,6 +161,8 @@ final class PersonStore: ObservableObject {
     /// 声の登録を集めている人（記録中だけ）と、集めた秒数（設定の「人」に出す）
     @Published var speakerEnrolling: String?
     @Published var speakerEnrollSec: Int = 0
+    /// 今の記録で話者の区別が動いているか（記録していなければ nil。v1.10.2〜、設定のトグルの下に出す）
+    @Published var speakerInSession: Bool?
     @Published var speakerEnrollCollect: SpeakerEnrollCollect?   // 集めているもの（本人の声とされた時間だけ／声が出ている時間すべて、v1.10.1〜）
     /// 撮る側が、記録中ならその人の声の登録を集め始める（始めたら true）。AnalysisModel が入れる
     var onSpeakerEnroll: ((_ id: String, _ consentBy: String) -> Bool)?

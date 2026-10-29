@@ -69,6 +69,7 @@ struct SettingsView: View {
     @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
     @AppStorage("baselineSeconds") private var baselineSeconds = AnalysisModel.defaultBaselineSeconds
     @State private var allowed = AllowedViewers.all()
+    @ObservedObject private var people = PersonStore.shared
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -111,7 +112,16 @@ struct SettingsView: View {
                     Section {
                         Toggle("話者の区別を記録する", isOn: $speakerRecord)
                     } footer: {
-                        Text("初めはオフ。オンのあいだは、声が出ている間 0.5秒ごとに声の特徴を数値にし、設定の「人」で声を登録した人ごとの似ている度合いを記録に書きます（type: \"speaker\" の行）。画面には出しません。声の特徴の数値はこの端末の persons.json の中だけで、記録にも見る側にも送りません。本人確認・認証には使いません。次に記録を始めたときから使います")
+                        VStack(alignment: .leading, spacing: 4) {
+                            // 記録中に切り替えても、今の記録には効かない（v1.10.2〜。オンにしたつもりの記録がオフだったため）
+                            if let now = people.speakerInSession {
+                                Text("切り替えは次の記録から効きます。今の記録は\(now ? "オン" : "オフ")のままです")
+                                    .font(.caption.bold()).foregroundStyle(now == speakerRecord ? .secondary : ContentView.navyText)
+                            } else {
+                                Text("切り替えは次の記録から効きます").font(.caption.bold())
+                            }
+                            Text("初めはオフ。オンのあいだは、声が出ている間（声の高さが取れている、または声の大きさが -52dB 以上）0.5秒ごとに声の特徴を数値にし、設定の「人」で声を登録した人ごとの似ている度合いを記録に書きます（type: \"speaker\" の行）。画面には出しません。声の特徴の数値はこの端末の persons.json の中だけで、記録にも見る側にも送りません。本人確認・認証には使いません。次に記録を始めたときから使います")
+                        }
                     }
                     Section {
                         Toggle("見る側に映像も送る", isOn: $sendVideo)

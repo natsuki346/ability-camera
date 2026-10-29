@@ -39,8 +39,14 @@ var args = Array(CommandLine.arguments.dropFirst())
 if args.first == "--selftest" {
     var bad: [String] = []
     let m3 = SpeakerMath.mask(spanS: 3), m05 = SpeakerMath.mask(spanS: 0.5)
-    if m3.count != SpeakerCriteria.maskFrames || Int(m3.reduce(0, +)) != 177 { bad.append("3秒の印が違う \(m3.reduce(0, +))") }
-    if Int(m05.reduce(0, +)) != 30 || m05.last != 1 || m05.first != 0 { bad.append("0.5秒の印が違う") }
+    if m3.count != SpeakerCriteria.maskFrames || Int(m3.reduce(0, +)) != 38 { bad.append("3秒の印が違う \(m3.reduce(0, +))") }
+    if Int(m05.reduce(0, +)) != 7 || m05.last != 1 || m05.first != 0 { bad.append("0.5秒の印が違う \(m05.reduce(0, +))") }
+    // 声が出ているか（v1.10.2〜）：f0 がある、または -52dB 以上
+    if !SpeakerMath.voiced(f0: true, rmsDb: -70) || !SpeakerMath.voiced(f0: false, rmsDb: -52) || SpeakerMath.voiced(f0: false, rmsDb: -52.1)
+        || SpeakerMath.voiced(f0: false, rmsDb: nil) { bad.append("声が出ているかの決め方が違う") }
+    var fr = SpeakerRing()
+    for k in 0..<10 { fr.mark(voiced: true, f0: k % 4 == 0, at: Double(k) * 0.1) }   // 0.0〜0.9秒、f0 は 0・0.4・0.8
+    if abs((fr.f0Ratio(spanS: 0.5, now: 0.9) ?? -1) - 0.2) > 1e-9 { bad.append("f0 の割合が違う \(String(describing: fr.f0Ratio(spanS: 0.5, now: 0.9)))") }
     var p = SpeakerEnrollPartial(model: SpeakerCriteria.model, sum: [], embeddings: 0, validS: 0, startedMs: 0, consentBy: "x", consentMs: 0)
     SpeakerMath.add(&p, embedding: [3, 4], spanS: 0.5)
     SpeakerMath.add(&p, embedding: [0, 2], spanS: 0.5)
@@ -88,6 +94,28 @@ if args.first == "--selftest" {
     if let r = g.ready(nowMs: 1000 + SpeakerCriteria.selfGateWaitMs + 1).first, r.counted || r.item != 7 { bad.append("待ちすぎたのに数えた") }
     print(bad.isEmpty ? "OK" : bad.joined(separator: "\n"))
     exit(bad.isEmpty ? 0 : 1)
+}
+// --fbank 音.wav：fbank（SpeakerFbank）を JSON で出す（analysis のテストで torchaudio の値と比べる）
+if args.first == "--fbank", args.count >= 2, let (x0, sr) = readWav(args[1]) {
+    let x = resample16k(x0, from: sr)
+    let f = SpeakerFbank().compute(x)
+    let o: [String: Any] = ["frames": SpeakerFbank.frames(samples: x.count), "bins": SpeakerFbank.bins, "fbank": f.map(Double.init)]
+    print(String(decoding: try! JSONSerialization.data(withJSONObject: o), as: UTF8.self))
+    exit(0)
+}
+// --plan モデル.mlmodelc：演算ごとに動かす予定の場所の数（Neural Engine で動くかを確かめる）
+if args.first == "--plan", args.count >= 2 {
+    let url = URL(fileURLWithPath: args[1])
+    let sem = DispatchSemaphore(value: 0)
+    Task {
+        for (name, cu) in [("cpuAndNeuralEngine", MLComputeUnits.cpuAndNeuralEngine), ("all", .all)] {
+            let p = await SpeakerEmbedder.computePlan(url: url, computeUnits: cu)
+            print(name, (p ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+        }
+        sem.signal()
+    }
+    sem.wait()
+    exit(0)
 }
 func opt(_ name: String, _ d: Double) -> Double {
     guard let i = args.firstIndex(of: name), i + 1 < args.count, let v = Double(args[i + 1]) else { return d }

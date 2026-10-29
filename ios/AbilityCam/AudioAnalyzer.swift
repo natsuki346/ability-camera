@@ -2,8 +2,22 @@ import AVFoundation
 import Accelerate
 import QuartzCore
 
+/// 音の設定（v1.10.2〜、記録の event audio_session）。打ち消し（エコーキャンセル）・自動の音量補正をしていないかを確かめるため
+struct AudioSessionSummary: Encodable {
+    let category: String
+    let mode: String
+    let voiceProcessing: Bool       // AVAudioEngine の inputNode の声の処理（エコーキャンセル・ノイズ除去）。オンにしていない
+    let otherAudioPlaying: Bool     // 始めたときに、ほかのアプリの音が鳴っていたか
+    let mixWithOthers: Bool         // ほかのアプリの音と混ぜて鳴らせる設定か
+    let inputGainSettable: Bool
+    enum CodingKeys: String, CodingKey {
+        case category, mode, voiceProcessing = "voice_processing", otherAudioPlaying = "other_audio_playing", mixWithOthers = "mix_with_others", inputGainSettable = "input_gain_settable"
+    }
+}
+
 /// マイクから音量と声の高さをその場で計算する。音声そのものは保存しない。
 final class AudioAnalyzer {
+    private(set) var sessionSummary = AudioSessionSummary(category: "", mode: "", voiceProcessing: false, otherAudioPlaying: false, mixWithOthers: false, inputGainSettable: false)
     struct Snapshot { var rmsDb: Float?; var f0Hz: Float?; var at: CFTimeInterval = 0 }   // at = 計算した時刻（CACurrentMediaTime）
 
     private let engine = AVAudioEngine()
@@ -21,8 +35,12 @@ final class AudioAnalyzer {
 
     func start() throws {
         let s = AVAudioSession.sharedInstance()
+        let otherBefore = s.isOtherAudioPlaying
         try s.setCategory(.record, mode: .measurement)   // 自動の音量補正やノイズ除去を切る
         try s.setActive(true)
+        sessionSummary = AudioSessionSummary(category: s.category.rawValue, mode: s.mode.rawValue, voiceProcessing: engine.inputNode.isVoiceProcessingEnabled,
+                                             otherAudioPlaying: otherBefore, mixWithOthers: s.categoryOptions.contains(.mixWithOthers),
+                                             inputGainSettable: s.isInputGainSettable)
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -31,7 +49,10 @@ final class AudioAnalyzer {
         input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buf, when in
             self?.analyze(buf, sampleRate: sr)
             self?.blocks(buf, sampleRate: sr, hostTime: when.hostTime)
-            if let self, let sp = self.speaker { sp.feed(buf, hostTime: when.hostTime, voiced: self.current.f0Hz != nil) }
+            if let self, let sp = self.speaker {   // 声が出ているか：f0 がある、または声の大きさがしきい値以上（v1.10.2〜）
+                let c = self.current
+                sp.feed(buf, hostTime: when.hostTime, voiced: SpeakerMath.voiced(f0: c.f0Hz != nil, rmsDb: c.rmsDb), f0: c.f0Hz != nil)
+            }
         }
         try engine.start()
     }
@@ -82,8 +103,8 @@ final class AudioAnalyzer {
     }
 }
 
-/// 話者の区別の音の流れ（v1.10〜、docs/speaker-plan.md）。タップの中では計算しない：16kHz に変えて輪のバッファ（10秒、メモリだけ）に足すだけ。
-/// 声が出ている間だけ、0.5秒ごとに、別の低い優先度のキューで直近の声のまとまり（最大3秒。1.5秒未満も）の埋め込みを求め、onEmbedding に渡す
+/// 話者の区別の音の流れ（v1.10〜、docs/speaker-plan.md）。タップの中では計算しない：16kHz に変えて輪のバッファ（3秒、メモリだけ）に足すだけ。
+/// 声が出ている間だけ（f0 がある、または声の大きさがしきい値以上。v1.10.2〜）、0.5秒ごとに、別の低い優先度のキューで直近の声のまとまり（最大3秒。1.5秒未満も）の埋め込みを求め、onEmbedding に渡す
 final class SpeakerFeed {
     private let queue = DispatchQueue(label: "speaker", qos: .utility)
     private let lock = NSLock()
@@ -95,17 +116,29 @@ final class SpeakerFeed {
     private var embedder: SpeakerEmbedder?
     private let ready: Bool
 
-    /// 埋め込みを求めた（音のスレッドではなく speaker のキュー）。endMs：使った声のまとまりの終わりの時刻（epoch ms）
-    var onEmbedding: ((_ endMs: Int64, _ spanS: Double, _ calcMs: Double, _ embedding: [Float]) -> Void)?
+    /// 埋め込みを求めた（音のスレッドではなく speaker のキュー）。endMs：使った声のまとまりの終わりの時刻（epoch ms）。
+    /// calcMs は fbank とモデルの計算の合計。f0Ratio：そのまとまりで f0 が取れていた割合
+    var onEmbedding: ((_ endMs: Int64, _ spanS: Double, _ calcMs: Double, _ f0Ratio: Double?, _ embedding: [Float]) -> Void)?
+    /// モデルを読み込んだ：どこで動かす予定か（Neural Engine / GPU / CPU の演算の数）と、computeUnits（v1.10.2〜、記録の event speaker_model）
+    var onModel: ((_ plan: [String: Int]?, _ computeUnits: String, _ loadMs: Double) -> Void)?
 
     /// モデルが無ければ nil
     init?() {
-        guard Bundle.main.url(forResource: SpeakerCriteria.resourceName, withExtension: "mlmodelc") != nil else { return nil }
+        guard let url = SpeakerEmbedder.bundledURL() else { return nil }
         ready = true
-        queue.async { [weak self] in self?.embedder = SpeakerEmbedder() }   // 読み込みも別のキューで
+        queue.async { [weak self] in   // 読み込みも別のキューで
+            let t0 = CACurrentMediaTime()
+            let e = SpeakerEmbedder()
+            let loadMs = (CACurrentMediaTime() - t0) * 1000
+            self?.embedder = e
+            Task { [weak self] in
+                let plan = await SpeakerEmbedder.computePlan(url: url, computeUnits: .cpuAndNeuralEngine)
+                self?.onModel?(plan, e == nil ? "failed" : "cpuAndNeuralEngine", loadMs)
+            }
+        }
     }
 
-    func feed(_ buf: AVAudioPCMBuffer, hostTime: UInt64, voiced: Bool) {
+    func feed(_ buf: AVAudioPCMBuffer, hostTime: UInt64, voiced: Bool, f0: Bool) {
         guard ready else { return }
         if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: outFormat) }
         guard let conv = converter else { return }
@@ -122,12 +155,12 @@ final class SpeakerFeed {
         let endS = hostS + Double(buf.frameLength) / buf.format.sampleRate
         lock.lock()
         ring.append(x, count: Int(out.frameLength))
-        ring.mark(voiced: voiced, at: endS)
+        ring.mark(voiced: voiced, f0: f0, at: endS)
         let span = ring.span(now: endS)
-        var job: (window: [Float], span: Double)?
+        var job: (window: [Float], span: Double, f0Ratio: Double?)?
         if voiced, let s = span, s >= SpeakerCriteria.minSpanS, endS - lastRun >= SpeakerCriteria.hopS - 1e-6, !busy {
             busy = true; lastRun = endS
-            job = (ring.window(), s)
+            job = (ring.window(), s, ring.f0Ratio(spanS: s, now: endS))
         }
         lock.unlock()
         guard let job else { return }
@@ -138,7 +171,7 @@ final class SpeakerFeed {
             guard let emb = self.embedder else { return }
             let t0 = CACurrentMediaTime()
             guard let e = emb.embed(window: job.window, spanS: job.span) else { return }
-            self.onEmbedding?(endMs, job.span, (CACurrentMediaTime() - t0) * 1000, e)
+            self.onEmbedding?(endMs, job.span, (CACurrentMediaTime() - t0) * 1000, job.f0Ratio, e)
         }
     }
 }

@@ -24,7 +24,12 @@ def summary(path: Path) -> dict:
     calc = calc[np.isfinite(calc)]
     win = np.array([r.get("window_ms", 0) for r in rec.speaker], float)
     pct = lambda x, q: float(np.percentile(x, q)) if len(x) else None
+    f0r = np.array([r["f0_ratio"] for r in rec.speaker if r.get("f0_ratio") is not None], float)   # v1.10.2〜
+    m = next((e for e in rec.events if e.get("kind") == "speaker_model"), None)                     # v1.10.2〜
+    plan = " ".join(f"{k}={v}" for k, v in sorted((m.get("plan") or {}).items())) if m else None
     return {"file": path.name, "speaker_on": bool(rec.header.get("speaker_on")), "duration_s": dur,
+            "model": rec.header.get("speaker_model"), "plan": plan, "load_ms": m.get("load_ms") if m else None,
+            "f0_ratio_p50": pct(f0r, 50),
             "fps": (len(t) - 1) / dur if dur > 0 else None,
             "lat_p50": pct(lat, 50), "lat_p95": pct(lat, 95), "proc_p50": pct(proc, 50), "proc_p95": pct(proc, 95),
             "speaker_rows": len(rec.speaker), "speaker_per_s": len(rec.speaker) / dur if dur > 0 else None,
@@ -34,7 +39,9 @@ def summary(path: Path) -> dict:
 COLS = [("file", "記録", "{}"), ("speaker_on", "話者の区別", "{}"), ("duration_s", "長さ 秒", "{:.0f}"), ("fps", "解析コマ/秒", "{:.1f}"),
         ("lat_p50", "撮影→結果 ms 中央値", "{:.0f}"), ("lat_p95", "撮影→結果 ms 95%", "{:.0f}"),
         ("proc_p50", "解析時間 ms 中央値", "{:.1f}"), ("speaker_rows", "話者の行", "{}"), ("speaker_per_s", "話者の行/秒", "{:.2f}"),
-        ("calc_p50", "話者の計算 ms 中央値", "{:.1f}"), ("calc_p95", "話者の計算 ms 95%", "{:.1f}"), ("short_rows", "1.5秒未満の声の行", "{}")]
+        ("calc_p50", "話者の計算 ms 中央値", "{:.1f}"), ("calc_p95", "話者の計算 ms 95%", "{:.1f}"), ("short_rows", "1.5秒未満の声の行", "{}"),
+        ("f0_ratio_p50", "f0 が取れていた割合 中央値", "{:.2f}"), ("model", "モデル", "{}"), ("plan", "計算の場所（ne＝Neural Engine）", "{}"),
+        ("load_ms", "読み込み ms", "{:.0f}")]
 
 
 def table(rows: list[dict]) -> str:

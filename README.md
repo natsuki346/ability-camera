@@ -207,6 +207,28 @@ iPhone をつないで実行。初回は、iPhone の 設定 > 一般 > VPNと�
 - 振り返りレポート・リプレイは、`voice_self` の無い古い記録では、同じ決まりで本人の声を決め直す
 - 声の普段の進み具合が3秒増えないときは、理由を小さく出す（v1.6.2〜）：「声の普段が増えない理由：声の高さが取れていません」／「口が動いていません」／「顔が読めていません」（見る側の声の欄にも）
 
+## 話者の区別を、f0 の取れない声でも・速く動かす（v1.10.2）
+記録 `ability-cam-20261029-114906`（iPhone）で分かった2つを直した。
+- **声が出ているかの決め方**：「f0 がある、**または声の大きさが -52dB 以上**」（v1.10〜v1.10.1 は f0 がある間だけ）。
+  スピーカーから流した動画の声は f0 がほとんど取れず（5秒に6〜28コマ）、声のまとまりが細切れになって計算されず、登録も進まなかった。叫び声・息の多い声も同じ。
+  - **-52dB の根拠**：この記録で黙っている区間（95〜145秒）は -60〜-75dB、話している区間は -38〜-46dB。その間で、黙っている区間の上端から 8dB、話している区間の下端から 6dB 離した値
+    （`analysis/criteria.json` の `speaker.voiced_floor_db`、アプリの `SpeakerCriteria.voicedFloorDb`。同じ値かをテストで確かめる）。部屋や距離で変わるので、記録を増やして見直す
+  - 声のまとまりの切れ目（0.3秒）も、この決め方で声が途切れた長さで見る
+  - 記録の `speaker` 行に `f0_ratio`（そのまとまりで、声が出ていた音の塊のうち f0 が取れていた割合）を足した。振り返りレポートの記録の質に分布と、f0 がまったく取れなかった行の数を出す
+  - **本人の声の見分け（`voice_self`）は変えない**（今まで通り f0 があるコマだけ）。テレビ・動画の声は、登録していない声として、どの人とも似ている度合いが低い声（いずれ「だれの声か分からない声」）になる想定。今は判定せず、似ている度合いを記録するだけ
+- **計算を速くする**：iPhone で1回約210ms（Mac は16ms）、0.6秒ごとで CPU を4割ほど使っていた。
+  - 調べたこと：Fluid Inference の変換は、Neural Engine を頼んでも（`computeUnits: .cpuAndNeuralEngine`）、Core ML の計算の予定（`MLComputePlan`）で **1150 の演算がすべて CPU** だった
+    （重みが Float32、fbank をモデルの中で 1000 個の切り出しで求めている）。毎回 10秒×3行を計算していて、使うのは1行の直近3秒だけ
+  - 直したこと：元の重み（pyannote、CC BY 4.0）をこのリポジトリで Core ML に変換し直した（`ios/Tools/SpeakerModel/convert.py`、`ios/AbilityCam/Models/wespeaker_3s.mlpackage`、Float16、13MB。リポジトリに入れる）。
+    **1行・3秒**（fbank 298×80 と、出力のフレームごとの重み 38）。fbank はモデルの外（`SpeakerFbank`、Accelerate、Float32）で求め、torchaudio の `kaldi.fbank` と同じ値か（差の最大 0.001）をテストで確かめる。
+    Mac の計算の予定で **111 の演算がすべて Neural Engine**、1回 0.9ms（fbank を入れて 1.3ms。前は 17ms）
+  - モデルの版が変わった（`wespeaker-r34lm-3s-fp16-v2`）ので、**v1.10〜v1.10.1 の声の登録は使わない**（設定の「人」に「前のモデルの登録なので使いません（取り直せます）」）。入力の長さが10秒から3秒になり、平均を引く範囲も変わるので、埋め込みは前と同じではない
+  - 記録に `event`（`kind: "speaker_model"`）：読み込みにかかった時間・頼んだ計算の場所（`compute_units`）・演算ごとの計算の予定（`plan`：`ne` / `gpu` / `cpu` の数、iOS 17.4〜）。`perf_check.py` が並べる
+- **音の設定（打ち消していないか）**：`AVAudioSession` は `category: .record`・`mode: .measurement`（自動の音量補正・ノイズ除去を切る）。`AVAudioEngine` の声の処理（エコーキャンセル）はオンにしていない。
+  なので、**ほかの端末のスピーカーから流した音は、打ち消さずにそのままマイクに入る**。**同じ iPhone の中で流した音**は、`.record` がほかのアプリの音を止める（混ぜる設定 `mixWithOthers` もしていない）ので、
+  記録している間は鳴らない見込み（コードと Apple の説明から。実機ではまだ確かめていない）。記録の始めに `event`（`kind: "audio_session"`）でカテゴリ・モード・声の処理・ほかのアプリの音が鳴っていたかを書く
+- **設定「話者の区別を記録する」**：記録中に切り替えても次の記録から効くことを、トグルの下に出す（記録中は「今の記録はオン／オフのままです」も）。ヘッダに `speaker_setting`（設定の値。オンでもモデルが無ければ `speaker_on` は false）
+
 ## 声の登録を使いやすくする（v1.10.1）
 - **撮る側の「いま」にも進み具合を出す**：登録している間「〇〇の声を集めています（12/30秒）。黙っている間は数えません」、たまったら「〇〇の声を登録しました」（取り直しは「登録し直しました」、5秒出す）。
   だれの声かの判定は、今まで通り画面に出さない
@@ -218,8 +240,8 @@ iPhone をつないで実行。初回は、iPhone の 設定 > 一般 > VPNと�
 
 ## 話者の区別を記録に書く（v1.10、`docs/speaker-plan.md` の最初の段階）
 画面には出さず、記録に書くだけ。だれの声のあとに何が変わったかを結びつけるのは、まだ作らない。
-- **設定「話者の区別を記録する」**（初めはオフ。次に記録を始めたときから）。オンで、モデル（`ios/setup.sh` が取ってくる `AbilityCam/Resources/wespeaker.mlmodelc`）があるときだけ動く
-- **音の流れ**：音のタップの中では計算しない。16kHz に変えて、10秒の輪のバッファ（メモリだけ）に足すだけ。声が出ている（f0 がある）間だけ、0.5秒ごとに、別の低い優先度のキュー（`qos: .utility`）で
+- **設定「話者の区別を記録する」**（初めはオフ。次に記録を始めたときから）。オンで、モデルがあるときだけ動く（v1.10.2〜は `AbilityCam/Models/wespeaker_3s.mlpackage`、上の「v1.10.2」）
+- **音の流れ**：音のタップの中では計算しない。16kHz に変えて、輪のバッファ（メモリだけ。v1.10.2〜は3秒）に足すだけ。声が出ている（f0 がある。v1.10.2〜は、または -52dB 以上）間だけ、0.5秒ごとに、別の低い優先度のキュー（`qos: .utility`）で
   直近の声のまとまり（声が 0.3秒より長く途切れたら切る。最大3秒）の埋め込みを Core ML（CPU と Neural Engine）で求める。**1.5秒未満の短い声も計算し**、使った長さを記録に書く（0.2秒より短いものは計算しない）
 - **登録**（設定の「人」の「声の登録」）：記録中で話者の区別がオンのとき、「声を登録する」→ 同意した人の名前を入れる →
   その人がひとりで話している間の声のまとまりを 0.5秒ずつ数え、合計 **30秒**（仮）たまったら登録する（埋め込みを長さ1にそろえて平均したもの）。
@@ -390,8 +412,9 @@ v1.9.1 からは、タイミングを判定に使わないので、アプリは 
 | `t_ms` | 使った声のまとまりの終わりの時刻（epoch ms） |
 | `window_ms` | 使った声の長さ（ms、最大 3000。1500 より短いものも書く） |
 | `scores` | 声を登録した人（id）ごとの似ている度合い（コサイン類似度、0.001 に丸める）。登録した人がいなければ `{}`。**埋め込みは書かない** |
-| `calc_ms` | 計算にかかった時間（ms） |
+| `calc_ms` | 計算にかかった時間（ms。v1.10.2〜は fbank とモデルの合計） |
 | `model` | 使ったモデルの版 |
+| `f0_ratio` | そのまとまりで、声が出ていた音の塊のうち f0 が取れていた割合（0.01 に丸める、v1.10.2〜） |
 
 ### `type: "audio"`（v1.9.1〜、音の塊（約0.1秒）ごとに1行）
 | キー | 意味 |
@@ -432,6 +455,8 @@ v1.9.1 からは、タイミングを判定に使わないので、アプリは 
 | `voice_pitch_range` | なし | 声の高さの範囲を使い始めた（v1.9.4〜、声の普段を集め終えたとき・保存し直したとき）。`median`・`iqr`（Hz）。無ければ範囲を外した |
 | `speaker_enroll` | `"登録"` / `"取り直し"` | 声の登録を集め始めた（v1.10〜）。`person_id`、`collect`（`voice_self`＝本人の声とされた時間だけ / `voiced`＝声が出ている時間すべて、v1.10.1〜）。名前・同意した人・埋め込みは書かない |
 | `speaker_enroll_progress` | なし | 声の登録の途中で、たまった秒数が 5秒増えた（v1.10.1〜）。`person_id`、`valid_s`（たまった秒数）、`score`（その時点までの登録と最新の声の似ている度合い） |
+| `speaker_model` | モデルの版 | 話者の区別のモデルを読み込んだ（v1.10.2〜）。`compute_units`、`load_ms`、`plan`（演算ごとの計算の予定：`ne`＝Neural Engine / `gpu` / `cpu` の数。iOS 17.4〜） |
+| `audio_session` | カテゴリ | マイクを始めた（v1.10.2〜）。`audio`：`category`・`mode`・`voice_processing`（エコーキャンセルなどの声の処理）・`other_audio_playing`（始めたときにほかのアプリの音が鳴っていたか）・`mix_with_others`・`input_gain_settable` |
 | `voice_partial_discarded` | 理由 | 途中まで集めた声の普段が、集め始めてから14日たっていたので使わなかった（v1.7〜）。`person_id` |
 | `head_turn` | `"右へ"` / `"左へ"` / `"正面に戻った"` / `"見えなくなった（直前は右 40°）"` / `"見えるようになった（左 20°）"` | 顔の向きが変わって0.5秒続いた（v0.8〜）。`head`（新しい向き：`front` / `right` / `left` / `hidden` / `oblique`）、`from`（前の向き）、`yaw_deg`（なり始めたときの yaw。`hidden` は見えなくなる直前の yaw）が付く |
 | `camera` | `"広角"` / `"超広角"` | 記録中に設定でカメラを切り替えた（v0.8〜）。`camera`（`wide` / `ultra_wide`）が付く |
@@ -466,9 +491,10 @@ v1.9.1 からは、タイミングを判定に使わないので、アプリは 
 要約は、記録のファイルに書いた行だけから数える（その場で作っても、あとから読み直しても同じ結果。`analysis/sessions.py` も同じ数え方）。
 
 ## ライセンス
-- 話者の区別のモデル（`ios/AbilityCam/Resources/wespeaker.mlmodelc`、v1.10〜。リポジトリには入れず、`ios/setup.sh` が取ってくる）：
-  [WeSpeaker](https://github.com/wenet-e2e/wespeaker) の VoxCeleb ResNet34-LM を、[pyannote](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) が公開したものを、
-  [Fluid Inference](https://huggingface.co/FluidInference/speaker-diarization-coreml) が Core ML に変換したもの（`wespeaker.mlmodelc`、変更された Core ML 変換）。
-  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)（元の学習データ VoxCeleb のライセンスに従う）。このアプリはモデルを変えずに使う
+- 話者の区別のモデル（`ios/AbilityCam/Models/wespeaker_3s.mlpackage`、v1.10.2〜。リポジトリに入れる）：
+  [WeSpeaker](https://github.com/wenet-e2e/wespeaker) の VoxCeleb ResNet34-LM を [pyannote](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) が公開した重み（`pytorch_model.bin`）を、
+  このリポジトリの `ios/Tools/SpeakerModel/convert.py` で Core ML に変換したもの（**変更あり**：入力を1行・3秒の fbank にし、fbank はモデルの外で求める。Float16 にした。学習はしていない）。
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)（元の学習データ VoxCeleb のライセンスに従う）
+- v1.10〜v1.10.1 は、同じ重みを [Fluid Inference](https://huggingface.co/FluidInference/speaker-diarization-coreml) が変換した `wespeaker.mlmodelc`（CC BY 4.0、`setup.sh` が取ってきていた）を使っていた。v1.10.2 からは使わない
 - 表情の解析のモデル（`face_landmarker.task`）：Google MediaPipe（Apache-2.0）
 

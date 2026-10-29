@@ -51,7 +51,8 @@ struct SpeakerRecord: Encodable {
     let scores: [String: Double]   // 声を登録した人（id）ごとの似ている度合い（コサイン類似度、-1〜1）。登録した人がいなければ空
     let calcMs: Double          // 計算にかかった時間
     let model: String
-    enum CodingKeys: String, CodingKey { case type, tMs = "t_ms", windowMs = "window_ms", scores, calcMs = "calc_ms", model }
+    let f0Ratio: Double?        // そのまとまりで、声が出ていた音の塊のうち f0 が取れていた割合（v1.10.2〜、0.01 に丸める）
+    enum CodingKeys: String, CodingKey { case type, tMs = "t_ms", windowMs = "window_ms", scores, calcMs = "calc_ms", model, f0Ratio = "f0_ratio" }
 }
 
 /// nil のときも null と書く値（書いていない古い記録と見分けるため）
@@ -101,11 +102,15 @@ struct EventRecord: Encodable {
     var collect: String?        // speaker_enroll：何を集めるか（voice_self＝本人の声とされた時間だけ / voiced＝声が出ている時間すべて、v1.10.1〜）
     var validS: Double?         // speaker_enroll_progress：たまった声の秒数（v1.10.1〜）
     var score: Double?          // speaker_enroll_progress：その時点までの登録（平均、最新の声を足す前）と最新の声との似ている度合い
+    var computeUnits: String?   // speaker_model：Core ML に頼んだ計算の場所（v1.10.2〜）
+    var loadMs: Double?         // speaker_model：モデルの読み込みにかかった時間
+    var plan: [String: Int]?    // speaker_model：演算ごとに動かす予定の場所の数（ne / gpu / cpu。iOS 17.4〜）
+    var audio: AudioSessionSummary?   // audio_session：音の設定（v1.10.2〜）
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
         case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part, median, iqr
-        case collect, validS = "valid_s", score
+        case collect, validS = "valid_s", score, computeUnits = "compute_units", loadMs = "load_ms", plan, audio
     }
 }
 

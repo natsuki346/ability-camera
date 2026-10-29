@@ -15,12 +15,9 @@ targets:
         buildPhase: resources
         optional: true
         excludes:
-          - "wespeaker.mlmodelc/**"
-      # 話者の区別のモデル（v1.10〜、setup.sh が取ってくる。CC BY 4.0、README の「ライセンス」）。コンパイル済みの Core ML をフォルダのまま入れる
-      - path: AbilityCam/Resources/wespeaker.mlmodelc
-        type: folder
-        buildPhase: resources
-        optional: true
+          - "*.mlmodelc/**"
+      # 話者の区別のモデル（v1.10.2〜）は AbilityCam/Models/wespeaker_3s.mlpackage（このリポジトリで変換したもの。CC BY 4.0、README の「ライセンス」）。
+      # AbilityCam の中なので、Xcode がビルドのときに wespeaker_3s.mlmodelc にする
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ability.cam
@@ -28,6 +25,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         TARGETED_DEVICE_FAMILY: "1,2"   # iPhone（撮る側）と iPad（見る側）。Apple シリコンの Mac では iPad 用アプリとして動く
         SWIFT_VERSION: "5.0"
+        COREML_CODEGEN_LANGUAGE: None   # モデルの Swift クラスは使わない（MLModel で読む）
         ENABLE_USER_SCRIPT_SANDBOXING: NO   # CocoaPods のスクリプトを動かすため
     info:
       path: AbilityCam/Info.plist

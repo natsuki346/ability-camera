@@ -173,19 +173,15 @@ final class AnalysisModel: ObservableObject {
         #endif
         // 記録する人（v1.11〜）：選んだらその人で始める。記録中なら今の記録を閉じてから新しく始める（1本の記録には1人だけ）
         PersonStore.shared.onStartRecording = { [weak self] id in self?.startRecording(personID: id) }
-        PersonStore.shared.onCloseRecording = { [weak self] in self?.closeRecording() }
     }
 
-    /// 人を選んだ：その人で記録を始める。記録中なら、今の記録を閉じてから（カメラは止めずに）新しい記録にする
+    /// 人を選んだ：その人で記録を始める（記録中は人を変えない、v1.11.2〜。呼ばれても何もしない）
     func startRecording(personID id: String) {
         Task {
             while activating { try? await Task.sleep(for: .milliseconds(50)) }
+            guard !running else { return }
             activating = true
             defer { activating = false }
-            if running {
-                if micOn { audio.stop() }   // startSession でつなぎ直す
-                finalizeSession()
-            }
             PersonStore.shared.selectedID = id
             PersonStore.shared.awaitingPerson = false
             startNote = nil
@@ -197,8 +193,8 @@ final class AnalysisModel: ObservableObject {
         }
     }
 
-    /// 記録している人を消した：記録を閉じ、マイクを止めて、人を選ぶのを待つ
-    func closeRecording() {
+    /// 「記録を終える」（v1.11.2〜）：記録を閉じ、マイクを止めて、最初の画面（だれを記録しますか）に戻る。カメラは顔が映っているかを見るために動かしたまま
+    func endRecording() {
         guard running else { return }
         if micOn { audio.stop() }
         finalizeSession()   // カメラは止めない（「だれを記録しますか」の映像に使う）

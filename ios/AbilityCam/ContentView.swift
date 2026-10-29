@@ -9,7 +9,7 @@ struct ContentView: View {
     @State private var cameraLarge = false
     @State private var showSettings = false
     @State private var middlePage = 0
-    @State private var showPeople = false
+    @State private var confirmEnd = false   // 「記録を終えますか？」（v1.11.2〜。記録中は人を変えない）
     @ObservedObject private var people = PersonStore.shared
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
 
@@ -18,13 +18,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            topBar
-            if model.lensInUse == .front {   // 前面は自分で試す用（v1.5〜）
-                Label("前面カメラ（試す用）", systemImage: "camera.rotate")
-                    .font(.caption).foregroundStyle(Self.navy)
-                    .padding(.horizontal, 10).padding(.vertical, 3)
-                    .background(Self.paleSlate, in: Capsule())
-            }
+            topBar   // v1.11.2〜：前面カメラの帯は出さない（カメラは最初の画面で選び、記録中は変えない）
             ViewersBar(link: model.link)
             HStack(alignment: .top, spacing: 12) {
                 faceSketch
@@ -38,7 +32,12 @@ struct ContentView: View {
         .padding(.bottom, 8)
         .overlay { if cameraLarge { largeCamera } }
         .sheet(isPresented: $showSettings) { SettingsView(link: model.link) }
-        .sheet(isPresented: $showPeople) { PersonPickerView() }
+        .confirmationDialog("記録を終えますか？", isPresented: $confirmEnd, titleVisibility: .visible) {
+            Button("記録を終える") { model.endRecording() }
+            Button("続ける", role: .cancel) {}
+        } message: {
+            Text("記録を閉じて、最初の画面（だれを記録しますか）に戻ります")
+        }
         // 「普段を取り直す」などで画面に出して取った今日の普段を、取り終えたとき（保存した普段がある人だけ）
         .alert("この普段で保存し直しますか？", isPresented: Binding(get: { model.askResave }, set: { if !$0 { model.askResave = false } })) {
             Button("保存し直す") { model.overwriteSaved() }
@@ -65,9 +64,9 @@ struct ContentView: View {
         .foregroundStyle(Self.navyText)
     }
 
-    /// いつも出す：記録中かどうかと経過時間。下に小さく選んでいる人（タップで変える）
+    /// いつも出す：記録中かどうかと経過時間。下に小さく記録している人。押すと「記録を終えますか？」だけ（v1.11.2〜。人は変えない）
     private var recordingBanner: some View {
-        Button { showPeople = true } label: {
+        Button { if model.running { confirmEnd = true } } label: {
             VStack(spacing: 1) {
                 Group {
                     if model.running, let since = model.sessionStartedAt {
@@ -80,7 +79,7 @@ struct ContentView: View {
                     }
                 }
                 .font(.callout.bold())
-                Text("\(people.selected?.displayName ?? "人を選んでいません") ▾")
+                Text(people.selected?.displayName ?? "人を選んでいません")
                     .font(.caption2)
             }
             .foregroundStyle(Self.navy)
@@ -89,7 +88,7 @@ struct ContentView: View {
             .background(Self.paleSlate, in: Capsule())   // 薄い青灰
         }
         .buttonStyle(.plain)
-        .accessibilityHint("タップで記録する人を変える")
+        .accessibilityHint("押すと、記録を終えるかを確かめます")
     }
 
     static let navy = Color(red: 0x1F / 255, green: 0x3A / 255, blue: 0x5F / 255)   // 濃紺

@@ -2,10 +2,10 @@ import SwiftUI
 
 /// 撮る側を開いたときの最初の画面「だれを記録しますか」（v1.11.1〜）。
 /// 介助する人に要るのは「正しい人で、すぐ始められる」「映り方を始める前に確かめられる」だけなので、それ以外は置かない。
-/// - 上：カメラの映像（保存も送信もしない。網目は出さない）と、その下に「顔が映っています／映っていません」
-/// - 前回記録した人を大きなボタン1つで。押すと軽い触覚を返して記録を始める
-/// - ほかの人（横に並べる）と「＋ 人を足す」は小さく
-/// 映像は記録を始めてもカメラを止めずに、記録中の画面に引き継ぐ（同じ AVCaptureSession）
+/// - 映像は出さない（v1.11.2〜）。カメラと顔の検出は動かし、見出しの上に「顔が映っています／映っていません」だけ（アイコン付き）
+/// - 前回記録した人を大きなボタン1つで、画面の真ん中寄りに。押すと軽い触覚を返して記録を始める
+/// - ほかの人（横に並べる）と「＋ 人を足す」は小さく。カメラ（広角・超広角・前面）もここで小さく選ぶ（記録中は変えない、v1.11.2〜）
+/// カメラは記録を始めても止めずに、記録中の画面で使い続ける（同じ AVCaptureSession。記録中の画面は今まで通り映像を出す）
 struct PersonStartView: View {
     @ObservedObject var model: AnalysisModel
     @ObservedObject private var store = PersonStore.shared
@@ -13,13 +13,15 @@ struct PersonStartView: View {
     @State private var askName = false
     @State private var newName = ""
     @State private var started = 0          // 触覚を返すきっかけ
+    @AppStorage("cameraLens") private var cameraLens = CameraLens.wide.rawValue
 
     var body: some View {
         GeometryReader { geo in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     topBar
-                    camera(height: max(160, geo.size.height / 3))
+                    Spacer(minLength: 12)
+                    faceLine
                     Text("だれを記録しますか")
                         .font(.title2.bold())
                         .foregroundStyle(.primary)
@@ -30,7 +32,8 @@ struct PersonStartView: View {
                     } else {
                         addButton(large: true)
                     }
-                    Spacer(minLength: 8)
+                    Spacer(minLength: 12)
+                    lensPicker
                     Label("映像と音声は保存しません", systemImage: "lock")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -75,41 +78,36 @@ struct PersonStartView: View {
         }
     }
 
-    /// カメラの映像（角丸、画面幅いっぱい）と、顔が映っているかの一言
-    private func camera(height: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Group {
-                #if DEBUG
-                if AnalysisModel.uiPreviewStart {
-                    PreviewStandIn()   // シミュレーターにはカメラが無いので、スクリーンショット用の代わり
-                } else {
-                    CameraPreview(camera: model.camera, fill: true, lens: model.lensInUse)
+    /// カメラ（広角・超広角・前面）：記録を始める前にだけ選ぶ（v1.11.2〜。記録中は設定でも変えない）
+    private var lensPicker: some View {
+        Menu {
+            Picker("カメラ", selection: $cameraLens) {
+                ForEach(CameraLens.allCases) { l in
+                    Text(l.available ? l.label : "\(l.label)（この端末にはありません）").tag(l.rawValue)
                 }
-                #else
-                CameraPreview(camera: model.camera, fill: true, lens: model.lensInUse)
-                #endif
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: height)
-            .background(Color.black)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .accessibilityHidden(true)
-            faceLine
+        } label: {
+            Label("カメラ：\((CameraLens(rawValue: cameraLens) ?? .wide).label)", systemImage: "camera")
+                .font(.footnote)
+                .frame(minHeight: 44)
         }
+        .foregroundStyle(Palette.progress)
+        .frame(maxWidth: .infinity)
+        .accessibilityLabel("カメラ：\((CameraLens(rawValue: cameraLens) ?? .wide).label)。変える")
     }
 
     @ViewBuilder private var faceLine: some View {
         if let note = model.startNote {
             Label(note, systemImage: "info.circle")
-                .font(.footnote).foregroundStyle(Palette.progress)
+                .font(.callout).foregroundStyle(Palette.progress)
         } else if let found = model.previewFace {
             Label(found ? "顔が映っています" : "顔が映っていません", systemImage: found ? "face.smiling" : "face.dashed")
-                .font(.footnote.weight(found ? .regular : .semibold))
+                .font(.headline.weight(found ? .regular : .semibold))
                 .foregroundStyle(found ? Palette.face : Palette.progress)
                 .animation(.easeInOut(duration: 0.2), value: found)
         } else {
             Label("カメラを準備しています", systemImage: "hourglass")
-                .font(.footnote).foregroundStyle(.secondary)
+                .font(.headline.weight(.regular)).foregroundStyle(.secondary)
         }
     }
 
@@ -180,15 +178,3 @@ struct PersonStartView: View {
         _ = store.choose(id)   // 記録していないので、そのまま始まる
     }
 }
-
-#if DEBUG
-/// スクリーンショット用：映像の代わりに灰色の地と顔の絵
-private struct PreviewStandIn: View {
-    var body: some View {
-        ZStack {
-            LinearGradient(colors: [Color(white: 0.32), Color(white: 0.18)], startPoint: .top, endPoint: .bottom)
-            FaceSketch(shape: ["yaw": 4, "pitch": -2, "roll": 1], size: 120, tone: .medium)
-        }
-    }
-}
-#endif

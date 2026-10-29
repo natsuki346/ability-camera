@@ -1795,6 +1795,24 @@ class StartScreenTest(unittest.TestCase):
         self.assertIn("。記録を始める", src)                      # VoiceOver で名前と「記録を始める」
         self.assertNotRegex(src, r"\.(red|green|yellow|orange)\b")  # 信号色を使わない
         self.assertNotIn("MeshOverlay", src)                       # 網目は出さない
+        self.assertNotIn("CameraPreview", src)                     # 映像は出さない（v1.11.2〜）
+        self.assertIn("カメラ：", src)                               # カメラは最初の画面で選ぶ
+        # 記録中は人とカメラを変えない（v1.11.2〜）：上の帯は「記録を終えますか？」だけ。閉じて新しく始める流れは無い
+        app = root / "ios" / "AbilityCam"
+        cv = (app / "ContentView.swift").read_text(encoding="utf-8")
+        person = (app / "Person.swift").read_text(encoding="utf-8")
+        settings = (app / "AbilityCamApp.swift").read_text(encoding="utf-8")
+        self.assertIn("記録を終えますか？", cv)
+        self.assertIn("記録を終える", cv)
+        self.assertNotIn("PersonPickerView()", cv)
+        self.assertNotIn("前面カメラ（試す用）", cv)
+        self.assertIn("記録を終えてから選べます", person)
+        self.assertIn(".disabled(people.inSession)", settings)
+        for src_ in (cv, person, guide):
+            self.assertNotIn("新しく始めますか？」（「はい」", src_)
+        self.assertNotIn("switchRecording", person)
+        for w in ("記録を終えますか？", "記録を終えてから選べます"):
+            self.assertIn(w, guide)
         self.assertGreaterEqual(min(int(x) for x in re.findall(r"minHeight: (?:large \? \d+ : )?(\d+)", src)), 44)
         for n in (0, 1, 3):
             for mode in ("light", "dark"):

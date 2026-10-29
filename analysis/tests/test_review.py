@@ -1609,6 +1609,9 @@ class SpeakerTest(unittest.TestCase):
         self.assertEqual(app("maxSpanS"), c["max_span_s"])
         self.assertEqual(app("hopS"), c["hop_s"])
         self.assertEqual(app("enrollTargetS"), c["enroll_target_s"])
+        self.assertEqual(app("selfThreshold"), c["self_threshold"])
+        self.assertEqual(app("shortWindowMs"), c["short_window_ms"])
+        self.assertEqual(float(re.search(r"otherVoiceWindowMs: Int64 = (\d+)", src).group(1)) / 1000, c["other_voice_window_s"])
         self.assertEqual(c["self_gate"]["version"], 3)
         self.assertIn("e.gateVersion = 3", (review.HERE.parent / "ios" / "AbilityCam" / "AnalysisModel.swift").read_text(encoding="utf-8"))
 
@@ -1684,3 +1687,86 @@ class EnrollCheckTest(unittest.TestCase):
         mine = [enroll_check.gate3(fr, e, s) for e, s in chunks]
         self.assertEqual(app, mine)
         self.assertGreater(len(set(mine)), 2)
+
+
+class SpeakerSelfTest(unittest.TestCase):
+    """声紋で本人の声か（self_by_speaker、v1.10.5〜）を、レポートと voice_check.py で voice_self と並べる。fbank が Debug でも速い"""
+
+    def record(self, d):
+        import json
+        t0 = 1_800_000_000_000
+        lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "speaker_on": True, "speaker_self_threshold": 0.45})]
+        for k in range(600):   # 20秒。0〜10秒は本人の声（voice_self true）、10〜20秒はほかの人（false）
+            t = k * 33
+            lines.append(json.dumps({"type": "frame", "t_ms": t0 + t, "face": True, "f0_hz": 150.0, "rms_db": -40.0,
+                                     "voice_self": t < 10000 if k % 5 else None}))
+        for k in range(1, 40):  # 0.5秒ごと。本人の区間は 1.5秒以上だと true、短いと false
+            t = 500 * k
+            w = 1000 if k % 4 == 0 else 3000
+            sb = (w >= 1500) if t < 10000 else False
+            lines.append(json.dumps({"type": "speaker", "t_ms": t0 + t, "window_ms": w, "scores": {"a": 0.8 if sb else 0.2}, "calc_ms": 1.0,
+                                     "self_by_speaker": sb}))
+        p = Path(d) / "self.jsonl"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def test_voice_check_table_and_report(self):
+        import argparse
+        import voice_check
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            rec = review.load(self.record(d))
+            q = review.quality(review.analyze(rec, c), calm=False)
+            ns = argparse.Namespace()
+            setattr(ns, "self", ["0-10"]); ns.other = ["10-20"]
+            rows = voice_check.speaker_table(rec, ns)
+        self.assertEqual(rows[0][0], "本人 0-10")
+        self.assertTrue(rows[0][1].startswith("100%"))       # voice_self で本人
+        self.assertTrue(rows[0][2].startswith("79%"))        # 全部の行：19 のうち 15（短い 4 は false）
+        self.assertTrue(rows[0][3].startswith("100%"))       # 1.5秒以上の行だけ
+        self.assertTrue(rows[1][1].startswith("0%") and rows[1][2].startswith("0%"))
+        self.assertEqual(q["speaker_self"]["long"], (15, 15))
+
+    def test_fbank_fast_without_optimization(self):
+        """SpeakerFbank（vDSP、v1.10.5〜）を -Onone（Xcode の Debug と同じ）でビルドしても、3秒の fbank が Mac で 3ms 以下（iPhone の目安 10ms）"""
+        import shutil
+        import subprocess
+        import speaker_check
+        if not shutil.which("swiftc"):
+            self.skipTest("swiftc が無い")
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "sc"
+            subprocess.run(["swiftc", "-Onone", "-o", str(exe), *map(str, speaker_check.SOURCES)], check=True, capture_output=True)
+            ms = float(subprocess.run([str(exe), "--bench-fbank"], check=True, capture_output=True, text=True).stdout)
+        self.assertLess(ms, 3.0)
+
+
+class PaletteTest(unittest.TestCase):
+    """文字の色（v1.10.5〜、ios/AbilityCam/Theme.swift）：白・黒の背景で読める濃さで、赤・黄・緑の信号色を使わない"""
+
+    @staticmethod
+    def contrast(a: int, b: int) -> float:
+        def lum(h):
+            c = [((h >> s) & 255) / 255 for s in (16, 8, 0)]
+            r, g, b_ = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b_
+        la, lb = sorted((lum(a), lum(b)), reverse=True)
+        return (la + 0.05) / (lb + 0.05)
+
+    def test_text_colors(self):
+        import colorsys
+        import re
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "Theme.swift").read_text(encoding="utf-8")
+        pairs = re.findall(r"static let (\w+) = adaptive\(light: 0x([0-9A-F]{6}), dark: 0x([0-9A-F]{6})\)", src)
+        self.assertGreaterEqual(len(pairs), 4)
+        for name, light, dark in pairs + [("face", "1F3A5F", "DCE3EA")]:
+            lt, dk = int(light, 16), int(dark, 16)
+            self.assertGreaterEqual(self.contrast(lt, 0xFFFFFF), 4.5, name)
+            self.assertGreaterEqual(self.contrast(dk, 0x000000), 4.5, name)
+            self.assertGreaterEqual(self.contrast(dk, 0x1C1C1E), 4.5, name)   # ダークモードの一段明るい背景
+            for h in (lt, dk):   # 赤（〜20°・340°〜）・黄（45〜70°）・緑（80〜160°）の、鮮やかな色は使わない
+                r, g, b = ((h >> 16) & 255) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255
+                hue, _, sat = colorsys.rgb_to_hls(r, g, b)
+                deg = hue * 360
+                if sat > 0.45:
+                    self.assertFalse(deg < 20 or deg > 340 or 45 <= deg <= 70 or 80 <= deg <= 160, (name, hex(h), deg))

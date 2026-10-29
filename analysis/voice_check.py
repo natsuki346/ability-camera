@@ -15,6 +15,10 @@
   --pitch-median 150 --pitch-spread 15   保存した声の普段の代わり（記録に保存した声の普段の行が無いとき、声の高さの範囲の決まりを試す）
   --self-baseline                  本人の時間の声の高さから、アプリと同じ求め方（中央値・四分位範囲）で声の普段を作って試す
 タイミングの決まりは v1.9.1 から判定に使っていない（criteria.json の voice_self.sync.enabled: false）が、ここでは試すために入れる
+
+v1.10.5〜：記録に話者の区別の行（type: "speaker"、self_by_speaker）があれば、渡した区間ごとに
+  voice_self で本人の割合（記録の voice_self。声が出ていたコマのうち true）と、
+  self_by_speaker で本人の割合（全部／使った声が 1.5秒以上の行だけ）を並べた表も出す
 """
 from __future__ import annotations
 
@@ -112,6 +116,26 @@ def report(rec, c, lab) -> list[list[str]]:
     return rows
 
 
+def speaker_table(rec: review.Recording, args, short_ms: int = 1500) -> list[list[str]]:
+    """区間ごとに、voice_self と self_by_speaker（声紋）で本人とした割合（v1.10.5〜）"""
+    t0 = float(rec.t[0])
+    vs = rec.voice_self_rec
+    rows = []
+    pct = lambda k, n: f"{k / n:.0%}（{k}/{n}）" if n else "–"
+    for kind, values in (("本人", args.self), ("ほかの人", args.other)):
+        for s in spans(values):
+            a, b = parse_span(s, t0)
+            m = (rec.t >= a) & (rec.t < b)
+            v = vs[m] if vs is not None else np.array([])
+            v = v[(v == 0) | (v == 1)]   # 声が出ていて本人か決めたコマ（null・キーの無いコマは除く）
+            sp = [r for r in rec.speaker if a <= r["t_ms"] / 1000 < b and r.get("self_by_speaker") is not None]
+            long_ = [r for r in sp if r.get("window_ms", 0) >= short_ms]
+            rows.append([f"{kind} {s}", pct(int((v == 1).sum()), len(v)),
+                         pct(sum(r["self_by_speaker"] is True for r in sp), len(sp)),
+                         pct(sum(r["self_by_speaker"] is True for r in long_), len(long_))])
+    return rows
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("record")
@@ -141,6 +165,12 @@ def main(argv=None) -> int:
     print("決まり\t本人を本人と言えた\tほかの人を本人と言ってしまった\t声のコマ（本人 / ほかの人）")
     for r in report(rec, c, lab):
         print("\t".join(r))
+    if any(r.get("self_by_speaker") is not None for r in rec.speaker):
+        th = (c.get("speaker") or {}).get("self_threshold")
+        print(f"\n区間ごと：voice_self と声紋（self_by_speaker、選んでいる人の似ている度合い ≥ {th}）で本人とした割合")
+        print("区間\tvoice_self で本人（声のコマ）\tself_by_speaker で本人（全部の行）\tself_by_speaker で本人（1.5秒以上の行）")
+        for r in speaker_table(rec, args, int((c.get("speaker") or {}).get("short_window_ms", 1500))):
+            print("\t".join(r))
     return 0
 
 

@@ -1457,6 +1457,10 @@ def quality(a: Analysis, calm: bool) -> dict:
         ids = sorted({k for r in rec.speaker for k in (r.get("scores") or {})})
         roles = {x.get("id"): x.get("role") for x in rec.header.get("speaker_enrolled") or []}
         f0r = np.array([r["f0_ratio"] for r in rec.speaker if r.get("f0_ratio") is not None], float)   # v1.10.2〜
+        sb = [(r.get("self_by_speaker"), r.get("window_ms", 0) >= 1500) for r in rec.speaker if "self_by_speaker" in r]   # v1.10.5〜
+        q["speaker_self"] = {"all": (sum(v is True for v, _ in sb), sum(v is False for v, _ in sb), sum(v is None for v, _ in sb)),
+                             "long": (sum(v is True for v, lg in sb if lg), sum(v is False for v, lg in sb if lg)),
+                             "threshold": rec.header.get("speaker_self_threshold")} if sb else None
         q["speaker"] = {"n": len(rec.speaker), "short": int((win < 1500).sum()), "win": tuple(np.percentile(win, [10, 50, 90])),
                         "f0_ratio": tuple(np.percentile(f0r, [10, 50, 90])) if len(f0r) else None,
                         "f0_none": int((f0r == 0).sum()),
@@ -1969,6 +1973,11 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                           "10% / 中央値 / 90%：" + " / ".join(f"{v:.2f}" for v in sp["f0_ratio"]) + f"。f0 がまったく取れていなかった行 {sp['f0_none']}"])
         for k, (role, (p10, p50, p90)) in sp["scores"].items():
             qrows.append([f"声を登録した人 {k[:8]}（{rl.get(role, role)}）との似ている度合い（10% / 中央値 / 90%）", f"{p10:.2f} / {p50:.2f} / {p90:.2f}"])
+        if q.get("speaker_self"):
+            ss = q["speaker_self"]
+            qrows.append([f"声紋で本人の声か（self_by_speaker、v1.10.5〜。選んでいる人の似ている度合い ≥ {ss['threshold']}。判定には使わない）",
+                          f"全部の行：本人 {ss['all'][0]}・本人でない {ss['all'][1]}・登録なし {ss['all'][2]}。"
+                          f"使った声が1.5秒以上の行：本人 {ss['long'][0]}・本人でない {ss['long'][1]}"])
         cl = {"voice_self": "本人の声とされた時間だけ", "voiced": "声が出ている時間すべて", None: "集めたものが書かれていない"}
         for k, v in sp.get("enroll", {}).items():
             qrows.append([f"声の登録の途中 {k[:8]}（{cl.get(v['collect'], v['collect'])}。たまった秒数：その時点までの登録と最新の声の似ている度合い）",

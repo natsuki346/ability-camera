@@ -147,7 +147,7 @@ struct ViewerView: View {
             VStack(spacing: 4) {
                 if let shape = s?.shape, shape["yaw"] != nil {
                     Text("顔の向き：\(FaceSketch.directionText(shape))")
-                        .font(.system(size: 20 * k, weight: .semibold)).foregroundStyle(Self.navy)
+                        .font(.system(size: 20 * k, weight: .semibold)).foregroundStyle(Palette.head)
                     if abs(shape["yaw"] ?? 0) > FaceSketch.sideLimit {
                         Text("横を向いているため表情は参考程度").font(.system(size: 14 * k)).foregroundStyle(.secondary)
                     }
@@ -182,7 +182,7 @@ struct ViewerView: View {
                     VStack(alignment: .leading, spacing: 4 * k) {
                         Text(last.value)
                             .font(.system(size: (h == .hidden ? 30 : 26) * k, weight: .bold))
-                            .foregroundStyle(Self.navy)
+                            .foregroundStyle(Palette.head)
                             .fixedSize(horizontal: false, vertical: true)
                         let since = max(cameraNow(now) - Double(last.tMs) / 1000, 0)
                         Text("\(Self.time(ms: last.tMs)) から（\(ContentView.duration(since))）")
@@ -238,16 +238,16 @@ struct ViewerView: View {
             card(k) {
                 VStack(alignment: .leading, spacing: 8 * k) {
                     HStack(alignment: .firstTextBaseline) {
-                        Text("いま").font(.system(size: 26 * k, weight: .bold)).foregroundStyle(Self.navy)
+                        Text("いま").font(.system(size: 26 * k, weight: .bold)).foregroundStyle(Palette.face)
                         Spacer()
                         if !live { Text(lastReceivedText).font(.system(size: 14 * k)).foregroundStyle(.secondary) }
                     }
-                    groupHeader("表情", reason: faceReason(s), k)
+                    groupHeader("表情", reason: faceReason(s), color: Palette.progress, k)
                     ForEach(Metric.allCases.filter(\.isFace), id: \.self) { m in
                         meterRow(m, s, faded: faceReason(s) != nil, k)
                     }
                     eyesRow(s, faded: faceReason(s) != nil, k)
-                    groupHeader("声", reason: voiceReason(s), k).padding(.top, 4 * k)
+                    groupHeader("声", reason: voiceReason(s), color: s?.otherVoice == true && s?.voiceSec == nil ? Palette.voice : Palette.progress, k).padding(.top, 4 * k)
                     ForEach(Metric.allCases.filter { !$0.isFace }, id: \.self) { m in
                         meterRow(m, s, faded: false, k)
                     }
@@ -280,10 +280,11 @@ struct ViewerView: View {
         return nil
     }
 
-    private func groupHeader(_ title: String, reason: String?, _ k: CGFloat) -> some View {
+    /// color：理由の種類の色（進み具合・記録していない＝青灰、本人以外の声＝焦げ茶。v1.10.5〜）
+    private func groupHeader(_ title: String, reason: String?, color: Color, _ k: CGFloat) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text(title).font(.system(size: 15 * k, weight: .semibold)).foregroundStyle(.secondary)
-            if let reason { Text(reason).font(.system(size: 17 * k, weight: .semibold)).foregroundStyle(Self.navy) }
+            if let reason { Text(reason).font(.system(size: 17 * k, weight: .semibold)).foregroundStyle(color) }
         }
     }
 
@@ -334,7 +335,7 @@ struct ViewerView: View {
             }
             Text(status)
                 .font(.system(size: (strong ? 19 : 15) * k, weight: strong ? .bold : .regular).monospacedDigit())
-                .foregroundStyle(strong ? Self.navy : .secondary)
+                .foregroundStyle(strong ? Palette.face : .secondary)
                 .lineLimit(2).minimumScaleFactor(0.7)
                 .frame(width: 210 * k, alignment: .leading)
         }
@@ -358,7 +359,7 @@ struct ViewerView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Text(status)
                 .font(.system(size: (closed == true ? 19 : 15) * k, weight: closed == true ? .bold : .regular).monospacedDigit())
-                .foregroundStyle(closed == true ? Self.navy : .secondary)
+                .foregroundStyle(closed == true ? Palette.eyes : .secondary)
                 .lineLimit(1).minimumScaleFactor(0.7)
                 .frame(width: 210 * k, alignment: .leading)
         }
@@ -382,7 +383,7 @@ struct ViewerView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Text(status)
                 .font(.system(size: (on == true ? 19 : 15) * k, weight: on == true ? .bold : .regular).monospacedDigit())
-                .foregroundStyle(on == true ? Self.navy : .secondary)
+                .foregroundStyle(on == true ? Palette.voice : .secondary)
                 .lineLimit(1).minimumScaleFactor(0.7)
                 .frame(width: 210 * k, alignment: .leading)
         }
@@ -415,8 +416,10 @@ struct ViewerView: View {
                     Text(s.faceReadable ? "いつもと大きな違いはありません" : "声は、いつもと大きな違いはありません")
                         .font(.system(size: 22 * k))
                 } else {
-                    ForEach(s.differences, id: \.self) {
-                        Text($0).font(.system(size: 28 * k, weight: .bold)).foregroundStyle(Self.navy)
+                    // メーターの点と同じ色の印と、種類の色の太い文字（v1.10.5〜）。diffs は differences と同じ順
+                    ForEach(Array(s.differences.enumerated()), id: \.element) { i, text in
+                        DiffLineView(text: text, target: s.diffs.flatMap { i < $0.count ? DiffTarget(key: $0[i].metric) : nil },
+                                     font: .system(size: 28 * k, weight: .bold), markerSize: 14 * k)
                     }
                 }
                 if !s.insufficient.isEmpty {
@@ -466,7 +469,7 @@ struct ViewerView: View {
         return VStack(alignment: .leading, spacing: 6 * k) {
             Label(s?.recording == true ? "記録中 \(elapsed.map(ContentView.duration) ?? "")" : "記録していません",
                   systemImage: s?.recording == true ? "record.circle" : "pause.circle")
-                .font(.system(size: 22 * k, weight: .bold)).foregroundStyle(Self.navy)
+                .font(.system(size: 22 * k, weight: .bold)).foregroundStyle(Palette.face)
             if let s, s.recording {
                 if let sec = s.baselineSec {
                     Text("普段を記録中 \(sec)/\(s.baselineTotal)秒")
@@ -529,7 +532,7 @@ struct ViewerView: View {
         return card(k) {
             VStack(alignment: .leading, spacing: 8 * k) {
                 HStack(spacing: 14 * k) {
-                    Text("時間の流れ").font(.system(size: 20 * k, weight: .bold)).foregroundStyle(Self.navy)
+                    Text("時間の流れ").font(.system(size: 20 * k, weight: .bold)).foregroundStyle(Palette.face)
                     Picker("表示する長さ", selection: $span) {
                         Text("1分").tag(60.0)
                         Text("5分").tag(300.0)

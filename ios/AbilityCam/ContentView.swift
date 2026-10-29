@@ -177,6 +177,7 @@ struct ContentView: View {
                 } else if let shape {
                     Text(sketch.turnedAway ? "横向き：表情は参考程度"
                          : shape["yaw"] != nil ? "顔の向き：\(FaceSketch.directionText(shape))" : " ")
+                        .foregroundStyle(Palette.head).fontWeight(.medium)   // 顔の向き（v1.10.5〜、藍）
                 } else {
                     Text("読めません").foregroundStyle(.secondary)
                 }

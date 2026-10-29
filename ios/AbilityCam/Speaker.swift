@@ -25,10 +25,35 @@ enum SpeakerCriteria {
     /// 記録 ability-cam-20261029-114906 で、黙っている区間（95〜145秒）は -60〜-75dB、話している区間は -38〜-46dB。その間で、
     /// 黙っている区間の上端から 8dB、話している区間の下端から 6dB 離した値（analysis/criteria.json の speaker.voiced_floor_db と同じ）
     static let voicedFloorDb: Float = -52
+    /// 声紋で本人の声か（v1.10.5〜、記録の self_by_speaker・「本人以外の声」）：選んでいる人の似ている度合いがこれ以上なら本人。仮の値。
+    /// 記録 ability-cam-20261029-131619 の推定区間で、自分 0.7〜0.87・動画の人 -0.13〜0.27 だったため（この記録を見て決めた値。analysis/criteria.json の speaker.self_threshold）
+    static let selfThreshold = 0.45
+    /// これより短い声（ms）は、自分でも似ている度合いが下がる（0.4 前後）ので、「本人以外の声」には使わず、記録・レポートでは別に数える
+    static let shortWindowMs = 1500
+    /// 「本人以外の声」を声紋で決めるときに見る直近の長さ（ms）
+    static let otherVoiceWindowMs: Int64 = 1000
     static let enrollTargetS = 15.0                         // 登録：声が合計これだけたまったら作る（v1.10.4〜 15秒、仮の値。speaker_enroll_progress の score が何秒で落ち着くかを見て決め直す。v1.10〜v1.10.3 は 30秒）
     static let enrollMaxAgeDays = 14.0                      // 途中まで集めた登録は、集め始めてから14日で捨てる（声の普段と同じ）
     static let enrollProgressStepS = 5.0                    // 登録の途中、たまった秒数がこれだけ増えるごとに、似ている度合いを記録に書く（v1.10.1〜、登録に必要な秒数を決めるため）
     static let selfGateWaitMs: Int64 = 3000                 // 本人を登録するとき、声のまとまりの終わりのコマがこれだけ待っても来なければ数えない（v1.10.1〜）
+}
+
+/// 「声：本人以外の声が入っています」を声紋で決める（v1.10.5〜。選んでいる人の声の登録があるとき）。
+/// 直近1秒に、使った声が1.5秒以上の行で self_by_speaker が false のものがあり、true が無ければ出す。1.5秒未満の行しか無いときは出さない
+struct SpeakerOtherVoice {
+    private var rows: [(t: Int64, windowMs: Int, selfBy: Bool?)] = []
+
+    mutating func add(tMs: Int64, windowMs: Int, selfBySpeaker: Bool?) {
+        rows.append((tMs, windowMs, selfBySpeaker))
+        rows.removeAll { $0.t < tMs - 5000 }
+    }
+
+    mutating func clear() { rows = [] }
+
+    func other(nowMs: Int64) -> Bool {
+        let recent = rows.filter { nowMs - $0.t <= SpeakerCriteria.otherVoiceWindowMs && $0.t <= nowMs + 1000 && $0.windowMs >= SpeakerCriteria.shortWindowMs }
+        return recent.contains { $0.selfBy == false } && !recent.contains { $0.selfBy == true }
+    }
 }
 
 /// 声の登録で、何を集めるか（v1.10.1〜。記録の event speaker_enroll の collect）
@@ -162,6 +187,9 @@ enum SpeakerMath {
         return Double(dot / (na.squareRoot() * nb.squareRoot()))
     }
 
+    /// 声紋で本人の声か（v1.10.5〜）：選んでいる人の似ている度合いが selfThreshold 以上なら true、未満なら false、登録が無ければ nil
+    static func selfBySpeaker(score: Double?) -> Bool? { score.map { $0 >= SpeakerCriteria.selfThreshold - 1e-9 } }
+
     /// 声が出ているか（v1.10.2〜）：f0 がある、または声の大きさが voicedFloorDb 以上
     static func voiced(f0: Bool, rmsDb: Float?) -> Bool { f0 || (rmsDb.map { $0 >= SpeakerCriteria.voicedFloorDb } ?? false) }
 
@@ -207,9 +235,9 @@ final class SpeakerFbank {
     private let mel: [Float]          // (257, 80)
     private let fft: FFTSetup
     private var frame = [Float](repeating: 0, count: SpeakerFbank.nfft)
+    private var tmp = [Float](repeating: 0, count: SpeakerFbank.frameLen)
     private var re = [Float](repeating: 0, count: SpeakerFbank.nfft / 2)
     private var im = [Float](repeating: 0, count: SpeakerFbank.nfft / 2)
-    private var power = [Float](repeating: 0, count: SpeakerFbank.nfft / 2 + 1)
 
     init() {
         let n = Self.frameLen
@@ -233,42 +261,60 @@ final class SpeakerFbank {
 
     static func frames(samples: Int) -> Int { samples < frameLen ? 0 : 1 + (samples - frameLen) / shift }
 
-    /// x：16kHz の声（-1〜1）。返り値：(フレーム数 × 80) を行ごとに並べたもの
+    /// x：16kHz の声（-1〜1）。返り値：(フレーム数 × 80) を行ごとに並べたもの。
+    /// v1.10.5〜：1つずつのループをやめ、vDSP（窓・プリエンファシス・FFT・パワー・メルの重みの行列の掛け算・log・平均を引く）で書いた。
+    /// Swift はファイルごとに最適化を変えられず、Xcode の Debug（-Onone）で iPhone 146ms・Mac 55ms かかっていたため（Accelerate は Debug でも最適化済み）
     func compute(_ x: [Float]) -> [Float] {
-        let nf = Self.frames(samples: x.count), n = Self.frameLen, half = Self.nfft / 2
-        var out = [Float](repeating: 0, count: nf * Self.bins)
+        let nf = Self.frames(samples: x.count), n = Self.frameLen, half = Self.nfft / 2, bins = Self.bins
+        guard nf > 0 else { return [] }
+        var out = [Float](repeating: 0, count: nf * bins)
         var spec = [Float](repeating: 0, count: nf * (half + 1))
-        for f in 0..<nf {
-            for j in 0..<n { frame[j] = x[f * Self.shift + j] * 32768 }
-            var mean: Float = 0
-            vDSP_meanv(frame, 1, &mean, vDSP_Length(n))
-            for j in 0..<n { frame[j] -= mean }
-            for j in stride(from: n - 1, to: 0, by: -1) { frame[j] -= 0.97 * frame[j - 1] }
-            frame[0] -= 0.97 * frame[0]
-            for j in 0..<n { frame[j] *= window[j] }
-            for j in n..<Self.nfft { frame[j] = 0 }
-            re.withUnsafeMutableBufferPointer { rp in
-                im.withUnsafeMutableBufferPointer { ip in
-                    var z = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
-                    frame.withUnsafeBufferPointer { fp in
-                        fp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: half) { vDSP_ctoz($0, 2, &z, 1, vDSP_Length(half)) }
-                    }
-                    vDSP_fft_zrip(fft, &z, 1, 9, FFTDirection(FFT_FORWARD))
-                }
+        var scale: Float = 32768, pre: Float = -0.97, quarter: Float = 0.25
+        x.withUnsafeBufferPointer { xp in
+        frame.withUnsafeMutableBufferPointer { fp in
+        window.withUnsafeBufferPointer { wp in
+        re.withUnsafeMutableBufferPointer { rp in
+        im.withUnsafeMutableBufferPointer { ip in
+        spec.withUnsafeMutableBufferPointer { sp in
+        tmp.withUnsafeMutableBufferPointer { tp in
+            let f0 = fp.baseAddress!, w = wp.baseAddress!, t = tp.baseAddress!
+            var z = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+            vDSP_vclr(f0 + n, 1, vDSP_Length(Self.nfft - n))   // 400〜511 は 0 のまま
+            for f in 0..<nf {
+                // 32768 倍して、フレームの平均（DC）を引く（tmp に）
+                vDSP_vsmul(xp.baseAddress! + f * Self.shift, 1, &scale, t, 1, vDSP_Length(n))
+                var mean: Float = 0
+                vDSP_meanv(t, 1, &mean, vDSP_Length(n))
+                var neg = -mean
+                vDSP_vsadd(t, 1, &neg, t, 1, vDSP_Length(n))
+                // プリエンファシス：y[j] = x[j] − 0.97 x[j−1]（j ≥ 1）、y[0] = x[0] − 0.97 x[0]（tmp から frame へ）
+                vDSP_vsma(t, 1, &pre, t + 1, 1, f0 + 1, 1, vDSP_Length(n - 1))
+                f0[0] = t[0] - 0.97 * t[0]
+                vDSP_vmul(f0, 1, w, 1, f0, 1, vDSP_Length(n))
+                f0.withMemoryRebound(to: DSPComplex.self, capacity: half) { vDSP_ctoz($0, 2, &z, 1, vDSP_Length(half)) }
+                vDSP_fft_zrip(fft, &z, 1, 9, FFTDirection(FFT_FORWARD))
+                // zrip は 2倍の値。0 番目の実部が直流、虚部がナイキスト
+                let row = sp.baseAddress! + f * (half + 1)
+                let nyq = z.imagp[0]
+                z.imagp[0] = 0
+                vDSP_zvmags(&z, 1, row, 1, vDSP_Length(half))          // re² + im²（直流は re² だけ）
+                row[half] = nyq * nyq
+                vDSP_vsmul(row, 1, &quarter, row, 1, vDSP_Length(half + 1))
             }
-            // zrip は 2倍の値。0 番目の実部が直流、虚部がナイキスト
-            power[0] = re[0] * re[0] / 4
-            power[half] = im[0] * im[0] / 4
-            for k in 1..<half { power[k] = (re[k] * re[k] + im[k] * im[k]) / 4 }
-            for k in 0...half { spec[f * (half + 1) + k] = power[k] }
-        }
-        guard nf > 0 else { return out }
-        vDSP_mmul(spec, 1, mel, 1, &out, 1, vDSP_Length(nf), vDSP_Length(Self.bins), vDSP_Length(half + 1))
-        for i in out.indices { out[i] = log(max(out[i], Float.ulpOfOne)) }
-        for b in 0..<Self.bins {
-            var mean: Float = 0
-            vDSP_meanv(out.withUnsafeBufferPointer { $0.baseAddress! + b }, vDSP_Stride(Self.bins), &mean, vDSP_Length(nf))
-            for f in 0..<nf { out[f * Self.bins + b] -= mean }
+        }}}}}}}
+        vDSP_mmul(spec, 1, mel, 1, &out, 1, vDSP_Length(nf), vDSP_Length(bins), vDSP_Length(half + 1))
+        let total = out.count
+        var eps = Float.ulpOfOne, count = Int32(total)
+        out.withUnsafeMutableBufferPointer { op in
+            let o = op.baseAddress!
+            vDSP_vthr(o, 1, &eps, o, 1, vDSP_Length(total))   // 下限は Float の epsilon
+            vvlogf(o, o, &count)
+            for b in 0..<bins {   // メルごとに、フレームの平均を引く
+                var mean: Float = 0
+                vDSP_meanv(o + b, vDSP_Stride(bins), &mean, vDSP_Length(nf))
+                var neg = -mean
+                vDSP_vsadd(o + b, vDSP_Stride(bins), &neg, o + b, vDSP_Stride(bins), vDSP_Length(nf))
+            }
         }
         return out
     }

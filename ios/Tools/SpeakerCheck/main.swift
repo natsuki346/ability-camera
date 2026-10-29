@@ -100,6 +100,22 @@ if args.first == "--selftest" {
     var g = SpeakerSelfGate<Int>()
     g.embedding(endMs: 1000, spanS: 0.5, item: 7)
     if let r = g.ready(nowMs: 1000 + SpeakerCriteria.selfGateWaitMs + 1).first, r.outcome != .noFrames || r.item != 7 { bad.append("待ちすぎたのに数えた") }
+    // 声紋で本人の声か・「本人以外の声」（v1.10.5〜）
+    if SpeakerMath.selfBySpeaker(score: 0.45) != true || SpeakerMath.selfBySpeaker(score: 0.449) != false || SpeakerMath.selfBySpeaker(score: nil) != nil {
+        bad.append("self_by_speaker のしきい値が違う")
+    }
+    var ov = SpeakerOtherVoice()
+    ov.add(tMs: 10_000, windowMs: 3000, selfBySpeaker: false)
+    if !ov.other(nowMs: 10_500) { bad.append("長い声で本人でないのに出ない") }
+    if ov.other(nowMs: 11_100) { bad.append("1秒より前の行で出た") }
+    ov.add(tMs: 10_400, windowMs: 3000, selfBySpeaker: true)
+    if ov.other(nowMs: 10_500) { bad.append("本人の行があるのに出た") }
+    var ov2 = SpeakerOtherVoice()
+    ov2.add(tMs: 10_000, windowMs: 1000, selfBySpeaker: false)
+    if ov2.other(nowMs: 10_200) { bad.append("1.5秒未満の行だけで出た") }
+    ov2.add(tMs: 10_100, windowMs: 1000, selfBySpeaker: true)
+    ov2.add(tMs: 10_150, windowMs: 2000, selfBySpeaker: false)
+    if !ov2.other(nowMs: 10_200) { bad.append("短い行の true で、長い行の false が消えた") }
     // 登録の途中の数え（v1.10.3〜）：計算した声が 5秒の区切りを越えたら true、理由ごとに足す
     var tally = SpeakerEnrollTally()
     var hits: [Double] = []
@@ -122,6 +138,15 @@ if args.first == "--gate", args.count >= 2, let d = FileManager.default.contents
         case .counted: print("counted"); case .notSelf: print("not_self"); case .noF0: print("no_f0"); case .noFrames: print("no_frames")
         }
     }
+    exit(0)
+}
+// --bench-fbank：3秒の fbank を 50回求めた時間の中央値（ms）。-Onone（Xcode の Debug と同じ）でビルドして、遅くないかを見る（v1.10.5〜）
+if args.first == "--bench-fbank" {
+    let fb = SpeakerFbank()
+    let x = (0..<SpeakerCriteria.windowSamples).map { Float(sin(Double($0) * 0.05) * 0.3) }
+    var ms: [Double] = []
+    for _ in 0..<50 { let t = CFAbsoluteTimeGetCurrent(); _ = fb.compute(x); ms.append((CFAbsoluteTimeGetCurrent() - t) * 1000) }
+    print(String(format: "%.2f", ms.sorted()[ms.count / 2]))
     exit(0)
 }
 // --fbank 音.wav：fbank（SpeakerFbank）を JSON で出す（analysis のテストで torchaudio の値と比べる）

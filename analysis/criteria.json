@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-29.2",
+  "version": "2026-10-29.3",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -60,6 +60,10 @@
     {
       "date": "2026-10-29",
       "reason": "v1.10.4：声の登録に必要な声を 30秒から 15秒にした（speaker.enroll_target_s、仮の値。記録の speaker_enroll_progress の score が何秒で落ち着くかを見て決め直す）。本人の声の登録で数える決まりを gate 3 にした（speaker.self_gate）：数える 0.5秒に、顔が読めていて口が動いている声のコマ（voice_self true、または false で reason pitch）が1つ以上あり、no_mouth・no_face の false が無ければ数える。登録はひとりで話すので、声の高さの範囲で絞らない。記録 ability-cam-20261029-123404 で、本人の声が 160〜190Hz に上がり声の高さの範囲（〜158Hz）を外れて、ほとんど数えられなかったため。だれの声かの判定（voice_self）は変えない。アプリ（Speaker.swift）と同じ値。"
+    },
+    {
+      "date": "2026-10-29",
+      "reason": "v1.10.5：声紋で本人の声か（記録の self_by_speaker）を、今の voice_self と並べて記録する。しきい値 speaker.self_threshold 0.45（仮）：記録 ability-cam-20261029-131619 の推定区間で、選んでいる人（自分）の似ている度合いが自分の声で 0.7〜0.87、動画の人の声で -0.13〜0.27 だったため、その間にした。この記録を見て決めた値なので、台本の記録で決め直す。使った声が 1.5秒（speaker.short_window_ms）未満の行は自分でも 0.4 前後に下がるので、レポート・voice_check.py では別に数え、「本人以外の声」には使わない。だれの声かの判定（voice_self）・画面は変えない。「声：本人以外の声が入っています」だけは、選んでいる人の声の登録があるとき声紋で決める（直近1秒に 1.5秒以上の行で false があり true が無いとき）。アプリ（Speaker.swift）と同じ値。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -199,7 +203,7 @@
     "history_s": 1.0
   },
   "speaker": {
-    "_note": "話者の区別（v1.10〜、記録に書くだけ）。voiced_floor_db：声が出ている（埋め込みを求める）のは、f0 がある、または rms_db がこれ以上の音の塊（v1.10.2〜）。voice_gap_s：これより長く声が途切れたら声のまとまりを切る。max_span_s：埋め込みに使う直近の声の長さの上限（＝モデルの入力の長さ）。hop_s：計算の間隔。アプリ（Speaker.swift の SpeakerCriteria）と同じ値。enroll_target_s：声の登録に必要な声の秒数（v1.10.4〜 15秒、仮の値。speaker_enroll_progress の score が何秒で落ち着くかを見て決め直す）。self_gate：本人の登録で数える決まり（gate 3、v1.10.4〜）。count_s：数える分（直近）。good：数えるコマ（voice_self と reason。pitch の false も入れる）。block_reasons：これがあれば数えない",
+    "_note": "話者の区別（v1.10〜、記録に書くだけ）。voiced_floor_db：声が出ている（埋め込みを求める）のは、f0 がある、または rms_db がこれ以上の音の塊（v1.10.2〜）。voice_gap_s：これより長く声が途切れたら声のまとまりを切る。max_span_s：埋め込みに使う直近の声の長さの上限（＝モデルの入力の長さ）。hop_s：計算の間隔。アプリ（Speaker.swift の SpeakerCriteria）と同じ値。enroll_target_s：声の登録に必要な声の秒数（v1.10.4〜 15秒、仮の値。speaker_enroll_progress の score が何秒で落ち着くかを見て決め直す）。self_gate：本人の登録で数える決まり（gate 3、v1.10.4〜）。count_s：数える分（直近）。good：数えるコマ（voice_self と reason。pitch の false も入れる）。block_reasons：これがあれば数えない。self_threshold：声紋で本人の声とする、選んでいる人の似ている度合いの下限（v1.10.5〜、仮の値）。short_window_ms：これより短い声の行は似ている度合いが下がるので別に数え、「本人以外の声」には使わない。other_voice_window_s：「本人以外の声」を声紋で決めるときに見る直近の長さ",
     "voiced_floor_db": -52.0,
     "voice_gap_s": 0.3,
     "max_span_s": 3.0,
@@ -217,7 +221,10 @@
         "no_face",
         "timing"
       ]
-    }
+    },
+    "self_threshold": 0.45,
+    "short_window_ms": 1500,
+    "other_voice_window_s": 1.0
   },
   "stale_s": 1.0,
   "mark_window_s": 10.0,

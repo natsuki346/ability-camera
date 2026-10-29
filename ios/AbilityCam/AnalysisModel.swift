@@ -46,6 +46,8 @@ final class AnalysisModel: ObservableObject {
     @Published var baselineEyesClosedLong = false   // 普段の間に目を閉じていた時間が、数えた時間の2割を超えた（v1.4〜）
     @Published var voiceSec: Int?             // 声の普段を集めている：本人の声の秒数（画面に出すときだけ。v1.6〜）
     @Published var otherVoice = false         // 本人以外の声（と言えない声）だけが入っている（直近1秒）
+    @Published var otherVoiceBySpeaker = false   // 「本人以外の声」を声紋で決めている（選んでいる人の声の登録があるとき、v1.10.5〜）
+    @Published var speakerLast: (score: Double, windowMs: Int)?   // 「数字」：選んでいる人との直近の似ている度合いと、使った声の長さ（v1.10.5〜）
     @Published var voiceRetaking = false      // 声の普段だけを取り直している（v1.9.3〜：この間は声の高さの範囲を使わず、口の動きだけで本人の声を数える）
     @Published var voiceSpreadWide = false    // 比べている保存した声の普段の声の高さのばらつきが大きい（v1.9.1〜、取り直せます）
     @Published var speakerEnrollNote: String?  // 撮る側の「いま」：声の登録の進み具合・登録した（v1.10.1〜）
@@ -53,6 +55,7 @@ final class AnalysisModel: ObservableObject {
     @Published var pitchRatio: Double?        // 「数字」：声の高さが取れた割合（直近10秒、声が出ていたときのうち。v1.6.2〜）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
     @Published var differences: [String] = []
+    @Published var diffTargets: [DiffTarget] = []    // differences と同じ順の種類（文字の印の色、v1.10.5〜）
     @Published var faceReadable = true
     @Published var scene: CareScene?
     @Published var markMessage: String?
@@ -130,6 +133,8 @@ final class AnalysisModel: ObservableObject {
     private var speakerOn = false
     private var speakerEnroll: (id: String, partial: SpeakerEnrollPartial, retake: Bool, collect: SpeakerEnrollCollect)?
     private var speakerEnrollSavedSec = -1
+    private var speakerOther = SpeakerOtherVoice()        // 「本人以外の声」を声紋で（v1.10.5〜）
+    private var otherVoiceSourceLogged: String?           // 記録に書いた other_voice_source（変わったら書く）
     private var speakerTally = SpeakerEnrollTally()   // 登録を始めてから計算した声と、数えなかった理由ごとの秒数（v1.10.3〜、speaker_enroll_progress）
     private var speakerGate = SpeakerSelfGate<(endMs: Int64, spanS: Double, embedding: [Float])>()   // 本人を登録するとき（v1.10.1〜）
     private var voiceRetake = false                           // 声の普段だけを取り直した（集め終えたら、その人の声の普段を置き換える。v1.9.2〜）
@@ -158,7 +163,33 @@ final class AnalysisModel: ObservableObject {
     // MARK: セッション（開いている間は記録し、裏に回ったら閉じて要約する）
 
     /// アプリが前に出た
+    #if DEBUG
+    /// シミュレーターで撮る側の「いま」の見た目を撮る用（v1.10.5〜。起動引数 -uiPreview、Debug ビルドだけ）。カメラ・マイク・記録は動かさず、作り物の値を入れる
+    static let uiPreview = ProcessInfo.processInfo.arguments.contains("-uiPreview")
+
+    func fillPreview() {
+        running = true; cameraActive = true
+        sessionStartedAt = Date().addingTimeInterval(-754)
+        comparing = .today; baselineReady = true; faceReadable = true
+        faceShape = ["yaw": 24, "pitch": -4, "roll": 2]
+        differences = ["眉を寄せる動きが、いつもより強い（4秒）", "目を閉じている（3秒）", "声が、いつもより大きい（2秒）"]
+        diffTargets = [.metric(.browDown), .eyesClosed, .metric(.rmsDb)]
+        diffMetrics = [.browDown: true, .rmsDb: true]
+        meterZ = [.mouthSmile: 0.3, .browDown: 2.6, .eyeSquint: -0.4, .jawOpen: 0.8, .rmsDb: 2.2, .f0Hz: -0.6]
+        baselineStats = Dictionary(uniqueKeysWithValues: Metric.allCases.map { ($0, DiffEngine.Stat(mean: 0, sd: 1)) })
+        voiceSec = 6; voiceWait = "口が動いていません"
+        speakerEnrollNote = "自分の声を集めています（8/15秒）。黙っている間は数えません"
+        otherVoice = true; otherVoiceBySpeaker = true
+        speakerLast = (0.21, 2600)
+        fps = 29.8; procMs = 11; latMs = 43; faceRatio = 0.96; rmsDb = -41; f0Hz = 182; pitchRatio = 0.62
+        lensInUse = .wide; analyzedRatio = 0.99
+    }
+    #endif
+
     func appBecameActive() async {
+        #if DEBUG
+        if Self.uiPreview { fillPreview(); return }
+        #endif
         guard !activating else { return }
         activating = true
         defer { activating = false }
@@ -217,6 +248,7 @@ final class AnalysisModel: ObservableObject {
             .map { ["id": $0.id, "role": $0.id == selected ? "self" : "family"] }
         return ["speaker_on": true, "speaker_setting": setting, "speaker_model": SpeakerCriteria.model, "speaker_voiced_floor_db": Double(SpeakerCriteria.voicedFloorDb), "speaker_enrolled": enrolled,
                 "speaker_hop_s": SpeakerCriteria.hopS, "speaker_max_span_s": SpeakerCriteria.maxSpanS,
+                "speaker_self_threshold": SpeakerCriteria.selfThreshold, "speaker_short_window_ms": SpeakerCriteria.shortWindowMs,
                 "speaker_qos": audio.speaker?.qosName ?? "", "speaker_compute_units": audio.speaker?.unitsName ?? ""]   // 確かめる用の切り替え（v1.10.3〜）
     }
 
@@ -303,10 +335,11 @@ final class AnalysisModel: ObservableObject {
             voiceCarry = nil; voiceCarryOwner = nil
             running = false
             sessionStartedAt = nil
-            baselineSec = nil; baselineReady = false; differences = []; insufficient = []
+            baselineSec = nil; baselineReady = false; differences = []; diffTargets = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false
             voiceWait = nil; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false; speakerEnrollNote = nil
+            speakerOther.clear(); otherVoiceSourceLogged = nil; speakerLast = nil; otherVoiceBySpeaker = false
             PersonStore.shared.voiceRestarting = nil
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
@@ -488,10 +521,16 @@ final class AnalysisModel: ObservableObject {
             scores[p.id] = (SpeakerMath.cosine(e, s.embedding) * 1000).rounded() / 1000
         }
         let r1 = { (x: Double) in (x * 10).rounded() / 10 }
+        let windowMs = Int((spanS * 1000).rounded())
+        let selScore = PersonStore.shared.selectedID.flatMap { scores[$0] }
+        let selfBy = SpeakerMath.selfBySpeaker(score: selScore)
+        speakerOther.add(tMs: endMs, windowMs: windowMs, selfBySpeaker: selfBy)
+        speakerLast = selScore.map { ($0, windowMs) }
         logger.write(SpeakerRecord(tMs: endMs, windowMs: Int((spanS * 1000).rounded()), scores: scores,
                                    calcMs: r1(timing.calcMs), model: SpeakerCriteria.model,
                                    f0Ratio: f0Ratio.map { ($0 * 100).rounded() / 100 },
-                                   fbankMs: r1(timing.fbankMs), predictMs: r1(timing.predictMs), waitMs: r1(timing.waitMs)), notBefore: endMs)
+                                   fbankMs: r1(timing.fbankMs), predictMs: r1(timing.predictMs), waitMs: r1(timing.waitMs),
+                                   selfBySpeaker: Nullable(selfBy)), notBefore: endMs)
         guard let en = speakerEnroll else { return }
         switch en.collect {
         case .voiced:
@@ -720,7 +759,7 @@ final class AnalysisModel: ObservableObject {
         stats = [:]
         baselineValidS = 0; baselineLastT = nil; lastValidHost = -.infinity
         baselineTarget = Self.selectedBaselineSeconds
-        baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []
+        baselineSec = 0; baselineReady = false; baselineWait = nil; insufficient = []; differences = []; diffTargets = []
         // 違いの数：取り直した部分の違いだけを数え直す（v1.9.3〜、SessionStats と同じ）。表情だけなら、続いている声の違いは数え直さない
         lastChange = keepVoice ? lastChange.map { (BaselinePart.keysAfterRestart($0.diffs, part: .face), $0.faceReadable) } : nil
         squintPending = []
@@ -1075,8 +1114,17 @@ final class AnalysisModel: ObservableObject {
         let tNow = Double(tMs) / 1000
         if voiceSelf == true { lastSelfVoiceT = tNow }
         if voiceSelf == false, voiceFaceValid { lastOtherVoiceT = tNow }   // 顔が読めていて口が動いていない声
-        let other = running && tNow - lastOtherVoiceT <= 1 && tNow - lastSelfVoiceT > 1
+        // 「本人以外の声」（v1.10.5〜）：選んでいる人の声の登録（今のモデル）があれば声紋で、無ければ今まで通り voice_self で。voice_self の記録・声の普段は変えない
+        let bySpeaker = speakerOn && (PersonStore.shared.selected?.speaker?.model == SpeakerCriteria.model)
+        let other = running && (bySpeaker ? speakerOther.other(nowMs: tMs)
+                                          : tNow - lastOtherVoiceT <= 1 && tNow - lastSelfVoiceT > 1)
         if otherVoice != other { otherVoice = other }
+        if otherVoiceBySpeaker != bySpeaker { otherVoiceBySpeaker = bySpeaker }
+        let source = bySpeaker ? "speaker" : "voice_self"
+        if running, otherVoiceSourceLogged != source {   // どちらで決めたかを記録に（記録の始め・変わったとき）
+            otherVoiceSourceLogged = source
+            logger.write(EventRecord(tMs: tMs, kind: "other_voice_source", value: .text(source)), notBefore: tMs)
+        }
         // 顔を向ける・そむける：0.5秒以上続いたときだけ記録する（全コマで見る）
         if let c = head.add(tMs: tMs, face: r.face, yaw: r.pose?.yaw) {
             var e = EventRecord(tMs: c.tMs, kind: "head_turn", value: .text(c.value))
@@ -1337,7 +1385,7 @@ final class AnalysisModel: ObservableObject {
         let messages = shown.map { "\($0.message)（\(Int(max(0, latestT - $0.startT)))秒）" }
         let keys = shown.map(\.key)
         let diffKeys = keys.filter { !$0.hasPrefix(DiffTarget.voiceOnKey + ":") }   // 声が出たは違いの数に入れない（v1.7〜）
-        if differences != messages { differences = messages }
+        if differences != messages { differences = messages; diffTargets = shown.map(\.target) }
         if meterZ != engine.z { meterZ = engine.z }
         let dm = Dictionary(uniqueKeysWithValues: shown.compactMap { s in s.metric.map { ($0, s.above) } })
         if diffMetrics != dm { diffMetrics = dm }

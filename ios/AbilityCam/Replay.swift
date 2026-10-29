@@ -32,6 +32,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
 
     // 時間の帯・出来事
     let segments: [DiffSegment]                  // 画面に出す違い（表情の「いつもより弱い」は入れない）
+    let coChanges: [CoChange]                    // 重なりのできごと（v1.12〜。画面には出さず、check_app.py で振り返りレポートと比べる）
     let scenes: [ReplayRun<String>]
     let marks: [ReplayEvent]
     let heads: [ReplayRun<HeadState>]            // 撮る側と同じ決まりで、コマから数え直した顔の向き
@@ -220,12 +221,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
                 else { noBase.append(ReplayRun(start: t[i], end: t[i], value: true)) }
             }
             var fv: [Metric: Double] = [:]
-            if face[i] {
-                fv[.mouthSmile] = avg(i, "mouthSmileLeft", "mouthSmileRight")
-                fv[.browDown] = avg(i, "browDownLeft", "browDownRight")
-                fv[.eyeSquint] = squint[i]
-                fv[.jawOpen] = bsList[i]["jawOpen"] ?? 0
-            }
+            if face[i] { fv = Metric.faceValues { bsList[i][$0] ?? 0 } }   // 表情のまとまり（v1.12〜）も（重なりのできごとに使う）
             var voice: [Metric: Double] = [:]
             if let r = rms[i] { voice[.rmsDb] = r }
             if let f = f0[i] { voice[.f0Hz] = f }
@@ -248,6 +244,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         engine.flush()
         segs += engine.finished
         segments = segs.filter(\.shown).sorted { $0.startT < $1.startT }
+        coChanges = engine.coDet.finished
         selfVoiceS = selfS; otherVoiceS = otherS
         voiceDetail = detail
         noBaseline = noBase

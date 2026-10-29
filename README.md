@@ -207,6 +207,25 @@ iPhone をつないで実行。初回は、iPhone の 設定 > 一般 > VPNと�
 - 振り返りレポート・リプレイは、`voice_self` の無い古い記録では、同じ決まりで本人の声を決め直す
 - 声の普段の進み具合が3秒増えないときは、理由を小さく出す（v1.6.2〜）：「声の普段が増えない理由：声の高さが取れていません」／「口が動いていません」／「顔が読めていません」（見る側の声の欄にも）
 
+## 表情のまとまり・動きの重なり・目を閉じている割合（v1.12、記録とレポートだけ）
+研究のまとめは [`docs/research-expressions.md`](docs/research-expressions.md)（出典・対象者・人数つき）。**画面の「いま」・見る側・通知は変えない**（データのタブにだけ新しい指標のずれのバーが出る）。
+- **表情のまとまり**（本人の普段からの z）：今までの `brow_down`（眉の緊張）に加えて、
+  `orbit`＝max(eyeSquint, cheekSquint) の左右平均（目のまわり。まばたきのコマと前後0.2秒は使わない）、`nose_lip`＝max(noseSneer, mouthUpperUp) の左右平均（鼻・上唇）、
+  `mouth_tense`＝max(mouthPress, mouthStretch) の左右平均（口・あごの緊張。`jaw_open` は今のまま）、`cheek_raise`＝cheekSquint の左右平均（`mouth_smile` と合わせて口角・頬）。
+  左右それぞれで大きい方をとってから平均する。今の `eye_squint`・`mouth_smile` は残す。
+  普段（`baseline` 行の `metrics`）・保存した普段に入り、z を求めるが、**「いつもとの違い」の区間にはしない**（criteria.json の `segments: false`。画面・見る側・リプレイ・違いの数は今までの6つだけ）。
+  MediaPipe の blendshape は FACS の AU として確かめられたものではなく、AU との対応は名前と顔の筋肉からの近似
+- **左右の差**：`brow_down`・`orbit`・`mouth_smile` の 左 − 右（本人から見て）の普段を `baseline` 行の `asym` に書く（まばたきのコマは外す）。振り返りレポートで |z| ≥ 2 の時間を出す。判定には使わない
+- **動きの重なり**（`event` の `kind: "co_change"`）：まとまり（眉・目のまわり・鼻と上唇・口の緊張・口角・声）のうち、z が同じ向きに 2 以上のものが2つ以上（表情を1つ以上含む。
+  声の大きさ・高さは1つのまとまりなので、声だけでは数えない）のコマが 0.5秒以上続いたら1つのできごとを始め、そういうコマが 5秒来なかったら終わり（終わりは最後に重なっていたコマ）。
+  続いている間に入った指標を全部書く（`end_ms`・`duration_s`・`above`・`metrics`・`groups`、記録の終わりで打ち切ったら `at_end`）。`t_ms` は始まり。
+  `jaw_open`（話す・ジストニアでも動く）・`eye_squint`（`orbit` と重なる）・`cheek_raise`（`orbit` と同じ cheekSquint）は入れない。**値はすべて仮で、記録で決め直す**（`criteria.json` の `co_change`）。
+  1つの動きだけでは出さない（CP のジストニアで jawOpen・eyeBlink・mouthPress・頭の向きが変わるため）
+- **目を閉じている割合**（`event` の `kind: "eyes_closed_ratio"`）：5秒ごとに、直近30秒の顔のあるコマのうち、目を閉じている（eyeBlink ≥ 0.5 が 0.5秒以上続いた）コマの割合（`ratio`・`window_s`・`face_frames`・`closed_frames`）。判定には使わない
+- **振り返りレポート**：「動きの重なり」（一覧と、それぞれの前後10秒の家族の印）、「表情のまとまり」（比べた時間・z ≥ 2 だった時間）、「目を閉じている割合」、「左右の差」の節（どれも参考）。
+  アプリ（`DiffEngine` の `CoChangeDetector`）とレポート（`detect_co_change`）で重なりのできごとが一致するかを `check_app.py` で確かめる（作り物の記録でテスト）。
+  記録のキー名に状態の名前（`pain` など）は使わない
+
 ## 記録中の画面を「いま」と「データ」に分ける・設定で人とカメラを変えたら新しい記録に（v1.11.3）
 実機で見た結果から。
 - **記録中の画面**：上の切り替え（segmented）で「いま」と「データ」を選ぶ（前に開いていた方を覚える、`liveTab`）。横スワイプのページ（いま／グラフ／数字）はやめた。
@@ -566,11 +585,13 @@ v1.9.1 からは、タイミングを判定に使わないので、アプリは 
 | `part` | `"face"`：表情の普段 / `"voice"`：声の普段（v1.6〜。表情と声は別の行に書く）。無い行は両方 |
 | `voice_valid_s` | 声の普段：数えた本人の声の秒数（v1.6〜、`part: "voice"` の行。v1.7〜は前のセッションまでの分も含む） |
 | `voice_sessions` / `voice_days` / `voice_carried_s` | 声の普段：集めたセッションの数・日の数・前のセッションまでに集めていた秒数（v1.7〜） |
+| `asym` | 左右の差（左 − 右、本人から見て）の普段 `brow_down` / `orbit` / `mouth_smile`（それぞれ `{n, mean, std, insufficient}`、v1.12〜。判定には使わず、振り返りレポートだけ） |
 | `eyes_closed_s` | 普段の間に目を閉じていた秒数（v1.4〜。目を閉じているの決まりで、普段に数えたコマから。保存した普段の行には無い） |
 | `blink_masked` | `true`：目を細めるの普段から、まばたき（と前後0.2秒）のコマを外した（v1.0〜）。無い記録は、振り返りレポートとリプレイが数え直す |
 | `metrics` | 指標ごとの `{n, mean, std, insufficient}`。`insufficient: true` はデータ不足で、比べるのに使わない（n = 0 のときは mean / std なし） |
 
-指標：`mouth_smile`（mouthSmileLeft/Right の平均）、`brow_down`（browDownLeft/Right）、`eye_squint`（eyeSquintLeft/Right）、`jaw_open`、`rms_db`、`f0_hz`（声があるときだけ）。std は標本標準偏差。
+指標：`mouth_smile`（mouthSmileLeft/Right の平均）、`brow_down`（browDownLeft/Right）、`eye_squint`（eyeSquintLeft/Right）、`jaw_open`、`rms_db`、`f0_hz`（声があるときだけ）。
+v1.12〜の表情のまとまり：`orbit`（max(eyeSquint, cheekSquint) の左右平均）、`nose_lip`（max(noseSneer, mouthUpperUp)）、`mouth_tense`（max(mouthPress, mouthStretch)）、`cheek_raise`（cheekSquint）。std は標本標準偏差。
 
 ### `type: "event"`
 | `kind` | `value` | 意味 |
@@ -591,6 +612,8 @@ v1.9.1 からは、タイミングを判定に使わないので、アプリは 
 | `faces` | なし | 映っている顔の数が変わって0.5秒続いた（v1.2〜）。`count` が付く |
 | `faces_limit` | 理由（解析コマ/秒） | 解析コマ/秒が落ちたため、探す顔の数を1にした（v1.2〜）。`count: 1` |
 | `person` | なし | 記録中に人を変えた（v1.2〜）。`person_id`（選ばないにしたときは空） |
+| `co_change` | なし | 動きの重なり（v1.12〜）。`t_ms`＝始まり、`end_ms`、`duration_s`、`above`（いつもより上か）、`metrics`（入っていた指標）、`groups`、`at_end`（記録の終わりで打ち切った）。状態の名前は付けない |
+| `eyes_closed_ratio` | なし | 目を閉じている割合（v1.12〜、5秒ごと）。`ratio`・`window_s`（30）・`face_frames`・`closed_frames`。判定には使わない |
 | `saved_baseline_skipped` | 理由 | 選んだ人の保存した普段があるが、カメラが違うので保存した普段の行を書かなかった（v1.2.1〜）。`camera`（今）、`saved_camera`（保存した普段） |
 
 `change` には、どちらの普段で比べたか（`baseline`：`"today"` / `"saved"`、v1.2〜）も付く。

@@ -329,7 +329,7 @@ struct GraphPage: View {
 
     private var legend: some View {
         HStack(spacing: 4) {
-            ForEach(Metric.allCases, id: \.self) { m in Circle().fill(m.color).frame(width: 7, height: 7) }
+            ForEach(Metric.main, id: \.self) { m in Circle().fill(m.color).frame(width: 7, height: 7) }
             Text("帯＝いつもの範囲").font(.caption2).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
             RoundedRectangle(cornerRadius: 2).fill(DiffTarget.eyesClosedColor.opacity(Self.closedOpacity)).frame(width: 12, height: 8)
             Text("目を閉じていた").font(.caption2).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
@@ -354,7 +354,7 @@ struct GraphPage: View {
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 0) {
                 ForEach(0..<3, id: \.self) { row in
                     GridRow {
-                        ForEach([Metric.allCases[row], Metric.allCases[row + 3]], id: \.self) { m in
+                        ForEach([Metric.main[row], Metric.main[row + 3]], id: \.self) { m in
                             Text(line(m, s)).font(.caption2.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.6)
                         }
                     }
@@ -408,7 +408,7 @@ struct GraphPage: View {
         // 指標ごとの z の線（点が多いときは幅に合わせて間引く。1秒より空いたら線を切る）
         let visible = samples.filter { $0.t >= start - 1 }
         let step = max(1, visible.count / max(Int(w), 1))
-        for m in Metric.allCases {
+        for m in Metric.main {   // グラフの線は今までの6つ（表情のまとまりはずれのバーだけ、v1.12〜）
             var p = Path()
             var lastT: Double?
             for i in stride(from: 0, to: visible.count, by: step) {

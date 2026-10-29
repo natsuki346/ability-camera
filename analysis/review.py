@@ -30,11 +30,17 @@ HERE = Path(__file__).resolve().parent
 METRICS = ["mouth_smile", "brow_down", "eye_squint", "jaw_open", "rms_db", "f0_hz"]
 FACE_METRICS = {"mouth_smile", "brow_down", "eye_squint", "jaw_open"}
 VOICE_METRICS = ["rms_db", "f0_hz"]
+# 表情のまとまり（v1.12〜、docs/research-expressions.md）：z を求め、重なりのできごと（co_change）に使う。「いつもとの違い」の区間にはしない（criteria.json の segments: false）
+GROUP_METRICS = ["orbit", "nose_lip", "mouth_tense", "cheek_raise"]
+ALL_FACE = FACE_METRICS | set(GROUP_METRICS)
+BLINK_MASKED = ("eye_squint", "orbit")       # まばたきのコマと前後を使わない
+ASYM_KEYS = ["brow_down", "orbit", "mouth_smile"]   # 左右の差（左 − 右、本人から見て。v1.12〜、判定には使わない）
 # 声の高さとして使う範囲（Hz、criteria.json の pitch.range_hz と同じ。アプリは ios/AbilityCam/Pitch.swift の PitchCriteria）。
 # v1.6.1 までの記録には 800Hz のような倍音の取り違えが入っているので、読むときに外す（アプリのリプレイも同じ）
 F0_RANGE = (70.0, 500.0)
 LABEL = {"mouth_smile": "口角を上げる", "brow_down": "眉を寄せる", "eye_squint": "目を細める",
-         "jaw_open": "口を開ける", "rms_db": "声の大きさ", "f0_hz": "声の高さ"}
+         "jaw_open": "口を開ける", "rms_db": "声の大きさ", "f0_hz": "声の高さ",
+         "orbit": "目のまわりを縮める", "nose_lip": "鼻・上唇を上げる", "mouth_tense": "口を結ぶ・横に引く", "cheek_raise": "頬を上げる"}
 UNIT = {"rms_db": " dB", "f0_hz": " Hz"}
 # 目を閉じている（v1.4〜）：普段とは比べず、閉じているかどうかの事実だけ（criteria.json の eyes_closed）
 EYES = "eyes_closed"
@@ -99,6 +105,7 @@ class Recording:
     roll: np.ndarray | None = None                               # 頭の傾き（本人から見て右が +）
     direction_flipped: bool = False                              # v1.6.1 までの記録（direction_version が無い）の左右を、本人から見た右・左に入れ替えた
     f0_dropped: int = 0                                          # 範囲（F0_RANGE）の外で使わなかった f0 の数（v1.6.1 までの記録の取り違え）
+    asym: dict = field(default_factory=dict)                     # 左右の差（左 − 右、本人から見て。v1.12〜。顔が無いコマは NaN）
 
     @property
     def has_pose(self) -> bool:
@@ -106,13 +113,28 @@ class Recording:
 
 
 def face_values(bs: dict) -> dict[str, float]:
-    """アプリと同じ式（左右の平均）"""
+    """アプリと同じ式（左右の平均。Metric.faceValues）。目のまわり・鼻と上唇・口の緊張は、左右それぞれで大きい方をとってから平均する（v1.12〜）"""
+    g = lambda k: float(bs.get(k) or 0)
+
     def avg(a, b):
-        return ((bs.get(a) or 0) + (bs.get(b) or 0)) / 2
+        return (g(a) + g(b)) / 2
+
+    def max_avg(a, b):
+        return (max(g(a + "Left"), g(b + "Left")) + max(g(a + "Right"), g(b + "Right"))) / 2
     return {"mouth_smile": avg("mouthSmileLeft", "mouthSmileRight"),
             "brow_down": avg("browDownLeft", "browDownRight"),
             "eye_squint": avg("eyeSquintLeft", "eyeSquintRight"),
-            "jaw_open": float(bs.get("jawOpen") or 0)}
+            "jaw_open": g("jawOpen"),
+            "orbit": max_avg("eyeSquint", "cheekSquint"), "nose_lip": max_avg("noseSneer", "mouthUpperUp"),
+            "mouth_tense": max_avg("mouthPress", "mouthStretch"), "cheek_raise": avg("cheekSquintLeft", "cheekSquintRight")}
+
+
+def asymmetry(bs: dict) -> dict[str, float]:
+    """左右の差（左 − 右、本人から見て。アプリの Metric.asymmetry と同じ）"""
+    g = lambda k: float(bs.get(k) or 0)
+    return {"brow_down": g("browDownLeft") - g("browDownRight"),
+            "orbit": max(g("eyeSquintLeft"), g("cheekSquintLeft")) - max(g("eyeSquintRight"), g("cheekSquintRight")),
+            "mouth_smile": g("mouthSmileLeft") - g("mouthSmileRight")}
 
 
 def load(path: Path) -> Recording:
@@ -144,7 +166,8 @@ def load(path: Path) -> Recording:
     events.sort(key=lambda o: o["t_ms"])
 
     n = len(frames)
-    raw = {m: np.full(n, np.nan) for m in METRICS}
+    raw = {m: np.full(n, np.nan) for m in METRICS + GROUP_METRICS}
+    asym = {k: np.full(n, np.nan) for k in ASYM_KEYS}
     yaw, lat, proc, blink, pitch, roll, other_jaw = (np.full(n, np.nan) for _ in range(7))
     extra = {"reason": [None] * n, "corr": np.full(n, np.nan), "corr_other": np.full(n, np.nan), "match": [None] * n, "has": False}
     face = np.zeros(n, bool)
@@ -160,6 +183,8 @@ def load(path: Path) -> Recording:
             face[i] = True
             for m, v in face_values(o["bs"]).items():
                 raw[m][i] = v
+            for k, v in asymmetry(o["bs"]).items():
+                asym[k][i] = v
             bs = o["bs"]
             for k in MOUTH_KEYS_ALL:
                 if bs.get(k) is not None:
@@ -213,7 +238,7 @@ def load(path: Path) -> Recording:
     used = [b for b in baselines if b.get("compared", True) is not False]
     return Recording(path, header, t, face, raw, yaw, blink, lat, proc, used, events, pairs=pairs, all_baselines=baselines,
                      bs_raw=bs_raw, voice_self_rec=vsr, f0_dropped=f0_dropped, direction_flipped=flipped, pitch=pitch, roll=roll,
-                     other_jaw=other_jaw, voice_extra=extra, speaker=sorted(speaker, key=lambda o: o["t_ms"]), **audio_blocks(audio))
+                     other_jaw=other_jaw, voice_extra=extra, speaker=sorted(speaker, key=lambda o: o["t_ms"]), asym=asym, **audio_blocks(audio))
 
 
 def audio_blocks(rows: list[dict]) -> dict:
@@ -439,7 +464,7 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
     starts = sorted([start0] + restart_times(rec, "face"))
     blinked = blink_mask(rec, c)
     split = bool(c and c.get("voice_self") and c.get("voice_baseline"))   # v1.6〜：声の普段は別に集める
-    face_only = [m for m in METRICS if m in FACE_METRICS] if split else METRICS
+    face_only = ([m for m in METRICS if m in FACE_METRICS] if split else list(METRICS)) + GROUP_METRICS   # 表情のまとまり（v1.12〜）も
 
     out: list[dict] = []
     period = -1
@@ -459,8 +484,13 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
         if valid:
             for m in face_only:
                 v = rec.raw[m][i]
-                if v == v and not (m == "eye_squint" and blinked[i]):
+                if v == v and not (m in BLINK_MASKED and blinked[i]):
                     vals[m].append(float(v))
+            if not blinked[i]:   # 左右の差の普段（v1.12〜）
+                for k in ASYM_KEYS:
+                    v = rec.asym.get(k, np.full(len(t), np.nan))[i] if rec.asym else np.nan
+                    if v == v:
+                        vals.setdefault("asym:" + k, []).append(float(v))
             for k, arr in zip(POSE_KEYS, (rec.yaw, rec.pitch, rec.roll)):   # 顔の向きの普段（v1.8〜）
                 if arr is not None and arr[i] == arr[i]:
                     vals[k].append(float(arr[i]))
@@ -471,6 +501,7 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
                         "target_s": target_s, "rebuilt": True, "blink_masked": blink_mask_on(c),
                         "metrics": {m: baseline_stat(np.array(vals[m])) for m in face_only},
                         "pose": {k: baseline_stat(np.array(vals[k])) for k in POSE_KEYS},
+                        "asym": {k: baseline_stat(np.array(vals.get("asym:" + k, []))) for k in ASYM_KEYS},
                         **({"part": "face"} if split else {})})
             done = True
     if split:
@@ -699,6 +730,7 @@ class Analysis:
     blink_note: str | None = None
     closed: np.ndarray | None = None                             # 目を閉じていたコマ（eyes_closed の区間）
     voice_self: np.ndarray | None = None                         # 本人の声か（1 / 0 / NaN＝声が出ていない）。v1.6〜
+    co_changes: list = field(default_factory=list)               # 重なりのできごと（v1.12〜、detect_co_change）
     vbidx: np.ndarray | None = None                              # 声の指標で使う普段（baseline 行の番号）
 
 
@@ -918,7 +950,8 @@ def analyze(rec: Recording, c: dict) -> Analysis:
     if blink_mask_on(c):
         rec = copy.copy(rec)
         rec.raw = dict(rec.raw)
-        rec.raw["eye_squint"] = np.where(blinked, np.nan, rec.raw["eye_squint"])
+        for m in BLINK_MASKED:   # 目のまわり（v1.12〜）も
+            rec.raw[m] = np.where(blinked, np.nan, rec.raw[m])
         rec.baselines, note = mask_baselines_blink(rec, c)
     a = Analysis(rec, c, baseline_index(rec), face_valid(rec, c))
     a.blinked, a.blink_note = blinked, note
@@ -976,7 +1009,135 @@ def analyze(rec: Recording, c: dict) -> Analysis:
         a.segments += detect_voice_on(t, a.voice_self, c["voice_on"])
     a.segments.sort(key=lambda s: (t[s.i0], SEG_KINDS.index(s.metric)))
     a.weak_segments.sort(key=lambda s: (t[s.i0], SEG_KINDS.index(s.metric)))
+    # 表情のまとまり（v1.12〜）：z と判定したコマだけ（区間にはしない）。アプリの DiffEngine と同じ
+    for m in GROUP_METRICS:
+        if m not in c["metrics"]:
+            continue
+        a.sm[m] = smooth(t, rec.raw[m], c["metrics"][m]["smooth_s"], c["stale_s"])
+        mean, sd = np.full(len(t), np.nan), np.full(len(t), np.nan)
+        for bi, b in enumerate(rec.baselines):
+            st = b.get("metrics", {}).get(m)
+            if not st or st.get("insufficient") or st.get("mean") is None:
+                continue
+            sel = a.bidx == bi
+            mean[sel] = st["mean"]
+            sd[sel] = max(st.get("std") or 0, c["std_floor"][m])
+        a.usable[m] = bool(np.isfinite(mean).any())
+        a.z[m] = (a.sm[m] - mean) / sd
+        a.judge[m] = np.isfinite(mean) & a.fvalid & (~blinked if m in BLINK_MASKED else True)
+    a.co_changes = detect_co_change(a, c)
     return a
+
+
+def detect_co_change(a: "Analysis", c: dict) -> list[dict]:
+    """重なりのできごと（v1.12〜、アプリの CoChangeDetector と同じ決まり。criteria.json の co_change）。
+    まとまりのうち z が同じ向きに z_min 以上のメンバーがあるものが min_groups 以上（表情のまとまりを1つ以上含む）のコマが min_overlap_s 秒以上続いたら始まり、
+    そういうコマが window_s 秒来なかったら終わり（終わりは最後にそうだったコマ）。返り値：{above, i0, i1, metrics, groups, at_end}"""
+    cc = c.get("co_change")
+    if not cc:
+        return []
+    t = a.rec.t
+    groups = list(cc["groups"].items())
+    zs = {m: np.where(a.judge[m], a.z[m], np.nan) for _, ms in groups for m in ms if m in a.z and m in a.judge}
+    eps = 1e-9
+    state = {above: {"run0": None, "rm": set(), "rg": set(), "ev": None} for above in (True, False)}
+    out: list[dict] = []
+    for i in range(len(t)):
+        ti = float(t[i])
+        for above in (True, False):
+            d, sign = state[above], (1 if above else -1)
+            lit, litm, face = set(), set(), False
+            for name, ms in groups:
+                hit = [m for m in ms if m in zs and zs[m][i] == zs[m][i] and zs[m][i] * sign >= cc["z_min"] - eps]
+                if hit:
+                    lit.add(name); litm.update(hit)
+                    face = face or any(m not in VOICE_METRICS for m in hit)
+            if len(lit) >= cc["min_groups"] and face:
+                if d["run0"] is None:
+                    d["run0"], d["rm"], d["rg"] = i, set(), set()
+                d["rm"] |= litm; d["rg"] |= lit
+                if d["ev"] is not None:
+                    d["ev"]["i1"] = i; d["ev"]["metrics"] |= litm; d["ev"]["groups"] |= lit
+                elif ti - float(t[d["run0"]]) >= cc["min_overlap_s"] - eps:
+                    d["ev"] = {"above": above, "i0": d["run0"], "i1": i, "metrics": set(d["rm"]), "groups": set(d["rg"]), "at_end": False}
+            else:
+                d["run0"] = None
+                if d["ev"] is not None and ti - float(t[d["ev"]["i1"]]) >= cc["window_s"] - eps:
+                    out.append(d["ev"]); d["ev"] = None
+    for above in (True, False):
+        if state[above]["ev"] is not None:
+            state[above]["ev"]["at_end"] = True
+            out.append(state[above]["ev"])
+    order = list(LABEL)
+    for e in out:
+        e["metrics"] = sorted(e["metrics"], key=order.index)
+        e["groups"] = [g for g, _ in groups if g in e["groups"]]
+    out.sort(key=lambda e: (t[e["i0"]], not e["above"]))
+    return out
+
+
+def eyes_closed_ratio(rec: Recording, c: dict) -> list[tuple[float, float, int, int]]:
+    """目を閉じている割合（v1.12〜、アプリの EyesClosedRatio と同じ）。step_s 秒ごとに (時刻, 割合, 顔のあるコマ, 閉じていたコマ)。
+    直近 window_s 秒の顔のあるコマのうち、eyeBlink ≥ threshold が start_min_s 秒以上続いたまとまり（顔の無いコマで切る）に入るコマの割合"""
+    er, ec = c.get("eyes_closed_ratio"), c.get("eyes_closed")
+    if not er or not ec:
+        return []
+    eps = 1e-9
+    frames: list[tuple[float, int]] = []    # (時刻, まとまりの番号 or -1)
+    span: dict[int, list[float]] = {}
+    run, in_run, last_emit, out = 0, False, None, []
+    for i in range(len(rec.t)):
+        ti = float(rec.t[i])
+        b = rec.blink[i]
+        if rec.face[i] and b == b:
+            closed = b >= ec["threshold"]
+            if closed:
+                if not in_run:
+                    run += 1; in_run = True; span[run] = [ti, ti]
+                span[run][1] = ti
+            else:
+                in_run = False
+            frames.append((ti, run if closed else -1))
+        else:
+            in_run = False
+        frames = [f for f in frames if f[0] > ti - er["window_s"]]
+        if last_emit is None:
+            last_emit = ti
+        if ti - last_emit < er["step_s"] - eps:
+            continue
+        last_emit = ti
+        if frames:
+            n_closed = sum(1 for _, r in frames if r >= 0 and span[r][1] - span[r][0] >= ec["start_min_s"] - eps)
+            out.append((ti, n_closed / len(frames), len(frames), n_closed))
+    return out
+
+
+def asym_summary(a: "Analysis", c: dict) -> dict[str, tuple[float, float, bool]]:
+    """左右の差（v1.12〜）：baseline 行の asym と比べて |z| ≥ z_min だった時間（表情を判定できたコマ）。
+    返り値：{key: (左がいつもより強い秒数, 右がいつもより強い秒数, 普段があったか)}"""
+    ac = c.get("asym")
+    rec, t = a.rec, a.rec.t
+    out = {}
+    if not ac or not rec.asym:
+        return out
+    dt = frame_dt(t)
+    for k in ac["keys"]:
+        x = rec.asym.get(k)
+        if x is None:
+            continue
+        mean, sd = np.full(len(t), np.nan), np.full(len(t), np.nan)
+        for bi, b in enumerate(rec.baselines):
+            st = (b.get("asym") or {}).get(k)
+            if not st or st.get("insufficient") or st.get("mean") is None:
+                continue
+            sel = a.bidx == bi
+            mean[sel], sd[sel] = st["mean"], max(st.get("std") or 0, ac["std_floor"])
+        z = (x - mean) / sd
+        ok = np.isfinite(z) & a.fvalid & (~a.blinked if (a.blinked is not None and k == "orbit") else True)
+        left = float(dt[ok & (z >= ac["z_min"])].sum())
+        right = float(dt[ok & (z <= -ac["z_min"])].sum())
+        out[k] = (left, right, bool(np.isfinite(mean).any()))
+    return out
 
 
 # ---------------------------------------------------------------- 顔の向き（head_turn）
@@ -1924,6 +2085,69 @@ def peak_text(rw: dict) -> str:
     return f"{rw['普段の平均']:g}{u} → {rw['ピークの値']:g}{u}"
 
 
+def co_change_text(e: dict) -> str:
+    """「眉を寄せる・目のまわりを縮める・声の大きさが、同時にいつもより上」（状態の名前は付けない）"""
+    return "・".join(LABEL[m] for m in e["metrics"]) + "が、同時にいつもより" + ("上" if e["above"] else "下")
+
+
+def co_change_rows(a: Analysis) -> list[list]:
+    """重なりのできごとの一覧と、それぞれの前後 mark_window_s 秒の家族の印"""
+    t, c = a.rec.t, a.criteria
+    w = (c.get("co_change") or {}).get("mark_window_s", 10.0)
+    mk = marks(a.rec)
+    rows = []
+    for e in a.co_changes:
+        t0, t1 = float(t[e["i0"]]), float(t[e["i1"]])
+        near = [f"{v}（{jst(mt)}）" for mt, v in mk if t0 - w <= mt <= t1 + w]
+        rows.append([f"{jst(t0)}〜", fmt_s(t1 - t0) + ("（記録の終わりで打ち切り）" if e.get("at_end") else ""), co_change_text(e),
+                     "、".join(near) if near else "なし"])
+    return rows
+
+
+def expression_sections(a: Analysis) -> list[str]:
+    """v1.12〜の節（記録とレポートだけ。docs/research-expressions.md）"""
+    rec, c, e = a.rec, a.criteria, html.escape
+    parts = []
+    cc = c.get("co_change")
+    if cc:
+        w = cc.get("mark_window_s", 10.0)
+        parts.append("<h2>動きの重なり（co_change、v1.12〜）</h2>"
+                     f"<p class=note>表情のまとまり（眉・目のまわり・鼻と上唇・口の緊張・口角）と声のうち、{cc['min_groups']}つ以上が同じ向きに |z| ≥ {cc['z_min']:g} で "
+                     f"{cc['min_overlap_s']:g}秒以上重なったときを1つのできごとにし、{cc['window_s']:g}秒以内に重なりが続けば1つにまとめています（値はすべて仮で、記録で決め直します）。"
+                     "1つの動きだけでは出しません。気持ちや状態は判断していません。前後の家族の印は、家族が付けた記録をそのまま並べたものです。</p>"
+                     + (table(["時刻", "長さ", "重なった動き", f"前後 {w:g}秒の家族の印"], co_change_rows(a)) if a.co_changes
+                        else "<p>重なりのできごとはありません。</p>"))
+    rows = []
+    dt = frame_dt(rec.t)
+    for m in GROUP_METRICS + ["brow_down", "mouth_smile"]:
+        if m not in a.z:
+            continue
+        ok = a.judge[m] & np.isfinite(a.z[m])
+        if not ok.any():
+            rows.append([LABEL[m], "普段にこの指標がありません（v1.12 より前の普段）", ""])
+            continue
+        up = float(dt[ok & (a.z[m] >= 2)].sum())
+        rows.append([LABEL[m], fmt_s(float(dt[ok].sum())), fmt_s(up)])
+    if rows:
+        parts.append("<h2>表情のまとまり（v1.12〜、参考）</h2><p class=note>本人の普段からの z。区間・通知候補には使いません。"
+                     "MediaPipe の数値は FACS の AU として確かめられたものではなく、名前と顔の筋肉からの近似です（docs/research-expressions.md）。</p>"
+                     + table(["動き", "比べた時間", "z ≥ 2 だった時間"], rows))
+    er = eyes_closed_ratio(rec, c)
+    if er:
+        vals = np.array([r[1] for r in er])
+        top = max(er, key=lambda r: r[1])
+        parts.append(f"<h2>目を閉じている割合（直近{c['eyes_closed_ratio']['window_s']:g}秒、v1.12〜、参考）</h2>"
+                     f"<p>中央値 {np.median(vals):.0%}・いちばん高かったとき {top[1]:.0%}（{jst(top[0])}）。"
+                     f"顔が映っていたコマのうち、目を閉じている（{c['eyes_closed']['start_min_s']:g}秒以上続いたもの）コマの割合です。判定には使いません。</p>")
+    asy = asym_summary(a, c)
+    if asy:
+        arows = [[LABEL[k], f"{fmt_s(l)} / {fmt_s(r)}" if has else "普段にありません（v1.12 より前の普段）"] for k, (l, r, has) in asy.items()]
+        parts.append("<h2>左右の差（本人から見て、v1.12〜、参考）</h2>"
+                     f"<p class=note>左 − 右 が普段から |z| ≥ {c['asym']['z_min']:g} 離れていた時間。判定には使いません。</p>"
+                     + table(["動き", "左がいつもより強い / 右がいつもより強い"], arows))
+    return parts
+
+
 def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str) -> None:
     rec, c, e = a.rec, a.criteria, html.escape
     parts = []
@@ -2176,6 +2400,8 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                      + (table(["時刻", "家族の印", f"前 {w:g}秒に声が", f"後 {w:g}秒に声が"],
                               [[jst(m_t), v, yn(b, bs), yn(af, as_)] for m_t, v, b, bs, af, as_ in vq["marks"]])
                         if vq["marks"] else "<p>家族の印はありません。</p>"))
+
+    parts += expression_sections(a)   # v1.12〜：重なりのできごと・表情のまとまり・目を閉じている割合・左右の差
 
     # 通知候補
     n = c["notify"]

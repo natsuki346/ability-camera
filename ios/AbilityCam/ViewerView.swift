@@ -243,12 +243,12 @@ struct ViewerView: View {
                         if !live { Text(lastReceivedText).font(.system(size: 14 * k)).foregroundStyle(.secondary) }
                     }
                     groupHeader("表情", reason: faceReason(s), color: Palette.progress, k)
-                    ForEach(Metric.allCases.filter(\.isFace), id: \.self) { m in
+                    ForEach(Metric.main.filter(\.isFace), id: \.self) { m in
                         meterRow(m, s, faded: faceReason(s) != nil, k)
                     }
                     eyesRow(s, faded: faceReason(s) != nil, k)
                     groupHeader("声", reason: voiceReason(s), color: s?.otherVoice == true && s?.voiceSec == nil ? Palette.voice : Palette.progress, k).padding(.top, 4 * k)
-                    ForEach(Metric.allCases.filter { !$0.isFace }, id: \.self) { m in
+                    ForEach(Metric.main.filter { !$0.isFace }, id: \.self) { m in
                         meterRow(m, s, faded: false, k)
                     }
                     voiceOnRow(s, k)

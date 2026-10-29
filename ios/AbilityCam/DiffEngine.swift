@@ -63,6 +63,130 @@ enum DiffCriteria {
     // 本人の声のコマを、間が gapS 未満ならひとまとまりにし、最初から最後までが minS 以上なら「声が出た」（最初のコマから最後のコマまで）
     static let voiceOnMinS = 0.3
     static let voiceOnGapS = 0.5
+    // 重なりのできごと（v1.12〜、criteria.json の co_change。すべて仮の値で、記録を見て決め直す）：
+    // まとまり（coGroups）のうち、z が同じ向きに coZ 以上（下なら −coZ 以下）のメンバーがあるものが coMinGroups 以上（表情を1つ以上含む）のコマが、
+    // coMinOverlapS 秒以上続いたら1つのできごとを始める。そのあと、そういうコマが coWindowS 秒来なかったら終わり（終わりは最後にそうだったコマ）。
+    // 声の大きさ・高さは1つのまとまり（声だけの重なりは数えない）。jaw_open（話す・ジストニアでも動く）・eye_squint（orbit と重なる）・cheek_raise（orbit と同じ cheekSquint）は入れない
+    static let coZ = 2.0
+    static let coMinGroups = 2
+    static let coMinOverlapS = 0.5
+    static let coWindowS = 5.0
+    static let coGroups: [(name: String, metrics: [Metric])] = [
+        ("brow", [.browDown]), ("orbit", [.orbit]), ("nose_lip", [.noseLip]), ("mouth_tense", [.mouthTense]),
+        ("smile", [.mouthSmile]), ("voice", [.rmsDb, .f0Hz])]
+    // 目を閉じている割合（v1.12〜、criteria.json の eyes_closed_ratio。判定には使わない）：直近 windowS 秒の顔のあるコマのうち、
+    // eyeBlink 左右平均 ≥ eyesClosedThreshold が eyesClosedMinS 秒以上続いたまとまりに入るコマの割合。stepS 秒ごとに記録に書く
+    static let eyesRatioWindowS = 30.0
+    static let eyesRatioStepS = 5.0
+}
+
+/// 重なりのできごと（v1.12〜、記録の event kind: "co_change"。review.py の detect_co_change と同じ決まり）
+struct CoChange: Equatable {
+    var above: Bool
+    var startT: Double
+    var endT: Double
+    var metrics: Set<Metric>
+    var groups: Set<String>
+
+    var seconds: Double { endT - startT }
+    /// 記録に書く並び（Metric.allCases の順）
+    var metricKeys: [String] { Metric.allCases.filter { metrics.contains($0) }.map(\.rawValue) }
+    var groupKeys: [String] { DiffCriteria.coGroups.map(\.name).filter { groups.contains($0) } }
+}
+
+struct CoChangeDetector {
+    private struct Dir {
+        var run0: Double?
+        var runMetrics: Set<Metric> = []
+        var runGroups: Set<String> = []
+        var event: CoChange?
+    }
+    private var dirs: [Bool: Dir] = [true: Dir(), false: Dir()]
+    /// 終わったできごと（呼ぶ側が取り出す）
+    var finished: [CoChange] = []
+
+    /// z：そのコマで判定できた指標の z（判定できない指標は入れない）
+    mutating func step(t: Double, z: [Metric: Double]) {
+        for above in [true, false] {
+            var d = dirs[above]!
+            let sign = above ? 1.0 : -1.0
+            var lit: Set<String> = [], litMetrics: Set<Metric> = []
+            var face = false
+            for g in DiffCriteria.coGroups {
+                let ms = g.metrics.filter { (z[$0] ?? 0) * sign >= DiffCriteria.coZ - 1e-9 }
+                if !ms.isEmpty {
+                    lit.insert(g.name); litMetrics.formUnion(ms)
+                    if ms.contains(where: \.isFace) { face = true }
+                }
+            }
+            if lit.count >= DiffCriteria.coMinGroups && face {
+                if d.run0 == nil { d.run0 = t; d.runMetrics = []; d.runGroups = [] }
+                d.runMetrics.formUnion(litMetrics); d.runGroups.formUnion(lit)
+                if var e = d.event {
+                    e.endT = t; e.metrics.formUnion(litMetrics); e.groups.formUnion(lit)
+                    d.event = e
+                } else if let r = d.run0, t - r >= DiffCriteria.coMinOverlapS - 1e-9 {
+                    d.event = CoChange(above: above, startT: r, endT: t, metrics: d.runMetrics, groups: d.runGroups)
+                }
+            } else {
+                d.run0 = nil
+                if let e = d.event, t - e.endT >= DiffCriteria.coWindowS - 1e-9 {
+                    finished.append(e); d.event = nil
+                }
+            }
+            dirs[above] = d
+        }
+    }
+
+    /// 続いているもの（記録の終わり）
+    mutating func flush() {
+        for above in [true, false] {
+            if let e = dirs[above]!.event { finished.append(e) }
+            dirs[above]!.event = nil; dirs[above]!.run0 = nil
+        }
+        finished.sort { $0.startT < $1.startT }
+    }
+}
+
+/// 目を閉じている割合（v1.12〜、記録の event kind: "eyes_closed_ratio"。判定には使わない）。
+/// 顔のあるコマだけを見る。閉じている（eyeBlink 左右平均 ≥ 0.5）コマが続いたまとまり（顔の無いコマで切る）のうち、最初から最後までが 0.5秒以上のものに入るコマを数える
+struct EyesClosedRatio {
+    private var frames: [(t: Double, closed: Bool)] = []
+    private var runIDs: [Int] = []        // frames と同じ並び。閉じているまとまりの番号（閉じていなければ -1）
+    private var runSpan: [Int: (start: Double, end: Double)] = [:]
+    private var nextRun = 0
+    private var inRun = false
+    private var lastEmit: Double?
+
+    /// face：そのコマに顔があるか。blink：eyeBlink 左右平均。返り値：stepS 秒ごとに (割合, 顔のあるコマ, 閉じていたコマ)
+    mutating func add(t: Double, face: Bool, blink: Double?) -> (ratio: Double, faceFrames: Int, closedFrames: Int)? {
+        if face, let b = blink {
+            let closed = b >= DiffCriteria.eyesClosedThreshold
+            if closed {
+                if !inRun { nextRun += 1; inRun = true; runSpan[nextRun] = (t, t) }
+                runSpan[nextRun]!.end = t
+            } else {
+                inRun = false
+            }
+            frames.append((t, closed)); runIDs.append(closed ? nextRun : -1)
+        } else {
+            inRun = false
+        }
+        if let i = frames.firstIndex(where: { $0.t > t - DiffCriteria.eyesRatioWindowS }), i > 0 {
+            frames.removeFirst(i); runIDs.removeFirst(i)
+        } else if let f = frames.first, f.t <= t - DiffCriteria.eyesRatioWindowS {
+            frames.removeAll(); runIDs.removeAll()
+        }
+        let keep = Set(runIDs.filter { $0 >= 0 })
+        runSpan = runSpan.filter { keep.contains($0.key) || $0.key == nextRun }
+        if lastEmit == nil { lastEmit = t }
+        guard t - lastEmit! >= DiffCriteria.eyesRatioStepS - 1e-9 else { return nil }
+        lastEmit = t
+        let closedN = runIDs.filter { id in id >= 0 && (runSpan[id].map { $0.end - $0.start >= DiffCriteria.eyesClosedMinS - 1e-9 } ?? false) }.count
+        return frames.isEmpty ? nil : (Double(closedN) / Double(frames.count), frames.count, closedN)
+    }
+
+    mutating func reset() { self = EyesClosedRatio() }
 }
 
 /// 本人の声か（review.py の voice_self と同じ決まり）。1コマずつ流す。
@@ -240,8 +364,8 @@ enum DiffTarget: Hashable {
     static let voiceOnLabel = "声が出た"
 
     /// 画面・見る側・時間の流れに並べる順（表情4つ・目を閉じている・声2つ・声が出た）
-    static let all: [DiffTarget] = Metric.allCases.filter(\.isFace).map { .metric($0) } + [.eyesClosed]
-        + Metric.allCases.filter { !$0.isFace }.map { .metric($0) } + [.voiceOn]
+    static let all: [DiffTarget] = Metric.main.filter(\.isFace).map { .metric($0) } + [.eyesClosed]
+        + Metric.main.filter { !$0.isFace }.map { .metric($0) } + [.voiceOn]
 
     /// 普段と比べた違いか（目を閉じている・声が出たは事実だけ）
     var isFact: Bool { if case .metric = self { false } else { true } }
@@ -362,6 +486,8 @@ struct DiffEngine {
     private var det: [Metric: Detector] = [:]
     private var closedDet = ClosedDetector()
     private var voiceOnDet = VoiceOnDetector()
+    /// 重なりのできごと（v1.12〜）。終わったものは coDet.finished
+    var coDet = CoChangeDetector()
 
     /// 今の z（判定できたコマのもの。判定できないときは入れない）
     private(set) var z: [Metric: Double] = [:]
@@ -407,6 +533,7 @@ struct DiffEngine {
             finished.append(s)
             active[k] = nil
         }
+        coDet.flush()
     }
 
     private mutating func drain(until limit: Double) {
@@ -435,7 +562,7 @@ struct DiffEngine {
         for m in Metric.allCases {
             // 生の値（目を細めるは、まばたきのコマを入れない）
             var raw: Double? = m.isFace ? (x.face ? x.faceValues[m] : nil) : x.voice[m]
-            if m == .eyeSquint && blink { raw = nil }
+            if m.blinkMasked && blink { raw = nil }
             if !m.isFace && x.voiceSelf != true { raw = nil }   // 声は本人の声のコマの値だけ使う（v1.6〜）
             // ならす（review.py の smooth：1秒より空いたら今の値から）
             if let r = raw {
@@ -453,8 +580,9 @@ struct DiffEngine {
             }
             if m.isFace && !faceValid { zz = nil }
             if !m.isFace && x.voiceSelf == false { zz = nil }   // 本人以外の声（と言えない声）のコマでは判定しない
-            if m == .eyeSquint && blink { zz = nil }
+            if m.blinkMasked && blink { zz = nil }
             z[m] = zz
+            guard m.isMain else { continue }   // 表情のまとまり（v1.12〜）は z だけ。「いつもとの違い」の区間にはしない
 
             var d = det[m] ?? Detector()
             let (started, ended) = d.step(t: x.t, z: zz)
@@ -473,6 +601,9 @@ struct DiffEngine {
                 active[k] = seg
             }
         }
+
+        // 重なりのできごと（v1.12〜）：判定できた指標の z だけで
+        coDet.step(t: x.t, z: z)
 
         // 目を閉じている：普段とは比べないが、ほかの違いと同じく普段がある間だけ、顔が読めて |yaw| < 35° のコマで判定する
         let judgeable = faceBaseline != nil && faceValid

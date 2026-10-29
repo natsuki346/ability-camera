@@ -126,11 +126,24 @@ struct EventRecord: Encodable {
     var loadMs: Double?         // speaker_model：モデルの読み込みにかかった時間
     var plan: [String: Int]?    // speaker_model：演算ごとに動かす予定の場所の数（ne / gpu / cpu。iOS 17.4〜）
     var audio: AudioSessionSummary?   // audio_session：音の設定（v1.10.2〜）
+    // co_change（v1.12〜、重なりのできごと。t_ms は始まり）
+    var endMs: Int64?           // co_change：終わり（最後に重なっていたコマ）
+    var durationS: Double?      // co_change：長さ
+    var above: Bool?            // co_change：いつもより上（true）か下（false）
+    var metrics: [String]?      // co_change：入っていた指標
+    var groups: [String]?       // co_change：入っていたまとまり（brow / orbit / nose_lip / mouth_tense / smile / voice）
+    var atEnd: Bool?            // co_change：記録の終わりで打ち切った
+    // eyes_closed_ratio（v1.12〜、目を閉じている割合。判定には使わない）
+    var ratio: Double?
+    var windowS: Double?
+    var faceFrames: Int?
+    var closedFrames: Int?
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
         case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part, median, iqr
         case collect, validS = "valid_s", score, computedS = "computed_s", notSelfS = "not_self_s", noF0S = "no_f0_s", noFramesS = "no_frames_s", final, gateVersion = "gate_version", cached, computeUnits = "compute_units", loadMs = "load_ms", plan, audio
+        case endMs = "end_ms", durationS = "duration_s", above, metrics, groups, atEnd = "at_end", ratio, windowS = "window_s", faceFrames = "face_frames", closedFrames = "closed_frames"
     }
 }
 
@@ -168,10 +181,11 @@ struct BaselineRecord: Encodable {
     var voiceDays: Int?         // voice：集めた日の数（v1.7〜）
     var voiceCarriedS: Double?  // voice：前のセッションまでに集めていた本人の声の秒数（v1.7〜）
     var eyesClosedS: Double?    // 普段の間に目を閉じていた秒数（v1.4〜。目を閉じているの決まりで、数えたコマから。保存した普段には無い）
+    var asym: [String: Stat]?   // 左右の差（左 − 右、本人から見て）の普段（v1.12〜。brow_down・orbit・mouth_smile。判定には使わず、振り返りレポートで比べる）
 
     enum CodingKeys: String, CodingKey {
         case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", pose, eyesClosedS = "eyes_closed_s", part, voiceValidS = "voice_valid_s"
-        case voiceSessions = "voice_sessions", voiceDays = "voice_days", voiceCarriedS = "voice_carried_s"
+        case voiceSessions = "voice_sessions", voiceDays = "voice_days", voiceCarriedS = "voice_carried_s", asym
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
         case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics
     }

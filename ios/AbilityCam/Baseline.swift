@@ -2,11 +2,41 @@ import Foundation
 import SwiftUI
 
 /// 「いつもとの違い」を見る指標。状態の名前は付けない（意味の解釈は家族がする）
+/// v1.12〜：表情のまとまり（orbit・nose_lip・mouth_tense・cheek_raise）を足した。普段・保存した普段・z・データのタブ・重なりのできごと（co_change）には使うが、
+/// 「いつもとの違い」の区間・画面の「いま」・見る側・リプレイは今までの6つ（main）だけ（docs/research-expressions.md）
 enum Metric: String, CaseIterable {
     case mouthSmile = "mouth_smile", browDown = "brow_down", eyeSquint = "eye_squint", jawOpen = "jaw_open"
     case rmsDb = "rms_db", f0Hz = "f0_hz"
+    case orbit, noseLip = "nose_lip", mouthTense = "mouth_tense", cheekRaise = "cheek_raise"
+
+    /// 「いつもとの違い」の区間・画面・見る側に使う指標（v1.11 までの6つ）
+    static let main: [Metric] = [.mouthSmile, .browDown, .eyeSquint, .jawOpen, .rmsDb, .f0Hz]
+    /// 表情のまとまり（v1.12〜、記録とレポート・データのタブだけ）
+    static let groups: [Metric] = [.orbit, .noseLip, .mouthTense, .cheekRaise]
+    var isMain: Bool { Self.main.contains(self) }
 
     var isFace: Bool { self != .rmsDb && self != .f0Hz }
+    /// まばたきのコマと前後 0.2秒を使わない（目を細める・目のまわりは、まばたきで動くため）
+    var blinkMasked: Bool { self == .eyeSquint || self == .orbit }
+
+    /// 表情の値（左右の平均）。bs：表情の数値 52種。目のまわり・鼻と上唇・口の緊張は、左右それぞれで大きい方をとってから平均する（v1.12〜）
+    static func faceValues(_ bs: (String) -> Double) -> [Metric: Double] {
+        func avg(_ k: String) -> Double { (bs(k + "Left") + bs(k + "Right")) / 2 }
+        func maxAvg(_ a: String, _ b: String) -> Double {
+            (max(bs(a + "Left"), bs(b + "Left")) + max(bs(a + "Right"), bs(b + "Right"))) / 2
+        }
+        return [.mouthSmile: avg("mouthSmile"), .browDown: avg("browDown"), .eyeSquint: avg("eyeSquint"), .jawOpen: bs("jawOpen"),
+                .orbit: maxAvg("eyeSquint", "cheekSquint"), .noseLip: maxAvg("noseSneer", "mouthUpperUp"),
+                .mouthTense: maxAvg("mouthPress", "mouthStretch"), .cheekRaise: avg("cheekSquint")]
+    }
+
+    /// 左右の差（左 − 右、本人から見て。v1.12〜、普段と比べて記録するだけで判定には使わない）
+    static let asymKeys = ["brow_down", "orbit", "mouth_smile"]
+    static func asymmetry(_ bs: (String) -> Double) -> [String: Double] {
+        ["brow_down": bs("browDownLeft") - bs("browDownRight"),
+         "orbit": max(bs("eyeSquintLeft"), bs("cheekSquintLeft")) - max(bs("eyeSquintRight"), bs("cheekSquintRight")),
+         "mouth_smile": bs("mouthSmileLeft") - bs("mouthSmileRight")]
+    }
 
     var label: String {
         switch self {
@@ -16,6 +46,10 @@ enum Metric: String, CaseIterable {
         case .jawOpen: "口を開ける"
         case .rmsDb: "声の大きさ"
         case .f0Hz: "声の高さ"
+        case .orbit: "目のまわりを縮める"
+        case .noseLip: "鼻・上唇を上げる"
+        case .mouthTense: "口を結ぶ・横に引く"
+        case .cheekRaise: "頬を上げる"
         }
     }
 
@@ -28,6 +62,11 @@ enum Metric: String, CaseIterable {
         case .jawOpen: Color(red: 0x3B / 255, green: 0x78 / 255, blue: 0xC2 / 255)      // 青
         case .rmsDb: Color(red: 0x9C / 255, green: 0x85 / 255, blue: 0x72 / 255)        // 灰茶
         case .f0Hz: Color(red: 0xCC / 255, green: 0x79 / 255, blue: 0xA7 / 255)         // 赤紫
+        // v1.12〜（データのタブだけ）
+        case .orbit: Color(red: 0x7A / 255, green: 0x6F / 255, blue: 0xB0 / 255)        // 藤
+        case .noseLip: Color(red: 0xB0 / 255, green: 0x7A / 255, blue: 0xA1 / 255)      // 藤紫
+        case .mouthTense: Color(red: 0x5F / 255, green: 0x7F / 255, blue: 0x8F / 255)   // 鉄色
+        case .cheekRaise: Color(red: 0x8F / 255, green: 0xB8 / 255, blue: 0xD8 / 255)   // 薄い空色
         }
     }
 

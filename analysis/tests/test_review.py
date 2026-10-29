@@ -1781,6 +1781,117 @@ class SpeakerSelfTest(unittest.TestCase):
         self.assertLess(ms, 3.0)
 
 
+class CoChangeTest(unittest.TestCase):
+    """表情のまとまりと重なりのできごと（v1.12〜）：アプリ（DiffEngine）とレポートで同じ。1つの動きだけ・短い重なりでは出さない"""
+
+    @staticmethod
+    def write(path: Path):
+        import json
+        t0 = 1_800_000_000_000
+        base_bs = {k: 0.1 for k in ("browDownLeft", "browDownRight", "eyeSquintLeft", "eyeSquintRight", "cheekSquintLeft", "cheekSquintRight",
+                                    "noseSneerLeft", "noseSneerRight", "mouthUpperUpLeft", "mouthUpperUpRight", "mouthPressLeft", "mouthPressRight",
+                                    "mouthStretchLeft", "mouthStretchRight", "mouthSmileLeft", "mouthSmileRight")}
+        base_bs.update(jawOpen=0.1, eyeBlinkLeft=0.0, eyeBlinkRight=0.0)
+        up = {"brow": ("browDownLeft", "browDownRight"), "orbit": ("eyeSquintLeft", "eyeSquintRight"),
+              "nose": ("mouthUpperUpLeft", "mouthUpperUpRight"), "press": ("mouthPressLeft", "mouthPressRight")}
+        # (始まり, 終わり, 上げるもの, 声を上げるか)
+        spans = [(3.0, 5.0, ("brow", "orbit"), False),    # 重なり 2秒 → できごと
+                 (7.0, 7.3, ("brow", "nose"), False),     # 5秒以内なので、前のできごとにまとめる
+                 (14.0, 16.0, ("brow",), False),          # 1つだけ → 出さない
+                 (20.0, 22.0, ("press",), True),          # 口の緊張＋声 → できごと
+                 (30.0, 30.1, ("brow", "orbit"), False),  # 短い重なり（ならしても 0.5秒に届かない） → 出さない
+                 (36.0, 41.0, ("brow", "orbit"), False)]  # 記録の終わりまで → 打ち切り
+        mets = {m: {"n": 300, "mean": 0.1, "std": 0.02, "insufficient": False}
+                for m in ("mouth_smile", "brow_down", "eye_squint", "jaw_open", "orbit", "nose_lip", "mouth_tense", "cheek_raise")}
+        lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "direction_version": 2}),
+                 json.dumps({"type": "baseline", "t_ms": t0, "part": "face", "blink_masked": True, "metrics": mets}),
+                 json.dumps({"type": "baseline", "t_ms": t0, "part": "voice", "metrics": {"rms_db": {"n": 300, "mean": -50.0, "std": 2.0, "insufficient": False},
+                                                                                         "f0_hz": {"n": 300, "mean": 150.0, "std": 10.0, "insufficient": False}}})]
+        for k in range(int(40 / 0.033)):
+            ts = k * 0.033
+            bs = dict(base_bs)
+            loud = False
+            for a, b, which, voice in spans:
+                if a <= ts < b:
+                    for w in which:
+                        for key in up[w]:
+                            bs[key] = 0.4
+                    loud = loud or voice
+            lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(ts * 1000), "face": True, "bs": bs, "yaw_deg": 0.0,
+                                     "rms_db": -30.0 if loud else -50.0, "f0_hz": 150.0, "voice_self": True}))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_report_and_app(self):
+        import shutil
+        import check_app
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "co.jsonl"
+            self.write(path)
+            a = review.analyze(review.load(path), c)
+            t0 = a.rec.t[0]
+            got = [(round(float(a.rec.t[e["i0"]] - t0)), e["metrics"], e["at_end"]) for e in a.co_changes]
+            self.assertEqual(got, [(3, ["brow_down", "orbit", "nose_lip"], False),
+                                   (20, ["rms_db", "mouth_tense"], False),
+                                   (36, ["brow_down", "orbit"], True)])
+            self.assertTrue(all(e["above"] for e in a.co_changes))
+            self.assertGreater(float(a.rec.t[a.co_changes[0]["i1"]] - t0), 7.0)   # 5秒以内の重なりはまとめる
+            # 区間（いつもとの違い）は今までの6つだけ（表情のまとまりは区間にしない）
+            self.assertTrue(all(s.metric in review.SEG_KINDS for s in a.segments))
+            self.assertNotIn("co_change", " ".join(review.SEG_KINDS))
+            html_parts = "".join(review.expression_sections(a))
+            self.assertIn("動きの重なり", html_parts)
+            for w in ("痛み", "発作", "眠気", "pain"):
+                self.assertNotIn(w, html_parts)
+            if not shutil.which("swiftc"):
+                self.skipTest("swiftc が無い")
+            diffs, n = check_app.compare_co(path, check_app.build(), c)
+            self.assertEqual(n, 3)
+            self.assertEqual(diffs, [])
+
+    def test_criteria_same_as_app(self):
+        import json
+        import re
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "DiffEngine.swift").read_text(encoding="utf-8")
+        c = json.loads((review.HERE / "criteria.json").read_text(encoding="utf-8"))
+        cc, er = c["co_change"], c["eyes_closed_ratio"]
+        num = lambda name: float(re.search(rf"static let {name} = (-?[\d.]+)", src).group(1))
+        self.assertEqual(num("coZ"), cc["z_min"])
+        self.assertEqual(num("coMinGroups"), cc["min_groups"])
+        self.assertEqual(num("coMinOverlapS"), cc["min_overlap_s"])
+        self.assertEqual(num("coWindowS"), cc["window_s"])
+        self.assertEqual(num("eyesRatioWindowS"), er["window_s"])
+        self.assertEqual(num("eyesRatioStepS"), er["step_s"])
+        app_groups = re.findall(r'\("(\w+)", \[([^\]]*)\]\)', src[src.index("static let coGroups"):src.index("static let coGroups") + 400])
+        rv = {"browDown": "brow_down", "orbit": "orbit", "noseLip": "nose_lip", "mouthTense": "mouth_tense", "mouthSmile": "mouth_smile",
+              "rmsDb": "rms_db", "f0Hz": "f0_hz"}
+        self.assertEqual({g: [rv[x.strip().lstrip(".")] for x in ms.split(",")] for g, ms in app_groups}, cc["groups"])
+        for m in review.GROUP_METRICS:
+            self.assertEqual(c["std_floor"][m], 0.03)
+            self.assertFalse(c["metrics"][m]["segments"])
+        # 状態の名前を記録のキーにしない
+        for k in list(c["co_change"]["groups"]) + review.GROUP_METRICS + ["co_change", "eyes_closed_ratio", "asym"]:
+            self.assertNotIn("pain", k)
+
+    def test_eyes_ratio(self):
+        """目を閉じている割合：0.5秒以上続いた閉じだけ数える（まばたきは数えない）"""
+        import json
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "eyes.jsonl"
+            t0 = 1_800_000_000_000
+            lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0})]
+            for k in range(int(30 / 0.033)):
+                ts = k * 0.033
+                closed = 10.0 <= ts < 16.0 or 20.0 <= ts < 20.2   # 6秒閉じる・0.2秒のまばたき
+                lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(ts * 1000), "face": True, "yaw_deg": 0.0,
+                                         "bs": {"eyeBlinkLeft": 0.9 if closed else 0.0, "eyeBlinkRight": 0.9 if closed else 0.0}}))
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            er = review.eyes_closed_ratio(review.load(path), c)
+        last = er[-1]   # 5秒ごと。最後は 25秒のとき（直近30秒＝始まりから）
+        self.assertAlmostEqual(last[1], 6.0 / (last[0] - t0 / 1000 + 0.033), delta=0.01)   # まばたき 0.2秒は入れない
+
+
 class StartScreenTest(unittest.TestCase):
     """撮る側の最初の画面（v1.11.1〜、ios/AbilityCam/StartView.swift）：文言が wording-guide と同じ・信号色を使わない・スクリーンショットがある"""
 

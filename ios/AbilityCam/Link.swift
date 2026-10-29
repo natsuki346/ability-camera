@@ -620,7 +620,7 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     private func addHistory(_ s: LiveState) {
         let t = Double(s.captureMs) / 1000
         var b = bands
-        for m in Metric.allCases { Self.extend(&b[m, default: []], at: t, Self.band(m, in: s)) }
+        for m in Metric.main { Self.extend(&b[m, default: []], at: t, Self.band(m, in: s)) }
         bands = b
         Self.extend(&eyesBand, at: t, Self.eyesBand(in: s))
         Self.extend(&voiceBand, at: t, Self.voiceBand(in: s))

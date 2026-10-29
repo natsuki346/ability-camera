@@ -2,7 +2,7 @@
 """アプリ（撮る側・リプレイの DiffEngine）と振り返りレポート（review.py）で、同じ記録の区間が一致するかを確かめる（Mac のみ）。
 
 ios/Tools/DiffCheck と、アプリのファイル（Replay.swift など）を swiftc でビルドし、記録を両方に流して比べる。
-比べるもの：区間の数・種類（指標と向き / 目を閉じている）・開始の時刻・終了の時刻・ピークの z。
+比べるもの：区間の数・種類（指標と向き / 目を閉じている）・開始の時刻・終了の時刻・ピークの z。重なりのできごと（v1.12〜）の数・時刻・向き・指標。
 記録の終わりで打ち切った区間の終了の時刻は比べない（アプリは最後に続いていたコマ、レポートは最後のコマにするため）。
 
 使い方：python check_app.py 記録.jsonl ...      一致すれば 0、違えば 1 を返す
@@ -102,6 +102,27 @@ def compare_voice(path: Path, exe: Path, c: dict) -> list[str]:
     return out
 
 
+def compare_co(path: Path, exe: Path, c: dict) -> tuple[list[str], int]:
+    """重なりのできごと（v1.12〜）：アプリ（DiffCheck --co）と review.py の detect_co_change の、数・始まり・終わり・向き・指標を比べる"""
+    p = subprocess.run([str(exe), "--co", str(path)], check=True, capture_output=True, text=True)
+    app = sorted((json.loads(x) for x in p.stdout.splitlines() if x.strip()), key=lambda o: (round(o["start"], 3), not o["above"]))
+    a = review.analyze(review.load(path), c)
+    t = a.rec.t
+    rep = [{"start": float(t[e["i0"]]), "end": float(t[e["i1"]]), "above": e["above"], "metrics": e["metrics"], "groups": e["groups"]}
+           for e in a.co_changes]
+    out = []
+    if len(app) != len(rep):
+        out.append(f"重なりのできごとの数が違います：アプリ {len(app)}件 / レポート {len(rep)}件")
+    for x, y in zip(app, rep):
+        where = f"{review.jst(y['start'], ms=True)} 重なり"
+        if abs(x["start"] - y["start"]) > TOL_S or abs(x["end"] - y["end"]) > TOL_S:
+            out.append(f"{where}：時刻が違います（アプリ {review.jst(x['start'], ms=True)}〜{review.jst(x['end'], ms=True)}）")
+        for k in ("above", "metrics", "groups"):
+            if x[k] != y[k]:
+                out.append(f"{where}：{k} が違います（アプリ {x[k]} / レポート {y[k]}）")
+    return out, len(rep)
+
+
 def main(argv=None) -> int:
     args = [Path(x) for x in (argv if argv is not None else sys.argv[1:])]
     if not args:
@@ -114,11 +135,13 @@ def main(argv=None) -> int:
         diffs, n = compare(p, exe, c)
         vd = compare_voice(p, exe, c)   # 本人の声の判定もコマごとに（v1.9〜）
         diffs += vd[:10] + ([f"ほか本人の声の判定の違い {len(vd) - 10}件"] if len(vd) > 10 else [])
+        cd, nco = compare_co(p, exe, c)   # 重なりのできごと（v1.12〜）
+        diffs += cd
         kinds = {}
         for s in report_segments(p, c):
             kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
         detail = "、".join(f"{review.LABEL[k]} {v}" for k, v in sorted(kinds.items(), key=lambda kv: review.SEG_KINDS.index(kv[0])))
-        print(f"{p.name}: {'一致' if not diffs else '違いあり'}（区間 {n}件{'：' + detail if detail else ''}）")
+        print(f"{p.name}: {'一致' if not diffs else '違いあり'}（区間 {n}件{'：' + detail if detail else ''}・重なり {nco}件）")
         for d in diffs:
             print("  " + d)
         bad += bool(diffs)

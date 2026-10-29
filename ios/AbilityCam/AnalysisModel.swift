@@ -106,7 +106,9 @@ final class AnalysisModel: ObservableObject {
     private var engine = DiffEngine()                         // いつもとの違い（振り返りレポートと同じ決まり）
     private var lastAudioAtEngine: CFTimeInterval = 0         // 違いの判定に入れた最後の音
     private var lastBlinkT = -Double.infinity                 // 最後にまばたき（eyeBlink ≥ 0.3）があった撮影時刻
-    private var squintPending: [(t: Double, x: Double)] = []  // 普段に数える前の目を細めるの値（後ろ 0.2秒にまばたきが無いか待つ）
+    private var squintPending: [(t: Double, m: Metric, x: Double)] = []  // 普段に数える前の目を細める・目のまわり（v1.12〜）の値（後ろ 0.2秒にまばたきが無いか待つ）
+    private var asymStats: [String: Welford] = [:]            // 普段の間の左右の差（左 − 右、v1.12〜。まばたきのコマは外す）
+    private var eyesRatio = EyesClosedRatio()                 // 目を閉じている割合（v1.12〜、記録だけ）
     private var recentFace: [(t: Double, face: Bool)] = []   // 直近1秒のコマ
     private var lastChange: (diffs: [String], faceReadable: Bool)?
     private var liveZ: [String: Double] = [:]                 // 見る側へ：指標ごとの今の z
@@ -411,6 +413,8 @@ final class AnalysisModel: ObservableObject {
         finalizeTask?.cancel(); finalizeTask = nil
         if running {
             stopSpeakerEnroll()   // 途中まで集めた声の登録は残す（取り直しなら捨てる）
+            engine.coDet.flush(); writeCoChanges(atEnd: true)   // 続いている重なりのできごと（v1.12〜）
+            engine.coDet = CoChangeDetector(); eyesRatio.reset()
             PersonStore.shared.speakerInSession = nil
             saveVoicePartial()   // 途中まで集めた声の普段は、次のセッションで続きから（v1.7〜）
             voiceCarry = nil; voiceCarryOwner = nil
@@ -875,7 +879,7 @@ final class AnalysisModel: ObservableObject {
         meterZ = [:]; diffMetrics = [:]; baselineStats = nil
         comparing = nil; savedFromMs = nil; askResave = false
         boxStats = (Welford(), Welford(), Welford())
-        poseStats = [:]
+        poseStats = [:]; asymStats = [:]
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
         usedFace = nil
         guard !keepVoice else { return }
@@ -956,8 +960,8 @@ final class AnalysisModel: ObservableObject {
         let b = Self.engineBaseline(merged)
         baselineStats = b
         // 声の普段を集めている間は、声を「データ不足」には入れない（集めていると別に出す）
-        insufficient = Metric.allCases.filter { m in (m.isFace || usedVoice != nil) && b[m] == nil }
-        link.baseline = LiveBaseline(startedMs: f.startedMs, tMs: tMs, metrics: merged)   // 見る側へ（名前は送らない）
+        insufficient = Metric.main.filter { m in (m.isFace || usedVoice != nil) && b[m] == nil }   // 画面・見る側に出すのは今までの6つだけ
+        link.baseline = LiveBaseline(startedMs: f.startedMs, tMs: tMs, metrics: merged.filter { Metric(rawValue: $0.key)?.isMain ?? false })   // 見る側へ（名前は送らない）
     }
 
     /// 普段の間に目を閉じていた秒数（続いている分も入れる）
@@ -993,7 +997,7 @@ final class AnalysisModel: ObservableObject {
                                  yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                  minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: faceMetrics)
         row.source = BaselineSource.saved.rawValue; row.compared = true; row.part = BaselinePart.face.rawValue
-        row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose
+        row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose; row.asym = sv.asym
         logger.write(row)
         engine.setBaseline(Self.engineBaseline(faceMetrics), part: .face)
         comparing = .saved
@@ -1078,6 +1082,9 @@ final class AnalysisModel: ObservableObject {
         row.eyesClosedS = (baselineEyesClosedS * 10).rounded() / 10
         row.camera = (lensInUse ?? camera.lens).rawValue
         row.pose = pose
+        row.asym = asymStats.isEmpty ? nil : asymStats.mapValues { w in   // 左右の差の普段（v1.12〜）
+            BaselineRecord.Stat(n: w.n, mean: (w.mean * 10000).rounded() / 10000, std: (w.std * 10000).rounded() / 10000, insufficient: w.n < Self.minSamples)
+        }
         logger.write(row)
         if useToday {
             engine.setBaseline(Self.engineBaseline(out), part: .face)
@@ -1090,7 +1097,7 @@ final class AnalysisModel: ObservableObject {
         baselineReady = true
         todayShown = useToday
         todayBaseline = SavedBaseline(metrics: out, camera: (lensInUse ?? camera.lens).rawValue, targetS: baselineTarget,
-                                      savedMs: Self.nowMs(), faceBox: faceBox, pose: pose)
+                                      savedMs: Self.nowMs(), faceBox: faceBox, pose: pose, asym: row.asym)
         saveTodayIfNew()   // 人を選んでいて、保存した普段がまだ無ければ保存する（あれば、画面に出して取ったときだけ保存し直すか聞く）
     }
 
@@ -1263,7 +1270,7 @@ final class AnalysisModel: ObservableObject {
         if !squintPending.isEmpty {   // 後ろ 0.2秒にまばたきが無かった値だけ、普段に数える
             let ready = squintPending.filter { $0.t < epochT - DiffCriteria.blinkPadS }
             if !ready.isEmpty {
-                for p in ready { stats[.eyeSquint, default: Welford()].add(p.x) }
+                for p in ready { stats[p.m, default: Welford()].add(p.x) }
                 squintPending.removeFirst(ready.count)
             }
         }
@@ -1275,6 +1282,14 @@ final class AnalysisModel: ObservableObject {
         }
         engine.add(DiffInput(t: epochT, face: r.face, yaw: r.pose?.yaw, faceValues: Self.faceValues(r), blink: blink,
                              voice: engineVoice, voiceSelf: voiceSelf))
+        writeCoChanges()
+        // 目を閉じている割合（v1.12〜）：5秒ごとに直近30秒の割合を記録に書く（判定・画面には使わない）
+        if running, let er = eyesRatio.add(t: epochT, face: r.face, blink: blink) {
+            var e = EventRecord(tMs: tMs, kind: "eyes_closed_ratio", value: nil)
+            e.ratio = (er.ratio * 1000).rounded() / 1000; e.windowS = DiffCriteria.eyesRatioWindowS
+            e.faceFrames = er.faceFrames; e.closedFrames = er.closedFrames
+            logger.write(e, notBefore: tMs)
+        }
 
         guard frames % 3 == 0 else { return }   // 画面の更新は 1/3 に間引く（記録は全コマ）
 
@@ -1316,14 +1331,18 @@ final class AnalysisModel: ObservableObject {
         }
         if valid {
             for (m, x) in faceValues {
-                if m == .eyeSquint {
-                    // まばたき（と前後 0.2秒）のコマは普段に数えない。後ろ 0.2秒を確かめてから数える
-                    if epochT - lastBlinkT > DiffCriteria.blinkPadS { squintPending.append((epochT, x)) }
+                if m.blinkMasked {
+                    // まばたき（と前後 0.2秒）のコマは普段に数えない。後ろ 0.2秒を確かめてから数える（目のまわりも、v1.12〜）
+                    if epochT - lastBlinkT > DiffCriteria.blinkPadS { squintPending.append((epochT, m, x)) }
                 } else {
                     stats[m, default: Welford()].add(x)
                 }
             }
             if let b = r.box { boxStats.cx.add(b.cx); boxStats.cy.add(b.cy); boxStats.w.add(b.w) }
+            // 左右の差の普段（v1.12〜）：まばたきのコマ（直前 0.2秒を含む）は外す。判定には使わない
+            if epochT - lastBlinkT > DiffCriteria.blinkPadS {
+                for (k, v) in Metric.asymmetry({ Double(r.blendshapes[$0] ?? 0) }) { asymStats[k, default: Welford()].add(v) }
+            }
             // 顔の向き：記録に書くのと同じ 0.1° に丸めた値（振り返りレポートが記録のコマから数え直したものと同じになるように）
             if let p = r.pose {
                 for (k, v) in [("yaw_deg", p.yaw), ("pitch_deg", p.pitch), ("roll_deg", p.roll)] {
@@ -1453,16 +1472,23 @@ final class AnalysisModel: ObservableObject {
         status = msg
     }
 
+    /// 重なりのできごと（v1.12〜）を記録に書く（終わったもの。at_end：記録の終わりで打ち切った）。画面・見る側には出さない
+    private func writeCoChanges(atEnd: Bool = false) {
+        guard !engine.coDet.finished.isEmpty else { return }
+        for c in engine.coDet.finished where running {
+            var e = EventRecord(tMs: Int64((c.startT * 1000).rounded()), kind: "co_change", value: nil)
+            e.endMs = Int64((c.endT * 1000).rounded()); e.durationS = (c.seconds * 10).rounded() / 10
+            e.above = c.above; e.metrics = c.metricKeys; e.groups = c.groupKeys
+            if atEnd { e.atEnd = true }
+            logger.write(e)
+        }
+        engine.coDet.finished = []
+    }
+
     /// アプリと同じ式（左右の平均）。顔が無いときは空
     static func faceValues(_ r: FaceAnalyzer.Result) -> [Metric: Double] {
         guard r.face else { return [:] }
-        func avg(_ a: String, _ b: String) -> Double {
-            Double(((r.blendshapes[a] ?? 0) + (r.blendshapes[b] ?? 0)) / 2)
-        }
-        return [.mouthSmile: avg("mouthSmileLeft", "mouthSmileRight"),
-                .browDown: avg("browDownLeft", "browDownRight"),
-                .eyeSquint: avg("eyeSquintLeft", "eyeSquintRight"),
-                .jawOpen: Double(r.blendshapes["jawOpen"] ?? 0)]
+        return Metric.faceValues { Double(r.blendshapes[$0] ?? 0) }   // 表情のまとまり（v1.12〜）も
     }
 
     /// DiffEngine が判定した違いを、画面・見る側・記録の change に出す。
@@ -1480,7 +1506,8 @@ final class AnalysisModel: ObservableObject {
         if meterZ != engine.z { meterZ = engine.z }
         let dm = Dictionary(uniqueKeysWithValues: shown.compactMap { s in s.metric.map { ($0, s.above) } })
         if diffMetrics != dm { diffMetrics = dm }
-        liveZ = Dictionary(uniqueKeysWithValues: engine.z.map { ($0.key.rawValue, ($0.value * 100).rounded() / 100) })
+        // 見る側へは今までの6つだけ（v1.12 の表情のまとまりは送らない）
+        liveZ = Dictionary(uniqueKeysWithValues: engine.z.filter(\.key.isMain).map { ($0.key.rawValue, ($0.value * 100).rounded() / 100) })
         liveDiffs = shown.map { LiveDiff(metric: $0.target.key, above: $0.above, seconds: Int(max(0, latestT - $0.startT))) }
 
         if lastChange == nil || lastChange!.diffs != keys || lastChange!.faceReadable != faceReadable {

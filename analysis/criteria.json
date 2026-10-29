@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-29.1",
+  "version": "2026-10-29.2",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -56,6 +56,10 @@
     {
       "date": "2026-10-29",
       "reason": "v1.10.2：話者の区別の「声が出ている」を、f0 がある、または声の大きさ（rms_db）が speaker.voiced_floor_db（-52dB）以上にした。記録 ability-cam-20261029-114906（iPhone）で、スピーカーから流した動画の声は f0 がほとんど取れず（5秒に6〜28コマ）、声のまとまりが細切れになって計算されなかったため。黙っている区間（95〜145秒）は -60〜-75dB、話している区間は -38〜-46dB で、その間の、黙っている区間の上端から 8dB・話している区間の下端から 6dB の値にした。声のまとまりの切れ目（0.3秒）も、この決め方で声が途切れた長さで見る。本人の声の見分け（voice_self）は変えない（f0 があるコマだけ）。アプリ（Speaker.swift の SpeakerCriteria.voicedFloorDb）と同じ値。"
+    },
+    {
+      "date": "2026-10-29",
+      "reason": "v1.10.4：声の登録に必要な声を 30秒から 15秒にした（speaker.enroll_target_s、仮の値。記録の speaker_enroll_progress の score が何秒で落ち着くかを見て決め直す）。本人の声の登録で数える決まりを gate 3 にした（speaker.self_gate）：数える 0.5秒に、顔が読めていて口が動いている声のコマ（voice_self true、または false で reason pitch）が1つ以上あり、no_mouth・no_face の false が無ければ数える。登録はひとりで話すので、声の高さの範囲で絞らない。記録 ability-cam-20261029-123404 で、本人の声が 160〜190Hz に上がり声の高さの範囲（〜158Hz）を外れて、ほとんど数えられなかったため。だれの声かの判定（voice_self）は変えない。アプリ（Speaker.swift）と同じ値。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -195,11 +199,25 @@
     "history_s": 1.0
   },
   "speaker": {
-    "_note": "話者の区別（v1.10〜、記録に書くだけ）。voiced_floor_db：声が出ている（埋め込みを求める）のは、f0 がある、または rms_db がこれ以上の音の塊（v1.10.2〜）。voice_gap_s：これより長く声が途切れたら声のまとまりを切る。max_span_s：埋め込みに使う直近の声の長さの上限（＝モデルの入力の長さ）。hop_s：計算の間隔。アプリ（Speaker.swift の SpeakerCriteria）と同じ値",
+    "_note": "話者の区別（v1.10〜、記録に書くだけ）。voiced_floor_db：声が出ている（埋め込みを求める）のは、f0 がある、または rms_db がこれ以上の音の塊（v1.10.2〜）。voice_gap_s：これより長く声が途切れたら声のまとまりを切る。max_span_s：埋め込みに使う直近の声の長さの上限（＝モデルの入力の長さ）。hop_s：計算の間隔。アプリ（Speaker.swift の SpeakerCriteria）と同じ値。enroll_target_s：声の登録に必要な声の秒数（v1.10.4〜 15秒、仮の値。speaker_enroll_progress の score が何秒で落ち着くかを見て決め直す）。self_gate：本人の登録で数える決まり（gate 3、v1.10.4〜）。count_s：数える分（直近）。good：数えるコマ（voice_self と reason。pitch の false も入れる）。block_reasons：これがあれば数えない",
     "voiced_floor_db": -52.0,
     "voice_gap_s": 0.3,
     "max_span_s": 3.0,
-    "hop_s": 0.5
+    "hop_s": 0.5,
+    "enroll_target_s": 15.0,
+    "self_gate": {
+      "version": 3,
+      "count_s": 0.5,
+      "good": [
+        "true",
+        "false:pitch"
+      ],
+      "block_reasons": [
+        "no_mouth",
+        "no_face",
+        "timing"
+      ]
+    }
   },
   "stale_s": 1.0,
   "mark_window_s": 10.0,

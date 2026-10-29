@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """本人の声の登録（collect: voice_self）で、声のまとまりを数えたかを、記録の voice_self と speaker 行から決め直す（v1.10.3〜）。
-前の決まり（v1.10.1〜v1.10.2、gate 1）と今の決まり（v1.10.3〜、gate 2。アプリの SpeakerSelfGate.decide と同じ）で、何個・何秒になるかを並べる。
+gate 1（v1.10.1〜v1.10.2）・gate 2（v1.10.3）・今の決まり gate 3（v1.10.4〜、アプリの SpeakerSelfGate.decide と同じ）で、何個・何秒になるかを並べる。
 
   gate 1：まとまり全体（最大3秒）に voice_self: false が1つでもあれば数えない。数える分（終わりから min(長さ, 0.5秒)）に null があれば数えない（no_f0）。
           数える分がすべて true（1コマ以上）なら数える
   gate 2：数える分だけを見る。pitch 以外の理由の false があれば数えない（not_self）。true が1つ以上あれば数える。
           true が無く null があれば no_f0、pitch の false だけなら not_self
-  参考（gate 2 で、数える分に null があれば数えない）も出す
+  gate 3：数える分だけを見て、声の高さの範囲（reason pitch）は見ない。no_mouth・no_face（・timing）の false があれば数えない（not_self）。
+          口が動いている声のコマ（true、または false で reason pitch）が1つ以上あれば数える。無く null があれば no_f0
+  参考（gate 3 で、数える分に null があれば数えない）も出す
 
 アプリは映像のコマが届くのを待って決めるが（3秒待って来なければ no_frames）、ここでは記録にあるコマで決める。
 登録の区間：speaker_enroll（collect: voice_self、無い記録では選んでいる人＝ヘッダの person_id の登録）から、次の speaker_enroll・final の行・記録の終わりまで。
-数えた声が30秒たまって登録し終えたあとのまとまりも数える（決まりの違いを見るため）。
+数えた声がたまって登録し終えたあと（v1.10.4〜 15秒）のまとまりも数える（決まりの違いを見るため）。
 
 使い方：python enroll_check.py 記録.jsonl ...
 """
@@ -66,7 +68,7 @@ def gate1(frames: list, end: int, span_s: float) -> str:
     return "no_f0" if null else "counted" if n else "no_frames"
 
 
-def gate2(frames: list, end: int, span_s: float, null_blocks: bool = False) -> str:
+def gate2(frames: list, end: int, span_s: float) -> str:
     counted = end - round(min(span_s, HOP_S) * 1000)
     trues, null, any_ = 0, False, False
     for _, v, reason in _slice(frames, counted, end):
@@ -78,9 +80,26 @@ def gate2(frames: list, end: int, span_s: float, null_blocks: bool = False) -> s
                 return "not_self"
         else:
             null = True
+    if trues:
+        return "counted"
+    return "no_f0" if null else "not_self" if any_ else "no_frames"
+
+
+def gate3(frames: list, end: int, span_s: float, null_blocks: bool = False) -> str:
+    """今の決まり（v1.10.4〜、アプリの SpeakerSelfGate.decide）"""
+    counted = end - round(min(span_s, HOP_S) * 1000)
+    good, null, any_ = 0, False, False
+    for _, v, reason in _slice(frames, counted, end):
+        any_ = True
+        if v is True or (v is False and reason == "pitch"):   # 声の高さの範囲は見ない
+            good += 1
+        elif v is False:
+            return "not_self"
+        else:
+            null = True
     if null_blocks and null:
         return "no_f0"
-    if trues:
+    if good:
         return "counted"
     return "no_f0" if null else "not_self" if any_ else "no_frames"
 
@@ -106,7 +125,7 @@ def check(rec: dict) -> list[dict]:
     for t0, t1, pid in windows(rec):
         sp = [s for s in rec["speaker"] if t0 <= s["t_ms"] <= t1]
         res = {"start_s": (t0 - rec["header"].get("started_at_ms", t0)) / 1000, "length_s": (t1 - t0) / 1000, "person_id": pid, "chunks": len(sp)}
-        for name, fn in (("gate1", gate1), ("gate2", gate2), ("gate2_null_blocks", lambda f, e, s: gate2(f, e, s, True))):
+        for name, fn in (("gate1", gate1), ("gate2", gate2), ("gate3", gate3), ("gate3_null_blocks", lambda f, e, s: gate3(f, e, s, True))):
             c, sec = Counter(), Counter()
             for s in sp:
                 span = s.get("window_ms", 0) / 1000
@@ -129,7 +148,8 @@ def main(argv=None) -> int:
             print(f"{p.name}：本人の声の登録の区間がありません")
         for r in rows:
             print(f"{p.name}：{r['start_s']:.0f}秒から {r['length_s']:.0f}秒、計算した声のまとまり {r['chunks']}個（{(r['person_id'] or '')[:8]}）")
-            for name, label in (("gate1", "前の決まり（v1.10.1〜v1.10.2）"), ("gate2", "今の決まり（v1.10.3〜）"), ("gate2_null_blocks", "参考：今の決まりで null があれば数えない")):
+            for name, label in (("gate1", "gate 1（v1.10.1〜v1.10.2）"), ("gate2", "gate 2（v1.10.3）"), ("gate3", "今の決まり gate 3（v1.10.4〜）"),
+                                ("gate3_null_blocks", "参考：今の決まりで null があれば数えない")):
                 g = r[name]
                 print(f"  {label}：数えた {g['count'].get('counted', 0)}個（{g['seconds'].get('counted', 0):.1f}秒）"
                       f"・not_self {g['count'].get('not_self', 0)}・no_f0 {g['count'].get('no_f0', 0)}・no_frames {g['count'].get('no_frames', 0)}")

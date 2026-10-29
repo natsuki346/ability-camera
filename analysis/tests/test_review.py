@@ -1608,6 +1608,9 @@ class SpeakerTest(unittest.TestCase):
         self.assertEqual(app("voiceGapS"), c["voice_gap_s"])
         self.assertEqual(app("maxSpanS"), c["max_span_s"])
         self.assertEqual(app("hopS"), c["hop_s"])
+        self.assertEqual(app("enrollTargetS"), c["enroll_target_s"])
+        self.assertEqual(c["self_gate"]["version"], 3)
+        self.assertIn("e.gateVersion = 3", (review.HERE.parent / "ios" / "AbilityCam" / "AnalysisModel.swift").read_text(encoding="utf-8"))
 
 
 class EnrollCheckTest(unittest.TestCase):
@@ -1619,17 +1622,19 @@ class EnrollCheckTest(unittest.TestCase):
         lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "person_id": "aaaa1111", "speaker_on": True})]
         lines.append(json.dumps({"type": "event", "t_ms": t0 + 1000, "kind": "speaker_enroll", "value": "取り直し", "person_id": "aaaa1111", "collect": "voice_self"}))
         # 2〜12秒：本人の声。0.5秒ごとの区切りの中で、コマが交互に true と false（pitch）＝声の高さが範囲の外
-        # 12〜14秒：口が動いていない（false、no_mouth）が混じる。14〜16秒：f0 が取れない（null）だけ
-        for k in range(0, 16000 // 33):
+        # 12〜14秒：声の高さの範囲の外だけ（false、pitch）。14〜16秒：口が動いていない（false、no_mouth）が混じる。16〜18秒：f0 が取れない（null）だけ
+        for k in range(0, 18000 // 33):
             t = 2000 + k * 33
             if t < 12000:
                 v, r = (True, None) if k % 2 == 0 else (False, "pitch")
             elif t < 14000:
+                v, r = False, "pitch"
+            elif t < 16000:
                 v, r = (True, None) if k % 3 else (False, "no_mouth")
             else:
                 v, r = None, None
             lines.append(json.dumps({"type": "frame", "t_ms": t0 + t, "face": True, "voice_self": v, **({"voice_self_reason": r} if r else {})}))
-        for k in range(4, 32):   # 2.5〜16秒、0.5秒ごと、3秒のまとまり
+        for k in range(4, 36):   # 2.45〜17.95秒で終わる、0.5秒ごと、3秒のまとまり
             lines.append(json.dumps({"type": "speaker", "t_ms": t0 + 500 * k + 450, "window_ms": 3000, "scores": {}, "calc_ms": 1.0}))
         p = Path(d) / "enroll.jsonl"
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1641,15 +1646,18 @@ class EnrollCheckTest(unittest.TestCase):
             r = enroll_check.check(enroll_check.load(self.record(d)))
         self.assertEqual(len(r), 1)
         r = r[0]
-        self.assertEqual(r["chunks"], 28)
-        g1, g2 = r["gate1"]["count"], r["gate2"]["count"]
-        # 前の決まり：pitch の false で全部外れる（null だけの区間は no_f0）
+        self.assertEqual(r["chunks"], 32)
+        g1, g2, g3 = r["gate1"]["count"], r["gate2"]["count"], r["gate3"]["count"]
+        # gate 1：pitch の false で全部外れる
         self.assertEqual(g1.get("counted", 0), 0)
-        # 今の決まり：2〜12秒（2.45〜11.95秒で終わる 20個）は数える。no_mouth の区間（14.45秒で終わる1個は 13.95〜14秒の no_mouth を含む）・null だけの区間は数えない
-        self.assertEqual(g2.get("counted", 0), 20)
-        self.assertEqual(g2.get("not_self", 0), 5)
-        self.assertEqual(g2.get("no_f0", 0), 3)
-        self.assertAlmostEqual(r["gate2"]["seconds"]["counted"], 10.0)
+        # gate 2：2〜12秒で終わる 20個と、12.45秒で終わる1個（11.95〜12秒の true を含む）は数える。pitch だけの残りは数えない
+        self.assertEqual(g2.get("counted", 0), 21)
+        # 今の決まり gate 3：声の高さの範囲は見ないので 12〜14秒（12.45〜13.95秒で終わる 4個）も数える。
+        # no_mouth の区間（16.45秒で終わる1個は 15.95〜16秒の no_mouth を含む）・null だけの区間は数えない
+        self.assertEqual(g3.get("counted", 0), 24)
+        self.assertEqual(g3.get("not_self", 0), 5)
+        self.assertEqual(g3.get("no_f0", 0), 3)
+        self.assertAlmostEqual(r["gate3"]["seconds"]["counted"], 12.0)
 
     def test_same_as_app(self):
         """作り物のコマで、enroll_check.gate2 とアプリ（SpeakerCheck --gate）が同じ結果"""
@@ -1673,6 +1681,6 @@ class EnrollCheckTest(unittest.TestCase):
             p.write_text(json.dumps({"frames": frames, "chunks": chunks}), encoding="utf-8")
             app = subprocess.run([str(speaker_check.build()), "--gate", str(p)], check=True, capture_output=True, text=True).stdout.split()
         fr = [tuple(f) for f in frames]
-        mine = [enroll_check.gate2(fr, e, s) for e, s in chunks]
+        mine = [enroll_check.gate3(fr, e, s) for e, s in chunks]
         self.assertEqual(app, mine)
         self.assertGreater(len(set(mine)), 2)

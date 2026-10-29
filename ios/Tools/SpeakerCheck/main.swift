@@ -76,7 +76,7 @@ if args.first == "--selftest" {
     var q2 = SpeakerEnrollPartial(model: SpeakerCriteria.model, sum: [], embeddings: 0, validS: 4.8, startedMs: 0, consentBy: "x", consentMs: 0)
     if SpeakerMath.addWithProgress(&q2, embedding: [1, 0], spanS: 0.5) != nil { bad.append("初めの1つで書いた") }
     if SpeakerMath.addWithProgress(&q2, embedding: [1, 0], spanS: 0.5) != nil { bad.append("区切りを越えないのに書いた") }
-    // 本人を登録するときの決め方（v1.10.3〜：数える 0.5秒だけを見る。true が1つ以上で、false が pitch だけなら数える）
+    // 本人を登録するときの決め方（v1.10.4〜 gate 3：数える 0.5秒だけを見る。声の高さの範囲（pitch）は見ない）
     func gate(_ vs: [(Int64, Bool?, String?)], end: Int64, span: Double) -> SpeakerSelfGate<Int>.Outcome? {
         var g = SpeakerSelfGate<Int>()
         g.embedding(endMs: end, spanS: span, item: 1)
@@ -91,10 +91,11 @@ if args.first == "--selftest" {
     if gate(with { inCount($0) && $0 % 2 == 0 ? (false, "pitch") : nil }, end: 2970, span: 3) != .counted { bad.append("false が pitch だけなのに数えない") }
     if gate(with { $0 == 2706 ? (false, "no_mouth") : nil }, end: 2970, span: 3) != .notSelf { bad.append("数える分に no_mouth の false があっても数えた") }
     if gate(with { $0 == 2706 ? (false, "no_face") : nil }, end: 2970, span: 3) != .notSelf { bad.append("数える分に no_face の false があっても数えた") }
-    if gate(with { inCount($0) ? (false, "pitch") : nil }, end: 2970, span: 3) != .notSelf { bad.append("pitch の false だけ（true 無し）で数えた") }
+    if gate(with { inCount($0) ? (false, "pitch") : nil }, end: 2970, span: 3) != .counted { bad.append("pitch の false だけ（声の高さの範囲の外の本人の声）で数えない") }
+    if gate(with { inCount($0) ? ($0 % 2 == 0 ? (false, "pitch") : (false, "no_mouth")) : nil }, end: 2970, span: 3) != .notSelf { bad.append("pitch と no_mouth があるのに数えた") }
     if gate(with { $0 > 2700 ? (nil, nil) : nil }, end: 2970, span: 3) != .counted { bad.append("true があるのに null が混じって数えない") }
     if gate(with { inCount($0) ? (nil, nil) : nil }, end: 2970, span: 3) != .noF0 { bad.append("数える分が全部 null なのに noF0 でない") }
-    if gate(with { inCount($0) ? ($0 % 2 == 0 ? (nil, nil) : (false, "pitch")) : nil }, end: 2970, span: 3) != .noF0 { bad.append("null と pitch だけで noF0 でない") }
+    if gate(with { inCount($0) ? ($0 % 2 == 0 ? (nil, nil) : (false, "pitch")) : nil }, end: 2970, span: 3) != .counted { bad.append("null と pitch だけで数えない") }
     if gate(allTrue.filter { $0.0 < 2900 }, end: 2970, span: 3) != nil { bad.append("終わりのコマを待たない") }
     var g = SpeakerSelfGate<Int>()
     g.embedding(endMs: 1000, spanS: 0.5, item: 7)

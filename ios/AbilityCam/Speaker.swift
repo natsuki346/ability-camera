@@ -25,9 +25,9 @@ enum SpeakerCriteria {
     /// 記録 ability-cam-20261029-114906 で、黙っている区間（95〜145秒）は -60〜-75dB、話している区間は -38〜-46dB。その間で、
     /// 黙っている区間の上端から 8dB、話している区間の下端から 6dB 離した値（analysis/criteria.json の speaker.voiced_floor_db と同じ）
     static let voicedFloorDb: Float = -52
-    static let enrollTargetS = 30.0                         // 登録：声が合計これだけたまったら作る（仮の値）
+    static let enrollTargetS = 15.0                         // 登録：声が合計これだけたまったら作る（v1.10.4〜 15秒、仮の値。speaker_enroll_progress の score が何秒で落ち着くかを見て決め直す。v1.10〜v1.10.3 は 30秒）
     static let enrollMaxAgeDays = 14.0                      // 途中まで集めた登録は、集め始めてから14日で捨てる（声の普段と同じ）
-    static let enrollProgressStepS = 5.0                    // 登録の途中、たまった秒数がこれだけ増えるごとに、似ている度合いを記録に書く（v1.10.1〜、30秒の根拠を決めるため）
+    static let enrollProgressStepS = 5.0                    // 登録の途中、たまった秒数がこれだけ増えるごとに、似ている度合いを記録に書く（v1.10.1〜、登録に必要な秒数を決めるため）
     static let selfGateWaitMs: Int64 = 3000                 // 本人を登録するとき、声のまとまりの終わりのコマがこれだけ待っても来なければ数えない（v1.10.1〜）
 }
 
@@ -38,18 +38,18 @@ enum SpeakerEnrollCollect: String {
 }
 
 /// 本人を登録するとき（v1.10.1〜）：声のまとまりの埋め込みを、そのまとまりのコマの voice_self が分かるまで待ち、数えるかを決める。
-/// v1.10.3〜の決まり：数える分（終わりから min(使った長さ, 0.5秒)）のコマだけを見る（まとまり全体は見ない）。
-///   - voice_self: false で理由が pitch 以外（no_face・no_mouth・timing）のコマがあれば数えない（notSelf）
-///   - true のコマが1つ以上あれば数える（false が pitch だけ・null が混じっていても）
-///   - true が無く null があれば数えない（noF0）。pitch の false だけなら数えない（notSelf）
-/// v1.10.1〜v1.10.2 は、まとまり全体に false が1つでもあれば数えず、数える分がすべて true のときだけ数えた。
-/// 声の高さが上がった本人の声（保存した声の普段の範囲の外、reason pitch）でほとんど数えられなかったため変えた（docs/validation-log.md）
+/// v1.10.4〜の決まり（gate 3）：数える分（終わりから min(使った長さ, 0.5秒)）のコマだけを見る。声の高さの範囲（reason pitch）は見ない（登録はひとりで話すので、声の高さで絞らない）。
+///   - no_mouth・no_face（・timing）の voice_self: false のコマがあれば数えない（notSelf）
+///   - 顔が読めていて口が動いている声のコマ（voice_self true、または false で reason pitch）が1つ以上あれば数える（null が混じっていても）
+///   - それが無く null があれば数えない（noF0）
+/// v1.10.3（gate 2）は pitch の false だけで true が無いと数えなかった。v1.10.1〜v1.10.2（gate 1）は、まとまり全体に false が1つでもあれば数えなかった。
+/// 判定（だれの声か・本人の声か）は voice_self のまま変えない（声紋の似ている度合いとどちらが良いかは、台本の記録で比べてから決める）
 struct SpeakerSelfGate<Item> {
     /// 決まったときの結果（数えなかった理由も。記録の speaker_enroll_progress の not_self_s・no_f0_s・no_frames_s）
     enum Outcome: Equatable {
         case counted     // 数えた
-        case notSelf     // pitch 以外の理由の voice_self: false のコマがあった、または pitch の false だけで true が無い
-        case noF0        // true が無く、voice_self: null（f0 が取れていない）のコマがあった
+        case notSelf     // no_mouth・no_face（・timing）の voice_self: false のコマがあった
+        case noF0        // 口が動いている声のコマが無く、voice_self: null（f0 が取れていない）のコマがあった
         case noFrames    // 数える分のコマが無い・待っても来なかった
     }
 
@@ -81,16 +81,16 @@ struct SpeakerSelfGate<Item> {
     /// 決まり（analysis/enroll_check.py も同じ決まり）
     static func decide<S: Sequence>(_ frames: S, endMs: Int64, spanS: Double) -> Outcome where S.Element == (Int64, Bool?, String?) {
         let counted = endMs - Int64((min(spanS, SpeakerCriteria.hopS) * 1000).rounded())
-        var trues = 0, null = false, any = false
+        var good = 0, null = false, any = false
         for (t, v, reason) in frames where t >= counted && t <= endMs {
             any = true
             switch v {
-            case .some(true): trues += 1
-            case .some(false): if reason != "pitch" { return .notSelf }
+            case .some(true): good += 1
+            case .some(false): if reason == "pitch" { good += 1 } else { return .notSelf }   // 声の高さの範囲は見ない
             case .none: null = true
             }
         }
-        if trues > 0 { return .counted }
+        if good > 0 { return .counted }
         return null ? .noF0 : any ? .notSelf : .noFrames
     }
 }

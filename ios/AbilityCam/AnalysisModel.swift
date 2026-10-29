@@ -598,7 +598,7 @@ final class AnalysisModel: ObservableObject {
         var e = EventRecord(tMs: now, kind: "speaker_enroll", value: .text(retake ? "取り直し" : "登録"))
         e.personId = id   // 名前・同意した人は記録に書かない
         e.collect = collect.rawValue
-        if collect == .voiceSelf { e.gateVersion = 2 }   // 数える決まり（v1.10.3〜：数える 0.5秒だけを見て、false は pitch だけなら数える）
+        if collect == .voiceSelf { e.gateVersion = 3 }   // 数える決まり（v1.10.4〜 3：数える 0.5秒だけを見て、声の高さの範囲は見ない。2＝v1.10.3）
         logger.write(e)
         setSpeakerProgress(name: p.displayName, sec: Int(part.validS))
         return true

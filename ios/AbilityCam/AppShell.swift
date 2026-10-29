@@ -133,7 +133,7 @@ struct CameraShell: View {
             case .now:
                 // 開いたら、人を選んでから記録を始める（v1.11〜）
                 if people.awaitingPerson && !model.running {
-                    PersonStartView(openMenu: menu, note: model.startNote)
+                    PersonStartView(model: model)   // v1.11.1〜：映像と大きなボタンの最初の画面
                 } else {
                     ContentView(model: model, openMenu: menu)
                 }

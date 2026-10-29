@@ -99,8 +99,18 @@ final class PersonStore: ObservableObject {
 
     @Published private(set) var people: [Person] = []
     @Published var selectedID: String? {
-        didSet { UserDefaults.standard.set(selectedID, forKey: "personID") }
+        didSet { if !previewOnly { UserDefaults.standard.set(selectedID, forKey: "personID") } }
     }
+    private var previewOnly = false   // スクリーンショット用の作り物の人（保存しない）
+
+    #if DEBUG
+    /// 最初の画面のスクリーンショット用（-uiPreviewStart -previewPeople 0/1/3）。persons.json・前回の人は変えない
+    func fillPreview(count: Int) {
+        previewOnly = true
+        people = ["自分", "姉", "母"].prefix(max(0, count)).enumerated().map { Person(id: "preview-\($0.offset)", name: $0.element) }
+        selectedID = people.first?.id
+    }
+    #endif
 
     var selected: Person? { people.first { $0.id == selectedID } }
 
@@ -176,7 +186,7 @@ final class PersonStore: ObservableObject {
     }
 
     private func save() {
-        guard let d = try? JSONEncoder().encode(people) else { return }
+        guard !previewOnly, let d = try? JSONEncoder().encode(people) else { return }
         try? d.write(to: Self.url, options: [.atomic, .completeFileProtection])
         Self.excludeFromBackup()   // 書き直すと付け直しが要ることがあるので、毎回
     }
@@ -289,34 +299,15 @@ struct PersonPickerView: View {
     }
 }
 
-/// 撮る側を開いたとき（記録していないとき）の「だれを記録しますか」（v1.11〜）。人を選ぶと、その人で記録を始める
-struct PersonStartView: View {
-    let openMenu: (() -> Void)?
-    var note: String?   // 記録を始められなかった理由
-
-    var body: some View {
-        NavigationStack {
-            PersonChooseList(note: note)
-                .navigationTitle("だれを記録しますか")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar { MenuToolbar(openMenu: openMenu) }
-        }
-    }
-}
-
 /// 人の一覧（前回の人がいちばん上）と「人を足す」。選んだら記録を始める（記録中なら、閉じて新しく始めるかを聞く）
 struct PersonChooseList: View {
     @ObservedObject var store = PersonStore.shared
-    var note: String?
     var onDone: () -> Void = {}
     @State private var newName = ""
     @State private var switchTo: Person?
 
     var body: some View {
         List {
-            if let note {
-                Section { Label(note, systemImage: "info.circle").font(.callout).foregroundStyle(Palette.progress) }
-            }
             Section {
                 if store.people.isEmpty {
                     Text("まだ人がいません。下の「人を足す」で名前を入れてください").foregroundStyle(.secondary)

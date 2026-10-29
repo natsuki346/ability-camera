@@ -1781,6 +1781,26 @@ class SpeakerSelfTest(unittest.TestCase):
         self.assertLess(ms, 3.0)
 
 
+class StartScreenTest(unittest.TestCase):
+    """撮る側の最初の画面（v1.11.1〜、ios/AbilityCam/StartView.swift）：文言が wording-guide と同じ・信号色を使わない・スクリーンショットがある"""
+
+    def test_start_screen(self):
+        import re
+        root = review.HERE.parent
+        src = (root / "ios" / "AbilityCam" / "StartView.swift").read_text(encoding="utf-8")
+        guide = (root / "docs" / "wording-guide.md").read_text(encoding="utf-8")
+        for w in ("だれを記録しますか", "押すと記録を始めます", "人を足す", "顔が映っています", "顔が映っていません", "映像と音声は保存しません"):
+            self.assertIn(w, src)
+            self.assertIn(w, guide)
+        self.assertIn("。記録を始める", src)                      # VoiceOver で名前と「記録を始める」
+        self.assertNotRegex(src, r"\.(red|green|yellow|orange)\b")  # 信号色を使わない
+        self.assertNotIn("MeshOverlay", src)                       # 網目は出さない
+        self.assertGreaterEqual(min(int(x) for x in re.findall(r"minHeight: (?:large \? \d+ : )?(\d+)", src)), 44)
+        for n in (0, 1, 3):
+            for mode in ("light", "dark"):
+                self.assertTrue((root / "docs" / "screenshots" / f"start-{n}people_{mode}.png").exists())
+
+
 class PaletteTest(unittest.TestCase):
     """文字の色（v1.10.5〜、ios/AbilityCam/Theme.swift）：白・黒の背景で読める濃さで、赤・黄・緑の信号色を使わない"""
 

@@ -65,6 +65,10 @@ final class AnalysisModel: ObservableObject {
     @Published var meshLagMs: Double?        // 撮影→網目を出すまで（解析の遅れ＋画面の間引き）
     @Published var lensInUse: CameraLens?    // 今使っているカメラ（設定で超広角を選んでも、無い端末では広角）
     @Published var startNote: String?        // 記録を始められなかった理由（「だれを記録しますか」の下に出す、v1.11〜）
+    @Published var previewFace: Bool?        // 記録を始める前の画面：顔が映っているか（v1.11.1〜。カメラが動いていなければ nil）
+    private var lastPreviewFaceHost: CFTimeInterval = -.infinity
+    /// 記録中か（MediaPipe のスレッドから読む）。記録を始める前は、コマを記録・判定・見る側に流さず、顔が映っているかだけを見る
+    private let recordingFlag = LockedFlag()
 
     let camera = CameraManager()
     private let face = FaceAnalyzer()
@@ -164,6 +168,9 @@ final class AnalysisModel: ObservableObject {
     // MARK: セッション（開いたら人を選んで記録し、裏に回ったら閉じて要約する）
 
     init() {
+        #if DEBUG
+        if Self.uiPreviewStart { PersonStore.shared.fillPreview(count: Self.previewPeopleCount) }
+        #endif
         // 記録する人（v1.11〜）：選んだらその人で始める。記録中なら今の記録を閉じてから新しく始める（1本の記録には1人だけ）
         PersonStore.shared.onStartRecording = { [weak self] id in self?.startRecording(personID: id) }
         PersonStore.shared.onCloseRecording = { [weak self] in self?.closeRecording() }
@@ -190,12 +197,11 @@ final class AnalysisModel: ObservableObject {
         }
     }
 
-    /// 記録している人を消した：記録を閉じ、カメラとマイクを止めて、人を選ぶのを待つ
+    /// 記録している人を消した：記録を閉じ、マイクを止めて、人を選ぶのを待つ
     func closeRecording() {
         guard running else { return }
-        stopCamera()
         if micOn { audio.stop() }
-        finalizeSession()
+        finalizeSession()   // カメラは止めない（「だれを記録しますか」の映像に使う）
         UIApplication.shared.isIdleTimerDisabled = false
         PersonStore.shared.awaitingPerson = true
     }
@@ -204,6 +210,10 @@ final class AnalysisModel: ObservableObject {
     #if DEBUG
     /// シミュレーターで撮る側の「いま」の見た目を撮る用（v1.10.5〜。起動引数 -uiPreview、Debug ビルドだけ）。カメラ・マイク・記録は動かさず、作り物の値を入れる
     static let uiPreview = ProcessInfo.processInfo.arguments.contains("-uiPreview")
+    /// 撮る側の最初の画面（だれを記録しますか）の見た目を撮る用（v1.11.1〜。起動引数 -uiPreviewStart と -previewPeople 0/1/3）。
+    /// カメラは動かさず、映像の代わりに灰色の地に顔の絵を出す。人は作り物で、persons.json には保存しない
+    static let uiPreviewStart = ProcessInfo.processInfo.arguments.contains("-uiPreviewStart")
+    static var previewPeopleCount: Int { UserDefaults.standard.integer(forKey: "previewPeople") }
 
     func fillPreview() {
         running = true; cameraActive = true
@@ -227,6 +237,7 @@ final class AnalysisModel: ObservableObject {
     func appBecameActive() async {
         #if DEBUG
         if Self.uiPreview { fillPreview(); return }
+        if Self.uiPreviewStart { PersonStore.shared.awaitingPerson = true; previewFace = true; return }
         #endif
         guard !activating else { return }
         activating = true
@@ -241,6 +252,8 @@ final class AnalysisModel: ObservableObject {
         } else {
             PersonStore.shared.awaitingPerson = true
             status = "だれを記録するか選んでください"
+            // 映り方を始める前に確かめられるよう、カメラだけ先に動かす（v1.11.1〜。記録・送信はしない。記録を始めてもカメラは止めずに使い続ける）
+            startNote = await startCamera() ? nil : status
         }
         link.start()
         if !recoveryDone {
@@ -325,6 +338,8 @@ final class AnalysisModel: ObservableObject {
             status = "記録を始められませんでした: \(error.localizedDescription)"
             return
         }
+        recordingFlag.set(true)   // ここからのコマを記録・判定する
+        previewFace = nil
         var note = ""
         micOn = await AVAudioApplication.requestRecordPermission()
         if micOn {
@@ -380,6 +395,9 @@ final class AnalysisModel: ObservableObject {
             saveVoicePartial()   // 途中まで集めた声の普段は、次のセッションで続きから（v1.7〜）
             voiceCarry = nil; voiceCarryOwner = nil
             running = false
+            recordingFlag.set(false)
+            video.configure(enabled: false, interval: VideoSender.fastest)   // 記録していない間は映像を送らない（v1.11.1〜。カメラは動いたままのことがある）
+            videoSending = false
             PersonStore.shared.inSession = false
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; diffTargets = []; insufficient = []
@@ -439,7 +457,14 @@ final class AnalysisModel: ObservableObject {
         }
 
         let face = self.face, audio = self.audio, logger = self.logger, voiceBox = self.voiceBox
+        let recordingFlag = self.recordingFlag
         face.onResult = { [weak self] r in
+            // 記録を始める前（だれを記録しますか）：顔が映っているかだけを見る。記録・声の判定・見る側には流さない（v1.11.1〜）
+            guard recordingFlag.get() else {
+                let found = r.face
+                Task { @MainActor in self?.previewFrame(face: found) }
+                return
+            }
             let a = audio.current
             // 撮影時刻（端末の起動からの時計）を、epoch ms に直す
             let ageSec = CACurrentMediaTime() - Double(r.captureMs) / 1000
@@ -488,10 +513,20 @@ final class AnalysisModel: ObservableObject {
         return true
     }
 
+    /// 記録を始める前の画面の「顔が映っています／映っていません」。ちらつかないよう、0.7秒見つからなければ「映っていません」
+    private func previewFrame(face found: Bool) {
+        guard !running else { return }
+        let now = CACurrentMediaTime()
+        if found { lastPreviewFaceHost = now }
+        let v = now - lastPreviewFaceHost < 0.7
+        if previewFace != v { previewFace = v }
+    }
+
     private func stopCamera() {
         guard cameraActive else { return }
         camera.stop()
         cameraActive = false
+        previewFace = nil; lastPreviewFaceHost = -.infinity
         mesh = nil; faceShape = nil; faceReadable = true
     }
 
@@ -1458,4 +1493,12 @@ final class VoiceSelfBox: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         tracker.setPitchRange(median: median, iqr: iqr, fromT: fromT)
     }
+}
+
+/// 別のスレッドから読む Bool（記録中か）
+final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
 }

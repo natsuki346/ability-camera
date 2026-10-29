@@ -52,6 +52,13 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
     var voiceOnS: Double { segments.filter { $0.target == .voiceOn }.reduce(0) { $0 + $1.seconds } }
     var markCount: Int { marks.count }
     let notes: [String]
+    /// 家族の印（v1.13〜：詳しい中身をあとから付ける・変えるため）
+    struct MarkItem: Identifiable { let tMs: Int64; let value: String; let detail: String?; let detailAt: Int64?; let by: String?; var id: Int64 { tMs } }
+    let markItems: [MarkItem]
+    /// 詳しい中身の選択肢（記録のヘッダの mark_details。無い古い記録は初めの選択肢）
+    let detailOptions: MarkDetails
+    /// 読んだファイル（あとから詳しい中身を書くとき。見る側で開いたものは、選んだファイルそのもの）
+    var sourceURL: URL?
 
     enum LoadError: LocalizedError {
         case empty
@@ -253,6 +260,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var sc: [ReplayRun<String>] = []
         var mk: [ReplayEvent] = []
         var list: [ReplayEvent] = []
+        var items: [MarkItem] = []
         for e in evs {
             let et = ms(e)!
             let kind = e["kind"] as? String
@@ -264,8 +272,13 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
                 list.append(ReplayEvent(t: et, kind: .scene, text: "場面：\(value ?? "なし")"))
             case "mark":
                 let by = (e["source"] as? String) == "viewer" ? "（\(e["by"] as? String ?? "見る側")で）" : ""
-                let ev = ReplayEvent(t: et, kind: .mark, text: "家族の印：\(value ?? "")\(by)")
+                let detail = e["detail"] as? String   // 家族の印の詳しい中身（v1.13〜、家族の言葉）
+                let ev = ReplayEvent(t: et, kind: .mark, text: "家族の印：\(value ?? "")\(detail.map { "・\($0)" } ?? "")\(by)")
                 mk.append(ev); list.append(ev)
+                if let tm = (e["t_ms"] as? NSNumber)?.int64Value {
+                    items.append(MarkItem(tMs: tm, value: value ?? "", detail: detail, detailAt: (e["detail_at"] as? NSNumber)?.int64Value,
+                                          by: (e["source"] as? String) == "viewer" ? (e["by"] as? String ?? "見る側") : nil))
+                }
             case "head_turn":
                 let v = flip < 0 ? FaceDirection.swapSides(value ?? "") : (value ?? "")
                 list.append(ReplayEvent(t: et, kind: .head, text: "顔の向き：\(v)（\(FaceDirection.note)）"))
@@ -275,7 +288,8 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         for s in segments {
             list.append(ReplayEvent(t: s.startT, kind: .diff, text: "\(s.message)（\(Int(s.seconds.rounded()))秒）"))
         }
-        scenes = sc; marks = mk
+        scenes = sc; marks = mk; markItems = items
+        detailOptions = MarkDetails(header: header["mark_details"]) ?? .initial
         events = list.sorted { $0.t < $1.t }
 
         // 顔の向きの段：撮る側と同じ決まり（0.5秒続いたら変わる）で、コマから数え直す。向きが記録されていない（v0.3 より前）なら作らない

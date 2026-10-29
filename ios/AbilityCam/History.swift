@@ -103,7 +103,9 @@ struct OpenedRecordsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { MenuToolbar(openMenu: openMenu) }
             .navigationDestination(for: UUID.self) { id in
-                if let d = opened.first(where: { $0.id == id }) { ReplayView(data: d) }
+                if let d = opened.first(where: { $0.id == id }) {
+                    ReplayView(data: d) { if let u = d.sourceURL { load(u) } }   // 詳しい中身を書いたら読み直す（v1.13〜）
+                }
             }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.data, .json, .plainText], allowsMultipleSelection: true) { result in
                 guard case .success(let urls) = result else { return }
@@ -121,8 +123,10 @@ struct OpenedRecordsView: View {
                 let ok = url.startAccessingSecurityScopedResource()
                 defer { if ok { url.stopAccessingSecurityScopedResource() } }
                 do {
-                    let data = try Data(contentsOf: url, options: .mappedIfSafe)
-                    return .success(try ReplayData(data: data, name: url.lastPathComponent))
+                    let data = try Data(contentsOf: url)
+                    let r = try ReplayData(data: data, name: url.lastPathComponent)
+                    r.sourceURL = url   // 家族の印の詳しい中身を、あとからこのファイルに書く（v1.13〜）
+                    return .success(r)
                 } catch {
                     return .failure(error)
                 }
@@ -145,23 +149,27 @@ struct ReplayLoaderView: View {
     let url: URL
     @State private var data: ReplayData?
     @State private var error: String?
+    @State private var version = 0   // 詳しい中身を書いたら読み直す（v1.13〜）
 
     var body: some View {
         Group {
             if let data {
-                ReplayView(data: data)
+                ReplayView(data: data) { version += 1 }
+                    .id(version)
             } else if let error {
                 Text(error).foregroundStyle(.secondary).padding()
             } else {
                 ProgressView("記録を読んでいます…")
             }
         }
-        .task(id: url) {
+        .task(id: "\(url.path)#\(version)") {
             let url = url
             let r = await Task.detached(priority: .userInitiated) { () -> Result<ReplayData, Error> in
                 do {
-                    let d = try Data(contentsOf: url, options: .mappedIfSafe)
-                    return .success(try ReplayData(data: d, name: url.lastPathComponent))
+                    let d = try Data(contentsOf: url)
+                    let r = try ReplayData(data: d, name: url.lastPathComponent)
+                    r.sourceURL = url
+                    return .success(r)
                 } catch {
                     return .failure(error)
                 }

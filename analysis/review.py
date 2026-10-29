@@ -1392,6 +1392,34 @@ def marks(rec: Recording) -> list[tuple[float, str]]:
     return [(e["t_ms"] / 1000, label(e)) for e in rec.events if e.get("kind") == "mark"]
 
 
+def mark_details(rec: Recording) -> list[dict]:
+    """家族の印と詳しい中身（v1.13〜、家族の言葉）。{t, value, detail, detail_at, by}"""
+    out = []
+    for e in rec.events:
+        if e.get("kind") != "mark":
+            continue
+        out.append({"t": e["t_ms"] / 1000, "value": str(e.get("value")), "detail": e.get("detail"),
+                    "detail_at": e["detail_at"] / 1000 if e.get("detail_at") else None,
+                    "by": (e.get("by") or "見る側") if e.get("source") == "viewer" else None})
+    return out
+
+
+def mark_detail_rows(a: "Analysis") -> list[list]:
+    """家族の印ごとに、詳しい中身と、前後 mark_window_s 秒の「いつもとの違い」・動きの重なり"""
+    t, c = a.rec.t, a.criteria
+    w = c.get("mark_window_s", 10.0)
+    rows = []
+    for m in mark_details(a.rec):
+        lo, hi = m["t"] - w, m["t"] + w
+        near = [f"{seg_text(s.metric, s.sign)}（{jst(t[s.i0])}〜）" for s in a.segments
+                if t[s.i0] <= hi and t[s.i1] >= lo and s.metric != VOICE_ON]
+        near += [f"重なり：{co_change_text(e)}（{jst(t[e['i0']])}〜）" for e in a.co_changes if t[e["i0"]] <= hi and t[e["i1"]] >= lo]
+        later = m["detail_at"] is not None and m["detail_at"] - m["t"] > 60
+        detail = (m["detail"] or "–") + (f"（あとから {jst(m['detail_at'])} に付けた）" if later and m["detail"] else "")
+        rows.append([jst(m["t"]), m["value"] + (f"（{m['by']}で）" if m["by"] else ""), detail, "、".join(near) if near else "なし"])
+    return rows
+
+
 def frame_dt(t: np.ndarray, cap=1.0) -> np.ndarray:
     """各コマが受け持つ時間（大きな空きは cap で切る）"""
     if len(t) < 2:
@@ -2402,6 +2430,12 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                         if vq["marks"] else "<p>家族の印はありません。</p>"))
 
     parts += expression_sections(a)   # v1.12〜：重なりのできごと・表情のまとまり・目を閉じている割合・左右の差
+    if mark_details(rec):   # 家族の印と詳しい中身（v1.13〜）
+        w = c.get("mark_window_s", 10.0)
+        parts.append("<h2>家族の印と詳しい中身</h2>"
+                     "<p class=note>詳しい中身は、家族が選んだ言葉をそのまま並べたものです（アプリやレポートが本人の状態として判定したものではありません）。"
+                     "あとから付けるときは <code>python mark_detail.py 記録.jsonl --set 番号 言葉</code>。</p>"
+                     + table(["時刻", "家族の印", "詳しい中身", f"前後 {w:g}秒のいつもとの違い・重なり"], mark_detail_rows(a)))
 
     # 通知候補
     n = c["notify"]

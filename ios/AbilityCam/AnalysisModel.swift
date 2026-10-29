@@ -7,10 +7,6 @@ enum CareScene: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-enum Mark: String, CaseIterable, Identifiable {
-    case pleasant = "快", unpleasant = "不快", unknown = "分からない"
-    var id: String { rawValue }
-}
 
 /// どちらの普段で比べているか（v1.2〜）
 enum BaselineSource: String { case today, saved }
@@ -65,6 +61,11 @@ final class AnalysisModel: ObservableObject {
     @Published var faceShape: [String: Double]?   // 顔の絵用に約0.2秒でならした値。読めないときは nil
     @Published var meshLagMs: Double?        // 撮影→網目を出すまで（解析の遅れ＋画面の間引き）
     @Published var lensInUse: CameraLens?    // 今使っているカメラ（設定で超広角を選んでも、無い端末では広角）
+    /// 家族の印を押したあとに数秒出す「詳しく（任意）」（v1.13〜。快・不快のときだけ）
+    @Published var markDetailPrompt: (tMs: Int64, mark: Mark, options: [String])?
+    static let markDetailSeconds = 6.0
+    private var markCombos: [Int64: (combo: String?, value: String, detail: String?)] = [:]   // 印を付けたときの「いつもとの違い」の組み合わせ
+    private var pastMarks = PastMarks()                                      // 前に同じ組み合わせのとき、家族が付けた印（v1.13〜）
     @Published var startNote: String?        // 記録を始められなかった理由（「だれを記録しますか」の下に出す、v1.11〜）
     @Published var previewFace: Bool?        // 記録を始める前の画面：顔が映っているか（v1.11.1〜。カメラが動いていなければ nil）
     private var lastPreviewFaceHost: CFTimeInterval = -.infinity
@@ -253,6 +254,9 @@ final class AnalysisModel: ObservableObject {
             graph.append(t: t, z: z, values: v, baseline: stats)
         }
         graph.addEvent(t: now - 25, label: "家族の印：快", isMark: true)
+        if ProcessInfo.processInfo.arguments.contains("-previewMarkDetail") {   // 「詳しく（任意）」の見た目（v1.13〜）
+            markDetailPrompt = (0, .unpleasant, MarkDetails.initial.unpleasant)
+        }
     }
     #endif
 
@@ -318,6 +322,11 @@ final class AnalysisModel: ObservableObject {
     }
 
     /// 話者の区別のヘッダ（v1.10〜）：使ったか・モデルの版・声を登録した人の id と役割（本人として撮る人か家族か）。名前・埋め込みは書かない
+    /// 家族の印の詳しい中身の選択肢（v1.13〜、記録している人のもの）。見る側・Mac であとから付けるときに使う。家族の言葉
+    private func markDetailsHeader() -> [String: Any] {
+        ["mark_details": (PersonStore.shared.selected?.markOptions ?? .initial).header]
+    }
+
     private func speakerHeader() -> [String: Any] {
         // speaker_setting：設定「話者の区別を記録する」（v1.10.2〜。オンでもモデルが無ければ speaker_on は false）
         let setting = UserDefaults.standard.bool(forKey: "speakerRecord")
@@ -355,7 +364,7 @@ final class AnalysisModel: ObservableObject {
         PersonStore.shared.onSpeakerEnrollStop = { [weak self] in self?.stopSpeakerEnroll() }
         do {
             try logger.start(camera: camera.lens, personId: PersonStore.shared.selectedID, mirrored: camera.analysisMirrored,
-                             extra: speakerHeader())
+                             extra: speakerHeader().merging(markDetailsHeader()) { a, _ in a })
         } catch {
             status = "記録を始められませんでした: \(error.localizedDescription)"
             return
@@ -392,6 +401,18 @@ final class AnalysisModel: ObservableObject {
         applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
         running = true
         PersonStore.shared.inSession = true
+        // 前に同じ組み合わせのとき家族が付けた印（v1.13〜）：同じ人のこれまでの記録から、裏で数える
+        pastMarks = PastMarks(); markCombos = [:]
+        if let pid = PersonStore.shared.selectedID {
+            let current = logger.fileName, dir = SessionStore.dir
+            Task { [weak self] in
+                let loaded = await Task.detached(priority: .utility) { PastMarks.load(personID: pid, dir: dir, except: current) }.value
+                guard let self, self.running, self.logger.fileName == current else { return }
+                var merged = loaded
+                for (_, v) in self.markCombos.sorted(by: { $0.key < $1.key }) { merged.add(combo: v.combo, value: v.value, detail: v.detail) }
+                self.pastMarks = merged
+            }
+        }
         sessionStartedAt = Date()
         // 記録していないときに設定の「人」で「声の普段を取り直す」を押していたら、このセッションで集め直す（1回だけ。途中で閉じたら古い声の普段のまま）
         if let p = PersonStore.shared.selected, p.voiceRetakePending {
@@ -420,6 +441,7 @@ final class AnalysisModel: ObservableObject {
             voiceCarry = nil; voiceCarryOwner = nil
             running = false
             recordingFlag.set(false)
+            markDetailPrompt = nil; markCombos = [:]
             video.configure(enabled: false, interval: VideoSender.fastest)   // 記録していない間は映像を送らない（v1.11.1〜。カメラは動いたままのことがある）
             videoSending = false
             PersonStore.shared.inSession = false
@@ -825,6 +847,10 @@ final class AnalysisModel: ObservableObject {
             guard let m = Mark(rawValue: e.value) else { return }
             r = EventRecord(tMs: e.tMs, kind: "mark", value: .text(m.rawValue))
             showMessage("\(name)が家族の印を付けました：\(m.rawValue)（\(time)）")
+            rememberMark(tMs: e.tMs, value: m.rawValue)
+        case "mark_detail":   // 見る側で「詳しく（任意）」を選んだ（v1.13〜。t_ms はその印の時刻）
+            setMarkDetail(tMs: e.tMs, detail: e.value.isEmpty ? nil : e.value, by: name)
+            return
         case "scene":
             let s = CareScene(rawValue: e.value)
             guard s != nil || e.value == "なし" else { return }
@@ -834,7 +860,7 @@ final class AnalysisModel: ObservableObject {
         default: return
         }
         r.source = "viewer"; r.by = name; r.clockCorrected = clockCorrected
-        logger.write(r)
+        if e.kind == "mark" { logger.writeMark(r) } else { logger.write(r) }
         graph.addEvent(t: Double(e.tMs) / 1000, label: e.kind == "mark" ? "家族の印：\(e.value)" : "場面：\(e.value)", isMark: e.kind == "mark")
         var out = e
         out.by = name
@@ -852,12 +878,57 @@ final class AnalysisModel: ObservableObject {
     func tapMark(_ m: Mark) {
         guard running else { return }
         let now = Date()
-        logger.write(EventRecord(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: .text(m.rawValue)))
+        let tMs = Int64(now.timeIntervalSince1970 * 1000)
+        logger.writeMark(EventRecord(tMs: tMs, kind: "mark", value: .text(m.rawValue)))   // ワンタップでこれだけ記録に残る
+        rememberMark(tMs: tMs, value: m.rawValue)
         graph.addEvent(t: now.timeIntervalSince1970, label: "家族の印：\(m.rawValue)", isMark: true)
-        link.send(LiveEvent(tMs: Int64(now.timeIntervalSince1970 * 1000), kind: "mark", value: m.rawValue))
+        link.send(LiveEvent(tMs: tMs, kind: "mark", value: m.rawValue))
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
         showMessage("家族の印を記録しました：\(m.rawValue)（\(f.string(from: now))）")
+        // 快・不快なら、その下に「詳しく（任意）」を数秒出す（v1.13〜。押さなければ消える。分からないには出さない）
+        let options = (PersonStore.shared.selected?.markOptions ?? .initial).options(for: m)
+        if !options.isEmpty {
+            markDetailPrompt = (tMs, m, options)
+            Task {
+                try? await Task.sleep(for: .seconds(Self.markDetailSeconds))
+                if markDetailPrompt?.tMs == tMs { markDetailPrompt = nil }
+            }
+        } else {
+            markDetailPrompt = nil
+        }
+    }
+
+    /// 「詳しく（任意）」で選んだ（v1.13〜）：同じ印の行に detail・detail_at を書き直す
+    func chooseMarkDetail(_ detail: String) {
+        guard let p = markDetailPrompt else { return }
+        markDetailPrompt = nil
+        setMarkDetail(tMs: p.tMs, detail: detail, by: nil)
+    }
+
+    private func rememberMark(tMs: Int64, value: String) {
+        let combo = PastMarks.key(lastChange?.diffs ?? [])
+        markCombos[tMs] = (combo, value, nil)
+        pastMarks.add(combo: combo, value: value, detail: nil)
+    }
+
+    /// 記録中のファイルの印に詳しい中身を書く（撮る側・見る側で選んだとき）。見る側にも知らせる
+    private func setMarkDetail(tMs: Int64, detail: String?, by name: String?) {
+        guard running else { return }
+        let now = Self.nowMs()
+        logger.amendMark(tMs: tMs, detail: detail, detailAt: now) { [weak self] ok in
+            Task { @MainActor in
+                guard let self else { return }
+                if !ok { self.showMessage("家族の印の詳しい中身を書けませんでした"); return }
+                if let c = self.markCombos[tMs] {
+                    self.pastMarks.setDetail(combo: c.combo, value: c.value, detail: detail)
+                    self.markCombos[tMs]?.detail = detail
+                }
+                let who = name.map { "\($0)が" } ?? ""
+                self.showMessage("\(who)家族の印に詳しい中身を付けました：\(self.markCombos[tMs]?.value ?? "")・\(detail ?? "なし")")
+                self.link.send(LiveEvent(tMs: tMs, kind: "mark_detail", value: detail ?? ""))
+            }
+        }
     }
 
     private static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
@@ -1434,7 +1505,9 @@ final class AnalysisModel: ObservableObject {
             directionVersion: FaceDirection.version,
             voiceOn: running ? engine.active[.voiceOn] != nil : nil,
             voiceWait: running && voiceSec != nil ? voiceWait : nil,
-            personName: running ? PersonStore.shared.selected?.displayName : nil))
+            personName: running ? PersonStore.shared.selected?.displayName : nil,
+            markDetails: running ? (PersonStore.shared.selected?.markOptions ?? .initial).header : nil,
+            pastMarks: running ? pastMarks.summary(for: PastMarks.key(lastChange?.diffs ?? [])) : nil))
     }
 
     /// 映っている顔の数が変わって0.5秒続いたら、event（kind: "faces"、count）を書く。最初に決まった数は書かない

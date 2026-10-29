@@ -5,6 +5,8 @@ import SwiftUI
 /// 真ん中の縦線が今の位置。研究用の合計は出さない（docs/wording-guide.md）
 struct ReplayView: View {
     let data: ReplayData
+    var reload: (() -> Void)? = nil            // 詳しい中身を書いたあと、読み直す（v1.13〜）
+    @State private var editMarks = false
     @State private var pos: Double
     @State private var playing = false
     @State private var speed = 1.0
@@ -14,8 +16,9 @@ struct ReplayView: View {
     static let speeds = [1.0, 2.0, 4.0]
     static let spans: [(Double, String)] = [(30, "30秒"), (60, "1分"), (300, "5分")]
 
-    init(data: ReplayData) {
+    init(data: ReplayData, reload: (() -> Void)? = nil) {
         self.data = data
+        self.reload = reload
         _pos = State(initialValue: data.startT)
     }
 
@@ -49,6 +52,12 @@ struct ReplayView: View {
         }
         .navigationTitle("リプレイ")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if data.sourceURL != nil, !data.markItems.isEmpty {
+                Button("家族の印の詳しい中身") { editMarks = true }
+            }
+        }
+        .sheet(isPresented: $editMarks) { MarkDetailSheet(data: data) { reload?() } }
         .task(id: playing) { await play() }
     }
 
@@ -67,7 +76,7 @@ struct ReplayView: View {
     }
 
     private var explanation: some View {
-        Text("映像は記録していません。記録した表情の数値と顔の向きで絵を動かしています。いつもとの違いは、記録の普段と撮る側と同じ決まりで計算し直したものです（読むだけで、印は付けません）")
+        Text("映像は記録していません。記録した表情の数値と顔の向きで絵を動かしています。いつもとの違いは、記録の普段と撮る側と同じ決まりで計算し直したものです（印は付けません。家族の印の詳しい中身だけは、右上からあとで付けたり変えたりできます）")
             .font(.caption).foregroundStyle(.secondary)
     }
 
@@ -321,5 +330,58 @@ struct ReplayTimeline: View {
             x += 7
         }
         c.stroke(p, with: .color(.secondary.opacity(0.35)), lineWidth: 1)
+    }
+}
+
+/// 記録の家族の印に、あとから詳しい中身を付ける・変える（v1.13〜）。選んだら記録のファイルの印の行に書き（detail_at は今）、読み直す。
+/// 選択肢は記録のヘッダ（mark_details）のもの。分からないには付けない
+struct MarkDetailSheet: View {
+    let data: ReplayData
+    let saved: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var error: String?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let error { Text(error).foregroundStyle(.secondary) }
+                ForEach(data.markItems) { m in
+                    let opts = Mark(rawValue: m.value).map(data.detailOptions.options(for:)) ?? []
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(ViewerView.time(ms: m.tMs))　家族の印：\(m.value)" + (m.by.map { "（\($0)で）" } ?? ""))
+                            Text(m.detail.map { "詳しい中身：\($0)" } ?? (opts.isEmpty ? "詳しい中身は付けません（分からない）" : "詳しい中身：なし"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if !opts.isEmpty {
+                            Menu(m.detail == nil ? "付ける" : "変える") {
+                                ForEach(opts, id: \.self) { o in Button(o) { write(m, o) } }
+                                if m.detail != nil { Button("詳しい中身を消す") { write(m, nil) } }
+                            }
+                        }
+                    }
+                    .frame(minHeight: 44)
+                }
+            }
+            .navigationTitle("家族の印の詳しい中身")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { dismiss() } } }
+            .safeAreaInset(edge: .bottom) {
+                Text("家族の言葉として、記録のファイルの印の行にそのまま書きます（付けた時刻も）。アプリが状態として判定・表示には使いません")
+                    .font(.caption).foregroundStyle(.secondary).padding()
+            }
+        }
+    }
+
+    private func write(_ m: ReplayData.MarkItem, _ detail: String?) {
+        guard let url = data.sourceURL else { return }
+        do {
+            try MarkFile.amend(url: url, tMs: m.tMs, detail: detail)
+            saved()
+            dismiss()
+        } catch {
+            self.error = "書けませんでした：\(error.localizedDescription)"
+        }
     }
 }

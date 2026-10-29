@@ -188,6 +188,29 @@ struct ContentView: View {
                 }
             }
             .disabled(!model.running)
+            markDetailChips
+        }
+    }
+
+    /// 家族の印を押したあとに数秒だけ出す「詳しく（任意）」（v1.13〜、快・不快のとき）。押さなければ消え、記録はワンタップの分だけ
+    @ViewBuilder private var markDetailChips: some View {
+        if let p = model.markDetailPrompt {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Text("詳しく（任意）：\(p.mark.rawValue)").font(.caption).foregroundStyle(.secondary)
+                    ForEach(p.options, id: \.self) { o in
+                        Button { model.chooseMarkDetail(o) } label: {
+                            Text(o).font(.callout).lineLimit(1)
+                                .padding(.horizontal, 12).frame(minHeight: 44)
+                                .foregroundStyle(Self.navy)
+                                .background(Self.paleSlate, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .transition(.opacity)
+            .accessibilityLabel("家族の印の詳しい中身（任意）")
         }
     }
 

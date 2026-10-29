@@ -138,12 +138,15 @@ struct EventRecord: Encodable {
     var windowS: Double?
     var faceFrames: Int?
     var closedFrames: Int?
+    // mark（v1.13〜）：家族の印の詳しい中身（家族の言葉。選んだら同じ行に書き直す）と、付けた時刻
+    var detail: String?
+    var detailAt: Int64?
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
         case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part, median, iqr
         case collect, validS = "valid_s", score, computedS = "computed_s", notSelfS = "not_self_s", noF0S = "no_f0_s", noFramesS = "no_frames_s", final, gateVersion = "gate_version", cached, computeUnits = "compute_units", loadMs = "load_ms", plan, audio
-        case endMs = "end_ms", durationS = "duration_s", above, metrics, groups, atEnd = "at_end", ratio, windowS = "window_s", faceFrames = "face_frames", closedFrames = "closed_frames"
+        case endMs = "end_ms", durationS = "duration_s", above, metrics, groups, atEnd = "at_end", ratio, windowS = "window_s", faceFrames = "face_frames", closedFrames = "closed_frames", detail, detailAt = "detail_at"
     }
 }
 
@@ -266,6 +269,31 @@ final class SessionLogger {
         }
     }
 
+    /// 家族の印の行がファイルのどこから始まるか（v1.13〜、詳しい中身を書き直すため。queue の上でだけ触る）
+    private var markOffsets: [Int64: UInt64] = [:]
+
+    /// 家族の印を書く（あとで詳しい中身を同じ行に書き直せるように、行の始まりを覚えておく）
+    func writeMark(_ e: EventRecord) {
+        queue.async {
+            guard let h = self.handle, let d = try? self.encoder.encode(e) else { return }
+            if let off = try? h.offset() { self.markOffsets[e.tMs] = off }
+            h.write(d + Data("\n".utf8))
+            self.count(e)
+        }
+    }
+
+    /// 記録中のファイルの家族の印の行に、詳しい中身を書き直す（v1.13〜）。そこから後ろの行を読み、印の行だけ変えて書き戻す。
+    /// 返り値は queue の上で決まるので、done で知らせる（書けたか）
+    func amendMark(tMs: Int64, detail: String?, detailAt: Int64, done: @escaping (Bool) -> Void = { _ in }) {
+        queue.async {
+            guard let h = self.handle, let name = self.fileName, let off = self.markOffsets[tMs] else { done(false); return }
+            let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(name)
+            guard let shift = MarkFile.amendInPlace(handle: h, url: url, offset: off, tMs: tMs, detail: detail, detailAt: detailAt) else { done(false); return }
+            for (k, v) in self.markOffsets where v > off { self.markOffsets[k] = UInt64(Int64(v) + shift) }   // 後ろの印の行の始まりもずれる
+            done(true)
+        }
+    }
+
     /// 書いた分を端末に書き出す（このあと終了されても、次に開いたときに読み直せるように）
     func flush() { queue.async { try? self.handle?.synchronize() } }
 
@@ -275,6 +303,7 @@ final class SessionLogger {
             guard let h = handle, let name = fileName else { return nil }
             try? h.close()
             handle = nil
+            markOffsets = [:]
             let s = stats.summary(file: name, startedMs: startedMs == .max ? nil : startedMs, recovered: false)
             startedMs = .max
             stats = SessionStats()

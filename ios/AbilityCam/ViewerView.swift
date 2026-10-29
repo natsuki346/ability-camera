@@ -7,6 +7,7 @@ struct ViewerView: View {
     var openMenu: (() -> Void)?              // サイドバーを開く（iPad・Mac のサイドバーがあるときは nil）
     @AppStorage("sketchTone") private var sketchTone = SketchTone.medium
     @State private var showSettings = false
+    @State private var detailPrompt: (tMs: Int64, mark: Mark, options: [String])?   // 見る側で押した印の「詳しく（任意）」（v1.13〜）
     @State private var span = 5 * 60.0      // 時間の流れに出す長さ（1分・5分・15分）
 
     static let staleSeconds = 2.0
@@ -421,6 +422,14 @@ struct ViewerView: View {
                         DiffLineView(text: text, target: s.diffs.flatMap { i < $0.count ? DiffTarget(key: $0[i].metric) : nil },
                                      font: .system(size: 28 * k, weight: .bold), markerSize: 14 * k)
                     }
+                    // 前に同じ組み合わせのとき、家族が付けた印（v1.13〜。印の数と、詳しい中身の上位2つ。家族の記録をそのまま並べる）
+                    if let past = s.pastMarks, !past.isEmpty {
+                        VStack(alignment: .leading, spacing: 2 * k) {
+                            Text("前に同じ組み合わせのとき、家族が付けた印").font(.system(size: 13 * k, weight: .semibold)).foregroundStyle(.secondary)
+                            ForEach(past, id: \.self) { Text("家族の印：" + $0.text).font(.system(size: 17 * k)).foregroundStyle(Palette.face) }
+                        }
+                        .padding(.top, 4 * k)
+                    }
                 }
                 if !s.insufficient.isEmpty {
                     Text("データ不足で比べていません：\(s.insufficient.joined(separator: "・"))")
@@ -499,7 +508,7 @@ struct ViewerView: View {
             ForEach(recent) { e in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(Self.time(ms: e.tMs)).monospacedDigit().foregroundStyle(.secondary)
-                    Text((e.kind == "mark" ? "家族の印：" : "場面：") + e.value + (e.by.map { "（\($0)で）" } ?? ""))
+                    Text((e.kind == "mark" ? "家族の印：" : "場面：") + e.value + (e.detail.map { "・\($0)" } ?? "") + (e.by.map { "（\($0)で）" } ?? ""))
                         .lineLimit(2)
                 }
             }
@@ -604,11 +613,36 @@ struct ViewerView: View {
             HStack(spacing: 8) {
                 Text("家族の印").font(.system(size: 14 * k)).foregroundStyle(.secondary).frame(minWidth: 90 * k, alignment: .leading)
                 ForEach(Mark.allCases) { m in
-                    Button { link.sendEvent(kind: "mark", value: m.rawValue) } label: {
+                    Button {
+                        // 快・不快なら「詳しく（任意）」を数秒出す（v1.13〜。選択肢は撮る側の、記録している人のもの）
+                        if let t = link.sendEvent(kind: "mark", value: m.rawValue), let opts = s?.markDetails?[m.rawValue], !opts.isEmpty {
+                            detailPrompt = (t, m, opts)
+                            Task {
+                                try? await Task.sleep(for: .seconds(AnalysisModel.markDetailSeconds))
+                                if detailPrompt?.tMs == t { detailPrompt = nil }
+                            }
+                        } else {
+                            detailPrompt = nil
+                        }
+                    } label: {
                         Text(m.rawValue).font(.system(size: 20 * k, weight: .bold)).frame(maxWidth: .infinity, minHeight: 44 * k)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(m == .pleasant ? .teal : m == .unpleasant ? .indigo : .gray)
+                }
+            }
+            if let p = detailPrompt {
+                HStack(spacing: 8) {
+                    Text("詳しく（任意）：\(p.mark.rawValue)").font(.system(size: 14 * k)).foregroundStyle(.secondary)
+                        .frame(minWidth: 90 * k, alignment: .leading)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(p.options, id: \.self) { o in
+                                Button(o) { link.sendEvent(kind: "mark_detail", value: o, tMs: p.tMs); detailPrompt = nil }
+                                    .font(.system(size: 16 * k)).buttonStyle(.bordered).frame(minHeight: 44)
+                            }
+                        }
+                    }
                 }
             }
             HStack(spacing: 8) {

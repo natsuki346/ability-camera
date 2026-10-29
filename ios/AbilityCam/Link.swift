@@ -39,6 +39,9 @@ struct LiveState: Codable {
     var voiceOn: Bool?                // 声が出た（v1.7〜）：本人の声のまとまりが続いているか（記録していない・古い撮る側では nil）。秒数は diffs の voice_on
     var voiceWait: String?            // 声の普段の進み具合が増えない理由（「声の高さが取れていません」など。集めていない・古い撮る側では nil）
     var personName: String? = nil     // 記録している人の名前（v1.11〜。記録していない・古い撮る側では nil。記録のファイルには書かない）
+    // v1.13〜
+    var markDetails: [String: [String]]? = nil   // 家族の印の詳しい中身の選択肢（記録している人のもの。{"快": [...], "不快": [...]}。家族の言葉）
+    var pastMarks: [LivePastMark]? = nil         // 前に同じ組み合わせのとき、家族が付けた印（今「いつもとの違い」が出ているときだけ）
 }
 
 /// いつもとの違い1つ
@@ -60,9 +63,10 @@ struct LiveBaseline: Codable {
 struct LiveEvent: Codable, Identifiable {
     var id = UUID()
     let tMs: Int64
-    let kind: String                  // mark / scene / head_turn
+    let kind: String                  // mark / scene / head_turn / mark_detail（v1.13〜：t_ms の印に詳しい中身 value を付けた。空なら消した）
     let value: String
     var by: String?                   // 見る側で押したときは、その端末の名前
+    var detail: String?               // mark：家族の印の詳しい中身（v1.13〜）
     var head: String?                 // head_turn：新しい向き（HeadState）
 }
 
@@ -489,12 +493,15 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
     }
 
     /// 見る側で押した印・場面を、撮る側に送って記録してもらう。時刻は押した瞬間を、撮る側の時計に直して送る
-    func sendEvent(kind: String, value: String) {
-        guard case .connected = status, let session, !session.connectedPeers.isEmpty else { return }
+    /// 返り値：送った時刻（撮る側の時計）。tMs：決まった時刻で送る（mark_detail：その印の時刻、v1.13〜）
+    @discardableResult
+    func sendEvent(kind: String, value: String, tMs: Int64? = nil) -> Int64? {
+        guard case .connected = status, let session, !session.connectedPeers.isEmpty else { return nil }
         let off = offsetMs
-        let e = LiveEvent(tMs: Int64((Double(LinkConfig.nowMs) + (off ?? 0)).rounded()), kind: kind, value: value)
-        guard let d = try? JSONEncoder().encode(Wire(kind: "viewer_event", event: e, clockCorrected: off != nil)) else { return }
+        let e = LiveEvent(tMs: tMs ?? Int64((Double(LinkConfig.nowMs) + (off ?? 0)).rounded()), kind: kind, value: value)
+        guard let d = try? JSONEncoder().encode(Wire(kind: "viewer_event", event: e, clockCorrected: off != nil)) else { return nil }
         try? session.send(d, toPeers: session.connectedPeers, with: .reliable)
+        return e.tMs
     }
 
     private func onTimer() {
@@ -713,7 +720,14 @@ final class ViewerLink: NSObject, ObservableObject, MCNearbyServiceBrowserDelega
             case "baseline":
                 self.baseline = w.baseline
             case "event":
-                if let e = w.event { self.events.append(e) }
+                guard let e = w.event else { return }
+                if e.kind == "mark_detail" {   // その印に詳しい中身を付けた・変えた（v1.13〜）
+                    if let i = self.events.lastIndex(where: { $0.kind == "mark" && $0.tMs == e.tMs }) {
+                        self.events[i].detail = e.value.isEmpty ? nil : e.value
+                    }
+                } else {
+                    self.events.append(e)
+                }
             case "head_turns":
                 self.headTurns = w.headTurns ?? []
             case "pong":

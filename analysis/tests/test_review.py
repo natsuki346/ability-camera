@@ -1,6 +1,7 @@
 """区間の判定が想定どおりかを確かめる。python -m unittest discover -s tests（analysis/ で）"""
 import sys
 import tempfile
+import json
 import unittest
 from pathlib import Path
 
@@ -1890,6 +1891,58 @@ class CoChangeTest(unittest.TestCase):
             er = review.eyes_closed_ratio(review.load(path), c)
         last = er[-1]   # 5秒ごと。最後は 25秒のとき（直近30秒＝始まりから）
         self.assertAlmostEqual(last[1], 6.0 / (last[0] - t0 / 1000 + 0.033), delta=0.01)   # まばたき 0.2秒は入れない
+
+
+class MarkDetailTest(unittest.TestCase):
+    """家族の印の詳しい中身（v1.13〜）：あとから付ける・消す（印の行だけ変える）、レポートに前後10秒の違いと並べる、アプリの書き直しと同じ"""
+
+    def test_amend_and_report(self):
+        import shutil
+        import mark_detail
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "fixture_basic.jsonl"
+            shutil.copy(FIXTURE, path)
+            before = path.read_text(encoding="utf-8").split("\n")
+            o = mark_detail.amend(path, 1, "姿勢がつらそう", now_ms=1790000099000)
+            after = path.read_text(encoding="utf-8").split("\n")
+            changed = [i for i, (x, y) in enumerate(zip(before, after)) if x != y]
+            self.assertEqual(len(before), len(after))
+            self.assertEqual(len(changed), 1)                         # 印の行だけ
+            row = json.loads(after[changed[0]])
+            self.assertEqual((row["value"], row["detail"], row["detail_at"]), ("不快", "姿勢がつらそう", 1790000099000))
+            self.assertEqual(o["t_ms"], 1790000020800)
+            with self.assertRaises(SystemExit):
+                mark_detail.amend(path, 2, "その他")                  # 分からないには付けない
+            self.assertIn("不快・姿勢がつらそう", "\n".join(mark_detail.listing(path)))
+            review.main([str(path), "--out-dir", d])
+            doc = (Path(d) / "fixture_basic.html").read_text(encoding="utf-8")
+            self.assertIn("家族の印と詳しい中身", doc)
+            self.assertIn("姿勢がつらそう（あとから", doc)
+            a = review.analyze(review.load(path), review.load_criteria(review.HERE / "criteria.json", []))
+            rows = review.mark_detail_rows(a)
+            self.assertEqual([r[2].split("（")[0] for r in rows], ["姿勢がつらそう", "–", "–"])
+            self.assertTrue(any("眉を寄せる" in r[3] for r in rows))  # 前後10秒のいつもとの違い
+            mark_detail.amend(path, 1, None)
+            cleared = path.read_text(encoding="utf-8").split("\n")
+            self.assertEqual(json.loads(cleared[changed[0]]), json.loads(before[changed[0]]))   # 消したら元の中身
+            self.assertEqual([x for i, x in enumerate(cleared) if i != changed[0]], [x for i, x in enumerate(before) if i != changed[0]])
+
+    @unittest.skipUnless(__import__("shutil").which("swiftc"), "swiftc が無い")
+    def test_app_amend(self):
+        """アプリ（MarkFile・PastMarks・記録中の書き直し）：DiffCheck --mark-selftest"""
+        import check_app
+        import subprocess
+        p = subprocess.run([str(check_app.build()), "--mark-selftest"], capture_output=True, text=True)
+        self.assertEqual(p.stdout.strip(), "OK", p.stdout + p.stderr)
+
+    def test_wording(self):
+        guide = (review.HERE.parent / "docs" / "wording-guide.md").read_text(encoding="utf-8")
+        self.assertIn("家族の印の詳しい中身", guide)
+        self.assertIn("前に同じ組み合わせのとき、家族が付けた印", guide)
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "MarkDetail.swift").read_text(encoding="utf-8")
+        for w in ("お腹がすいた", "姿勢がつらそう", "楽しそう", "落ち着いている"):
+            self.assertIn(w, src)
+            self.assertIn(w, (review.HERE / "mark_detail.py").read_text(encoding="utf-8"))
 
 
 class StartScreenTest(unittest.TestCase):

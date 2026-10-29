@@ -50,6 +50,9 @@ struct Person: Codable, Identifiable, Equatable {
     var voiceRetakePending = false               // 記録していないときに「声の普段を取り直す」を押した：次のセッションで集め直す（v1.9.3〜）
     var speaker: SpeakerEnrollment?              // 声の登録（話者の区別、v1.10〜）。声の特徴の数値と、だれが同意したか。この端末の中だけ（バックアップにも入れない）
     var speakerPartial: SpeakerEnrollPartial?    // 途中まで集めた声の登録（14日で捨てる）
+    var markDetails: MarkDetails?                // 家族の印の詳しい中身の選択肢（v1.13〜。nil なら初めの選択肢）
+
+    var markOptions: MarkDetails { markDetails ?? .initial }
 
     /// 画面に出す名前（v1.3 から「さん」を付けない：「自分」「姉」）
     var displayName: String { name }
@@ -60,7 +63,7 @@ struct Person: Codable, Identifiable, Equatable {
     init(id: String, name: String) { self.id = id; self.name = name }
 
     enum CodingKeys: String, CodingKey { case id, name, savedByCamera = "saved_by_camera", voice, saved, voicePartial = "voice_partial", voiceRetakePending = "voice_retake_pending"
-        case speaker, speakerPartial = "speaker_partial" }
+        case speaker, speakerPartial = "speaker_partial", markDetails = "mark_details" }
 
     /// v1.6 までの persons.json（saved が1つ）は、そのカメラの普段として移す。声の普段は人ごとに移す
     init(from decoder: Decoder) throws {
@@ -73,6 +76,7 @@ struct Person: Codable, Identifiable, Equatable {
         voiceRetakePending = try c.decodeIfPresent(Bool.self, forKey: .voiceRetakePending) ?? false
         speaker = try c.decodeIfPresent(SpeakerEnrollment.self, forKey: .speaker)
         speakerPartial = try c.decodeIfPresent(SpeakerEnrollPartial.self, forKey: .speakerPartial)
+        markDetails = try c.decodeIfPresent(MarkDetails.self, forKey: .markDetails)
         if var old = try c.decodeIfPresent(SavedBaseline.self, forKey: .saved) {
             if voice == nil { voice = old.voice }
             old.voice = nil
@@ -90,6 +94,7 @@ struct Person: Codable, Identifiable, Equatable {
         if voiceRetakePending { try c.encode(true, forKey: .voiceRetakePending) }
         try c.encodeIfPresent(speaker, forKey: .speaker)
         try c.encodeIfPresent(speakerPartial, forKey: .speakerPartial)
+        try c.encodeIfPresent(markDetails, forKey: .markDetails)
     }
 }
 
@@ -233,6 +238,13 @@ final class PersonStore: ObservableObject {
     func setSpeakerPartial(_ id: String, _ p: SpeakerEnrollPartial?) {
         guard let i = people.firstIndex(where: { $0.id == id }), people[i].speakerPartial != p else { return }
         people[i].speakerPartial = p
+        save()
+    }
+
+    /// 家族の印の詳しい中身の選択肢を置き換える（v1.13〜）
+    func setMarkDetails(_ id: String, _ d: MarkDetails) {
+        guard let i = people.firstIndex(where: { $0.id == id }) else { return }
+        people[i].markDetails = d
         save()
     }
 
@@ -468,6 +480,11 @@ struct PersonEditView: View {
                 Text("「取り直す」と、記録中でこの人を選んでいればその場で、そうでなければ次に記録を始めたときから声の普段を集め直します。本人の声が10秒たまって保存し直すまで、今の声の普段は残します（途中で閉じたら今の声の普段のまま）")
             }
             recordSection(p)
+            Section {
+                NavigationLink("家族の印の詳しい中身") { MarkDetailsEditor(id: id) }
+            } footer: {
+                Text("家族の印（快・不快）を押したあとに出す選択肢です。家族の言葉としてそのまま記録します。アプリが状態として判定したり、画面に状態として出したりはしません")
+            }
             speakerSection(p)
             Section {
                 if store.inSession && store.selectedID == id {
@@ -502,5 +519,53 @@ struct PersonEditView: View {
         } message: {
             Text("記録のファイルは消えません")
         }
+    }
+}
+
+/// 設定の人ごとの画面の「家族の印の詳しい中身」（v1.13〜）：快・不快それぞれの選択肢を足す・消す・並べ替える
+struct MarkDetailsEditor: View {
+    let id: String
+    @ObservedObject var store = PersonStore.shared
+    @State private var newPleasant = ""
+    @State private var newUnpleasant = ""
+
+    private var details: MarkDetails { store.people.first { $0.id == id }?.markOptions ?? .initial }
+
+    var body: some View {
+        List {
+            section(.unpleasant, items: details.unpleasant, text: $newUnpleasant)
+            section(.pleasant, items: details.pleasant, text: $newPleasant)
+            Section {
+                Button("初めの選択肢に戻す") { store.setMarkDetails(id, .initial) }
+            } footer: {
+                Text("家族の印を押したあと、数秒だけ選択肢を出します。選ばなければ、印だけを記録します。選んだ言葉は、家族の言葉としてそのまま記録に書きます（アプリが状態として判定・表示には使いません）。「分からない」には出しません。あとから、これまでの記録や Mac で付けたり変えたりできます")
+            }
+        }
+        .navigationTitle("家族の印の詳しい中身")
+        .toolbar { EditButton() }
+    }
+
+    private func section(_ m: Mark, items: [String], text: Binding<String>) -> some View {
+        Section(m.rawValue) {
+            ForEach(items, id: \.self) { Text($0) }
+                .onDelete { idx in update(m) { $0.remove(atOffsets: idx) } }
+                .onMove { from, to in update(m) { $0.move(fromOffsets: from, toOffset: to) } }
+            HStack {
+                TextField("選択肢を足す", text: text)
+                Button("足す") {
+                    let v = text.wrappedValue.trimmingCharacters(in: .whitespaces)
+                    text.wrappedValue = ""
+                    guard !v.isEmpty else { return }
+                    update(m) { if !$0.contains(v) { $0.append(v) } }
+                }
+                .disabled(text.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+    }
+
+    private func update(_ m: Mark, _ change: (inout [String]) -> Void) {
+        var d = details
+        if m == .pleasant { change(&d.pleasant) } else { change(&d.unpleasant) }
+        store.setMarkDetails(id, d)
     }
 }

@@ -40,6 +40,14 @@ enum SpeakerEnrollCollect: String {
 /// 本人を登録するとき（v1.10.1〜）：声のまとまりの埋め込みを、そのまとまりのコマの voice_self が分かるまで待ち、数えるかを決める。
 /// 数える：使った声のまとまり全体に voice_self が false のコマが無く、数える分（終わりから min(使った長さ, 0.5秒)）のコマがすべて true（1コマ以上）
 struct SpeakerSelfGate<Item> {
+    /// 決まったときの結果（v1.10.2〜、数えなかった理由も）
+    enum Outcome: Equatable {
+        case counted     // 数えた
+        case notSelf     // 使った声のまとまりに voice_self: false のコマがあった
+        case noF0        // false は無いが、数える分に voice_self: null（f0 が取れていない）のコマがあった（記録の skipped_no_f0_s）
+        case noFrames    // 数える分のコマが無い・待っても来なかった
+    }
+
     private var frames: [(t: Int64, v: Bool?)] = []        // 時刻の順（映像のコマ）
     private var pending: [(endMs: Int64, spanS: Double, item: Item)] = []
 
@@ -53,27 +61,27 @@ struct SpeakerSelfGate<Item> {
     mutating func embedding(endMs: Int64, spanS: Double, item: Item) { pending.append((endMs, spanS, item)) }
 
     /// 決まったもの（数えるか）を古い順に返す。nowMs：今の時刻（コマが来ないまま待ちすぎたものは数えない）
-    mutating func ready(nowMs: Int64) -> [(item: Item, counted: Bool)] {
-        var out: [(item: Item, counted: Bool)] = []
+    mutating func ready(nowMs: Int64) -> [(item: Item, outcome: Outcome)] {
+        var out: [(item: Item, outcome: Outcome)] = []
         let lastT = frames.last?.t ?? Int64.min
         while let p = pending.first, lastT >= p.endMs || nowMs - p.endMs > SpeakerCriteria.selfGateWaitMs {
             pending.removeFirst()
-            out.append((p.item, lastT >= p.endMs && decide(endMs: p.endMs, spanS: p.spanS)))
+            out.append((p.item, lastT >= p.endMs ? decide(endMs: p.endMs, spanS: p.spanS) : .noFrames))
         }
         return out
     }
 
     mutating func clear() { frames = []; pending = [] }
 
-    private func decide(endMs: Int64, spanS: Double) -> Bool {
+    private func decide(endMs: Int64, spanS: Double) -> Outcome {
         let start = endMs - Int64((spanS * 1000).rounded())
         let counted = endMs - Int64((min(spanS, SpeakerCriteria.hopS) * 1000).rounded())
-        var n = 0
+        var n = 0, null = false
         for f in frames where f.t >= start && f.t <= endMs {
-            if f.v == false { return false }
-            if f.t >= counted { if f.v != true { return false }; n += 1 }
+            if f.v == false { return .notSelf }
+            if f.t >= counted { if f.v == nil { null = true } else { n += 1 } }
         }
-        return n > 0
+        return null ? .noF0 : n > 0 ? .counted : .noFrames
     }
 }
 

@@ -1470,9 +1470,13 @@ def quality(a: Analysis, calm: bool) -> dict:
         for e in rec.events:
             if e.get("kind") == "speaker_enroll" and e.get("person_id"):
                 prog.setdefault(e["person_id"], {"collect": None, "points": []})["collect"] = e.get("collect")
-            elif e.get("kind") == "speaker_enroll_progress" and e.get("person_id") and e.get("score") is not None:
-                prog.setdefault(e["person_id"], {"collect": None, "points": []})["points"].append((float(e.get("valid_s", 0)), float(e["score"])))
-        q["speaker"]["enroll"] = {k: v for k, v in prog.items() if v["points"]}
+            elif e.get("kind") == "speaker_enroll_progress" and e.get("person_id"):
+                v = prog.setdefault(e["person_id"], {"collect": None, "points": []})
+                if e.get("score") is not None:
+                    v["points"].append((float(e.get("valid_s", 0)), float(e["score"])))
+                if e.get("skipped_no_f0_s") is not None:   # v1.10.2〜：本人の登録で、f0 が取れず（voice_self が null）数えなかった秒数。最後の行の値
+                    v["skipped_no_f0_s"] = float(e["skipped_no_f0_s"]); v["valid_s"] = float(e.get("valid_s", 0))
+        q["speaker"]["enroll"] = {k: v for k, v in prog.items() if v["points"] or "skipped_no_f0_s" in v}
 
     yaw = rec.yaw[np.isfinite(rec.yaw)]
     if len(yaw):
@@ -1963,7 +1967,9 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
         cl = {"voice_self": "本人の声とされた時間だけ", "voiced": "声が出ている時間すべて", None: "集めたものが書かれていない"}
         for k, v in sp.get("enroll", {}).items():
             qrows.append([f"声の登録の途中 {k[:8]}（{cl.get(v['collect'], v['collect'])}。たまった秒数：その時点までの登録と最新の声の似ている度合い）",
-                          "、".join(f"{t:.0f}秒 {sc:.2f}" for t, sc in v["points"])])
+                          ("、".join(f"{t:.0f}秒 {sc:.2f}" for t, sc in v["points"]) or "5秒に届かなかった")
+                          + (f"。f0 が取れず（voice_self が null）数えなかった声 {v['skipped_no_f0_s']:.1f}秒（数えた声 {v['valid_s']:.1f}秒）"
+                             if "skipped_no_f0_s" in v else "")])
     p = q["pitch"]
     qrows.append(["声の高さ（f0）が取れたコマ",
                   f"{p['f0_frames']}コマ（求め方 {p['version']}："

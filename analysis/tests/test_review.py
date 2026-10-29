@@ -1534,7 +1534,9 @@ class SpeakerTest(unittest.TestCase):
             lines.append(json.dumps({"type": "event", "t_ms": t0 + 100, "kind": "speaker_enroll", "value": "登録", "person_id": "aaaa1111", "collect": "voice_self"}))
             for k, sc in enumerate((0.61, 0.74, 0.78)):
                 lines.append(json.dumps({"type": "event", "t_ms": t0 + 5000 * (k + 1), "kind": "speaker_enroll_progress",
-                                         "person_id": "aaaa1111", "valid_s": 5.0 * (k + 1), "score": sc}))
+                                         "person_id": "aaaa1111", "valid_s": 5.0 * (k + 1), "score": sc, "skipped_no_f0_s": 2.0 * k}))
+            lines.append(json.dumps({"type": "event", "t_ms": t0 + 19000, "kind": "speaker_enroll_progress",
+                                     "person_id": "aaaa1111", "valid_s": 17.5, "skipped_no_f0_s": 6.5, "final": True}))
         p = Path(d) / f"spk_{on}.jsonl"
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return p
@@ -1563,6 +1565,7 @@ class SpeakerTest(unittest.TestCase):
         en = sp["enroll"]["aaaa1111"]
         self.assertEqual(en["collect"], "voice_self")
         self.assertEqual(en["points"], [(5.0, 0.61), (10.0, 0.74), (15.0, 0.78)])
+        self.assertEqual((en["skipped_no_f0_s"], en["valid_s"]), (6.5, 17.5))   # 最後の行（final）の値
 
     def test_fbank_matches_torchaudio(self):
         """アプリの fbank（SpeakerFbank、v1.10.2〜）が torchaudio の kaldi.fbank と同じ（作り物の音。答えは tests/fixture_fbank.json）"""

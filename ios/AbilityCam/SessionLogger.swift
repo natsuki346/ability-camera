@@ -102,6 +102,8 @@ struct EventRecord: Encodable {
     var collect: String?        // speaker_enroll：何を集めるか（voice_self＝本人の声とされた時間だけ / voiced＝声が出ている時間すべて、v1.10.1〜）
     var validS: Double?         // speaker_enroll_progress：たまった声の秒数（v1.10.1〜）
     var score: Double?          // speaker_enroll_progress：その時点までの登録（平均、最新の声を足す前）と最新の声との似ている度合い
+    var skippedNoF0S: Double?   // speaker_enroll_progress：本人を登録しているとき、声が出ていたが voice_self が null（f0 が取れない）で数えなかった秒数（この登録を始めてから、v1.10.2〜）
+    var final: Bool?            // speaker_enroll_progress：登録し終えた・止めたときの最後の1行（score は無い、v1.10.2〜）
     var computeUnits: String?   // speaker_model：Core ML に頼んだ計算の場所（v1.10.2〜）
     var loadMs: Double?         // speaker_model：モデルの読み込みにかかった時間
     var plan: [String: Int]?    // speaker_model：演算ごとに動かす予定の場所の数（ne / gpu / cpu。iOS 17.4〜）
@@ -110,7 +112,7 @@ struct EventRecord: Encodable {
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
         case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part, median, iqr
-        case collect, validS = "valid_s", score, computeUnits = "compute_units", loadMs = "load_ms", plan, audio
+        case collect, validS = "valid_s", score, skippedNoF0S = "skipped_no_f0_s", final, computeUnits = "compute_units", loadMs = "load_ms", plan, audio
     }
 }
 

@@ -77,21 +77,24 @@ if args.first == "--selftest" {
     if SpeakerMath.addWithProgress(&q2, embedding: [1, 0], spanS: 0.5) != nil { bad.append("初めの1つで書いた") }
     if SpeakerMath.addWithProgress(&q2, embedding: [1, 0], spanS: 0.5) != nil { bad.append("区切りを越えないのに書いた") }
     // 本人を登録するときの決め方（v1.10.1〜）
-    func gate(_ vs: [(Int64, Bool?)], end: Int64, span: Double) -> Bool? {
+    func gate(_ vs: [(Int64, Bool?)], end: Int64, span: Double) -> SpeakerSelfGate<Int>.Outcome? {
         var g = SpeakerSelfGate<Int>()
         g.embedding(endMs: end, spanS: span, item: 1)
         for (t, v) in vs { g.frame(tMs: t, voiceSelf: v) }
-        return g.ready(nowMs: end).first?.counted
+        return g.ready(nowMs: end).first?.outcome
     }
     let allTrue = stride(from: Int64(0), through: 3000, by: 33).map { ($0, Optional(true)) }
-    if gate(allTrue, end: 2970, span: 3) != true { bad.append("本人の声だけなのに数えない") }
-    if gate(allTrue.map { ($0.0, $0.0 == 1023 ? false : $0.1) }, end: 2970, span: 3) != false { bad.append("ほかの人の声が混じっても数えた") }
-    if gate(allTrue.map { ($0.0, $0.0 > 2700 ? nil : $0.1) }, end: 2970, span: 3) != false { bad.append("数える分に分からないコマがあっても数えた") }
-    if gate(allTrue.map { ($0.0, $0.0 < 2400 ? nil : $0.1) }, end: 2970, span: 3) != true { bad.append("前の方が分からないだけで数えない") }
+    if gate(allTrue, end: 2970, span: 3) != .counted { bad.append("本人の声だけなのに数えない") }
+    if gate(allTrue.map { ($0.0, $0.0 == 1023 ? false : $0.1) }, end: 2970, span: 3) != .notSelf { bad.append("ほかの人の声が混じっても数えた") }
+    if gate(allTrue.map { ($0.0, $0.0 > 2700 ? nil : $0.1) }, end: 2970, span: 3) != .noF0 { bad.append("数える分に分からないコマがあっても数えた") }
+    if gate(allTrue.map { ($0.0, $0.0 < 2400 ? nil : $0.1) }, end: 2970, span: 3) != .counted { bad.append("前の方が分からないだけで数えない") }
     if gate(allTrue.filter { $0.0 < 2900 }, end: 2970, span: 3) != nil { bad.append("終わりのコマを待たない") }
     var g = SpeakerSelfGate<Int>()
     g.embedding(endMs: 1000, spanS: 0.5, item: 7)
-    if let r = g.ready(nowMs: 1000 + SpeakerCriteria.selfGateWaitMs + 1).first, r.counted || r.item != 7 { bad.append("待ちすぎたのに数えた") }
+    if let r = g.ready(nowMs: 1000 + SpeakerCriteria.selfGateWaitMs + 1).first, r.outcome != .noFrames || r.item != 7 { bad.append("待ちすぎたのに数えた") }
+    // f0 が取れず数えなかった（skipped_no_f0_s）と、ほかの人の声（false）は分ける：false があれば null があっても notSelf
+    if gate(allTrue.map { ($0.0, $0.0 > 2700 ? nil : ($0.0 == 99 ? false : $0.1)) }, end: 2970, span: 3) != .notSelf { bad.append("false と null が両方あるのに notSelf でない") }
+    if gate(allTrue.map { ($0.0, Optional<Bool>.none) }, end: 2970, span: 3) != .noF0 { bad.append("全部 null なのに noF0 でない") }
     print(bad.isEmpty ? "OK" : bad.joined(separator: "\n"))
     exit(bad.isEmpty ? 0 : 1)
 }

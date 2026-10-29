@@ -130,6 +130,7 @@ final class AnalysisModel: ObservableObject {
     private var speakerOn = false
     private var speakerEnroll: (id: String, partial: SpeakerEnrollPartial, retake: Bool, collect: SpeakerEnrollCollect)?
     private var speakerEnrollSavedSec = -1
+    private var speakerSkippedNoF0S = 0.0   // 本人を登録しているとき、声が出ていたが voice_self が null（f0 が取れない）で数えなかった秒数（この登録を始めてから。v1.10.2〜）
     private var speakerGate = SpeakerSelfGate<(endMs: Int64, spanS: Double, embedding: [Float])>()   // 本人を登録するとき（v1.10.1〜）
     private var voiceRetake = false                           // 声の普段だけを取り直した（集め終えたら、その人の声の普段を置き換える。v1.9.2〜）
     private var voiceF0Values: [Double] = []                  // このセッションで数えた声の高さ（v1.9.1〜、中央値・四分位範囲を求める）
@@ -504,8 +505,12 @@ final class AnalysisModel: ObservableObject {
     private func drainSpeakerGate() {
         for r in speakerGate.ready(nowMs: Self.nowMs()) {
             // 途中で選んでいる人を変えたら、voice_self はほかの人のものなので数えない
-            guard r.counted, let en = speakerEnroll, en.collect == .voiceSelf, PersonStore.shared.selectedID == en.id else { continue }
-            addSpeakerEnroll(endMs: r.item.endMs, spanS: r.item.spanS, embedding: r.item.embedding)
+            guard let en = speakerEnroll, en.collect == .voiceSelf, PersonStore.shared.selectedID == en.id else { continue }
+            switch r.outcome {
+            case .counted: addSpeakerEnroll(endMs: r.item.endMs, spanS: r.item.spanS, embedding: r.item.embedding)
+            case .noF0: speakerSkippedNoF0S += min(r.item.spanS, SpeakerCriteria.hopS)   // 数えたら足した分と同じ長さ
+            case .notSelf, .noFrames: break
+            }
         }
     }
 
@@ -514,17 +519,14 @@ final class AnalysisModel: ObservableObject {
         // 0.5秒ごとなので、重ならない分だけ数える
         let score = SpeakerMath.addWithProgress(&en.partial, embedding: e, spanS: min(spanS, SpeakerCriteria.hopS))
         speakerEnroll = en
-        if let score {   // たまった秒数が5秒増えるごと（v1.10.1〜）。埋め込みは書かない
-            var ev = EventRecord(tMs: endMs, kind: "speaker_enroll_progress", value: nil)
-            ev.personId = en.id; ev.validS = (en.partial.validS * 10).rounded() / 10; ev.score = score
-            logger.write(ev)
-        }
+        if let score { writeEnrollProgress(en, tMs: endMs, score: score) }   // たまった秒数が5秒増えるごと（v1.10.1〜）
         let sec = Int(en.partial.validS)
         if PersonStore.shared.speakerEnrollSec != sec { PersonStore.shared.speakerEnrollSec = sec }
         let name = PersonStore.shared.people.first { $0.id == en.id }?.displayName ?? ""
         if en.partial.validS >= SpeakerCriteria.enrollTargetS {
             let done = SpeakerMath.finish(en.partial, now: Self.nowMs())
             PersonStore.shared.setSpeaker(en.id, done)
+            writeEnrollProgress(en, tMs: Self.nowMs(), score: nil, final: true)
             showSpeakerDone("\(name)の声を\(en.retake ? "登録し直しました" : "登録しました")")
             speakerEnroll = nil; speakerGate.clear(); PersonStore.shared.speakerEnrolling = nil
         } else {
@@ -534,6 +536,17 @@ final class AnalysisModel: ObservableObject {
                 PersonStore.shared.setSpeakerPartial(en.id, en.partial)
             }
         }
+    }
+
+    /// 記録の speaker_enroll_progress（埋め込みは書かない）。本人を登録しているときは skipped_no_f0_s も（v1.10.2〜）。
+    /// final：登録し終えた・止めたときの最後の1行（score は無い。たまった秒数が5秒に届かなくても、取りこぼした秒数が分かるように）
+    private func writeEnrollProgress(_ en: (id: String, partial: SpeakerEnrollPartial, retake: Bool, collect: SpeakerEnrollCollect),
+                                     tMs: Int64, score: Double?, final: Bool = false) {
+        var ev = EventRecord(tMs: tMs, kind: "speaker_enroll_progress", value: nil)
+        ev.personId = en.id; ev.validS = (en.partial.validS * 10).rounded() / 10; ev.score = score
+        if en.collect == .voiceSelf { ev.skippedNoF0S = (speakerSkippedNoF0S * 10).rounded() / 10 }
+        if final { ev.final = true }
+        logger.write(ev)
     }
 
     /// 撮る側の「いま」の進み具合（docs/wording-guide.md）
@@ -563,6 +576,7 @@ final class AnalysisModel: ObservableObject {
         }
         speakerEnroll = (id, part, retake, collect)
         speakerEnrollSavedSec = -1
+        speakerSkippedNoF0S = 0
         speakerGate.clear()
         PersonStore.shared.speakerEnrollCollect = collect
         PersonStore.shared.speakerEnrollSec = Int(part.validS)
@@ -575,7 +589,10 @@ final class AnalysisModel: ObservableObject {
     }
 
     private func stopSpeakerEnroll() {
-        if let en = speakerEnroll, !en.retake, en.partial.embeddings > 0 { PersonStore.shared.setSpeakerPartial(en.id, en.partial) }
+        if let en = speakerEnroll {
+            if !en.retake, en.partial.embeddings > 0 { PersonStore.shared.setSpeakerPartial(en.id, en.partial) }
+            if running { writeEnrollProgress(en, tMs: Self.nowMs(), score: nil, final: true) }
+        }
         speakerEnroll = nil
         speakerGate.clear()
         PersonStore.shared.speakerEnrolling = nil

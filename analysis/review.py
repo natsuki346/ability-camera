@@ -346,15 +346,23 @@ def baseline_yaw(b: dict) -> float | None:
     return None if v is None else float(v)
 
 
-def eyes_yaw_ok(rec: Recording, c: dict, bidx: np.ndarray) -> np.ndarray:
-    """目の指標を比べてよいコマ：普段の yaw が無いか、直近の yaw が普段から eye_yaw_tolerance_deg 未満のコマ"""
+def metric_baseline_yaw(b: dict, m: str) -> float | None:
+    """その指標の普段の yaw。今日の普段から足した指標（from_today）は今日の普段の yaw（from_today_yaw_deg、v1.17〜）"""
+    if m in (b.get("from_today") or []) and b.get("from_today_yaw_deg") is not None:
+        return float(b["from_today_yaw_deg"])
+    return baseline_yaw(b)
+
+
+def eyes_yaw_ok(rec: Recording, c: dict, bidx: np.ndarray, m: str | None = None) -> np.ndarray:
+    """目の指標を比べてよいコマ：普段の yaw が無いか、直近の yaw が普段から eye_yaw_tolerance_deg 未満のコマ。
+    m を渡すと、その指標の普段の yaw（metric_baseline_yaw）で"""
     tol = c.get("eye_yaw_tolerance_deg")
     out = np.ones(len(rec.t), bool)
     if tol is None:
         return out
     yr = yaw_recent(rec, c)
     for bi, b in enumerate(rec.baselines):
-        by = baseline_yaw(b)
+        by = baseline_yaw(b) if m is None else metric_baseline_yaw(b, m)
         if by is None:
             continue
         sel = (bidx == bi) & np.isfinite(yr)
@@ -1009,6 +1017,7 @@ def analyze(rec: Recording, c: dict) -> Analysis:
     a.vbidx = baseline_index(rec, "voice")
     eyes_ok = eyes_yaw_ok(rec, c, a.bidx)   # 目の指標：顔の向きが普段からずれたコマは比べない（v1.16〜）
     a.eyes_yaw_ok = eyes_ok
+    eyes_ok_m = {m: eyes_yaw_ok(rec, c, a.bidx, m) for m in EYE_METRICS}   # v1.17〜：from_today の指標は今日の普段の yaw で
     for m in METRICS:
         mc = c["metrics"][m]
         voice = m not in FACE_METRICS
@@ -1032,7 +1041,7 @@ def analyze(rec: Recording, c: dict) -> Analysis:
         if m == "eye_squint":
             ok &= ~blinked
         if m in EYE_METRICS:
-            ok &= eyes_ok
+            ok &= eyes_ok_m[m]
         if voice:
             ok &= ~(a.voice_self == 0)
         a.judge[m] = ok
@@ -1076,7 +1085,7 @@ def analyze(rec: Recording, c: dict) -> Analysis:
             sd[sel] = max(st.get("std") or 0, c["std_floor"][m])
         a.usable[m] = bool(np.isfinite(mean).any())
         a.z[m] = (a.sm[m] - mean) / sd
-        a.judge[m] = np.isfinite(mean) & a.fvalid & (~blinked if m in BLINK_MASKED else True) & (eyes_ok if m in EYE_METRICS else True)
+        a.judge[m] = np.isfinite(mean) & a.fvalid & (~blinked if m in BLINK_MASKED else True) & (eyes_ok_m[m] if m in EYE_METRICS else True)
     a.co_changes = detect_co_change(a, c)
     return a
 
@@ -1096,6 +1105,7 @@ def detect_co_change(a: "Analysis", c: dict) -> list[dict]:
     state = {above: {"run0": None, "rm": set(), "rg": set(), "ev": None} for above in (True, False)}
     out: list[dict] = []
     secondary = set(cc.get("secondary_groups", []))
+    support = cc.get("support", {})   # 補助の指標：同じコマで相手の指標が入っているときだけ数える（v1.17〜）
     split = set(cc.get("split_groups", []))
     for i in range(len(t)):
         ti = float(t[i])
@@ -1104,6 +1114,7 @@ def detect_co_change(a: "Analysis", c: dict) -> list[dict]:
             lit: dict[str, list[str]] = {}
             for name, ms in groups:
                 hit = [m for m, _ in ms if m in zs and zs[m][i] == zs[m][i] and zs[m][i] * sign >= cc["z_min"] - eps]
+                hit = [m for m in hit if m not in support or support[m] in hit]
                 if hit:
                     lit[name] = hit
             if all(g in secondary for g in lit):   # 目のまとまりは、ほかのまとまりが入っているときだけ数える（v1.16〜）

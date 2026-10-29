@@ -2,6 +2,10 @@
 """記録ごとの速さ（解析コマ/秒・撮影→結果・解析時間）と、話者の区別の計算時間を並べる（v1.10〜）。
 話者の区別のオン／オフで同じ場面を記録し、両方を渡して比べる（ヘッダの speaker_on で見分ける）。
 
+v1.17〜：顔の点の距離（v1.15〜の frame の geo）があるコマと無いコマの解析時間・撮影→結果、10秒ごとの解析コマ/秒の最小と、
+前半・後半の解析コマ/秒も出す（点の距離を足したことで遅くなったか、時間がたって遅くなったか（熱など）を見分ける）。
+点の距離は |yaw| > 25° と顔の無いコマで求めないので、無いコマは横を向いた・顔の無いコマでもあることに気をつける。
+
 使い方：python perf_check.py 記録.jsonl ...
 """
 from __future__ import annotations
@@ -24,6 +28,17 @@ def summary(path: Path) -> dict:
     calc = calc[np.isfinite(calc)]
     win = np.array([r.get("window_ms", 0) for r in rec.speaker], float)
     pct = lambda x, q: float(np.percentile(x, q)) if len(x) else None
+    # 顔の点の距離があるコマ（v1.15〜）と無いコマ
+    geo = np.zeros(len(t), bool)
+    for m in review.GEO_METRICS:
+        if m in rec.raw:
+            geo |= np.isfinite(rec.raw[m])
+    face = np.asarray(rec.face, bool)
+    pm, lm = np.isfinite(rec.proc_ms), np.isfinite(rec.lat_ms)
+    # 10秒ごとの解析コマ/秒（最後の半端な分は入れない）と、前半・後半
+    win_fps = [float(((t >= a) & (t < a + 10)).sum()) / 10 for a in np.arange(t[0], t[-1] - 10 + 1e-9, 10)] if dur >= 10 else []
+    half = t[0] + dur / 2 if dur > 0 else 0
+    fps_of = lambda sel, d: (int(sel.sum()) / d) if d > 0 else None
     f0r = np.array([r["f0_ratio"] for r in rec.speaker if r.get("f0_ratio") is not None], float)   # v1.10.2〜
     part = {k: np.array([r[k] for r in rec.speaker if r.get(k) is not None], float) for k in ("fbank_ms", "predict_ms", "wait_ms")}   # v1.10.3〜
     m = next((e for e in rec.events if e.get("kind") == "speaker_model"), None)                     # v1.10.2〜
@@ -37,7 +52,12 @@ def summary(path: Path) -> dict:
             "fps": (len(t) - 1) / dur if dur > 0 else None,
             "lat_p50": pct(lat, 50), "lat_p95": pct(lat, 95), "proc_p50": pct(proc, 50), "proc_p95": pct(proc, 95),
             "speaker_rows": len(rec.speaker), "speaker_per_s": len(rec.speaker) / dur if dur > 0 else None,
-            "calc_p50": pct(calc, 50), "calc_p95": pct(calc, 95), "short_rows": int((win < 1500).sum())}
+            "calc_p50": pct(calc, 50), "calc_p95": pct(calc, 95), "short_rows": int((win < 1500).sum()),
+            "geo_ratio": float(geo[face].mean()) if face.any() else None,
+            "proc_geo_p50": pct(rec.proc_ms[pm & geo], 50), "proc_nogeo_p50": pct(rec.proc_ms[pm & face & ~geo], 50),
+            "lat_geo_p50": pct(rec.lat_ms[lm & geo], 50), "lat_nogeo_p50": pct(rec.lat_ms[lm & face & ~geo], 50),
+            "fps_win_min": min(win_fps) if win_fps else None,
+            "fps_first": fps_of(t < half, dur / 2), "fps_second": fps_of(t >= half, dur / 2)}
 
 
 COLS = [("file", "記録", "{}"), ("speaker_on", "話者の区別", "{}"), ("duration_s", "長さ 秒", "{:.0f}"), ("fps", "解析コマ/秒", "{:.1f}"),
@@ -45,6 +65,10 @@ COLS = [("file", "記録", "{}"), ("speaker_on", "話者の区別", "{}"), ("dur
         ("proc_p50", "解析時間 ms 中央値", "{:.1f}"), ("speaker_rows", "話者の行", "{}"), ("speaker_per_s", "話者の行/秒", "{:.2f}"),
         ("calc_p50", "話者の計算 ms 中央値", "{:.1f}"), ("calc_p95", "話者の計算 ms 95%", "{:.1f}"), ("short_rows", "1.5秒未満の声の行", "{}"),
         ("f0_ratio_p50", "f0 が取れていた割合 中央値", "{:.2f}"), ("model", "モデル", "{}"), ("plan", "計算の場所（ne＝Neural Engine）", "{}"),
+        ("geo_ratio", "顔のコマのうち点の距離がある割合", "{:.2f}"),
+        ("proc_geo_p50", "解析時間 ms 中央値（点の距離あり）", "{:.1f}"), ("proc_nogeo_p50", "解析時間 ms 中央値（顔はあるが点の距離なし）", "{:.1f}"),
+        ("lat_geo_p50", "撮影→結果 ms 中央値（点の距離あり）", "{:.0f}"), ("lat_nogeo_p50", "撮影→結果 ms 中央値（顔はあるが点の距離なし）", "{:.0f}"),
+        ("fps_win_min", "10秒ごとの解析コマ/秒 最小", "{:.1f}"), ("fps_first", "解析コマ/秒 前半", "{:.1f}"), ("fps_second", "解析コマ/秒 後半", "{:.1f}"),
         ("load_ms", "読み込み ms", "{:.0f}"), ("cached", "前に読み込んだもの", "{}"),
         ("fbank_p50", "fbank ms 中央値", "{:.1f}"), ("predict_p50", "predict ms 中央値", "{:.1f}"), ("predict_p95", "predict ms 95%", "{:.1f}"),
         ("wait_p50", "待ち ms 中央値", "{:.1f}"), ("wait_p95", "待ち ms 95%", "{:.1f}"), ("qos", "優先度", "{}"), ("units", "computeUnits", "{}")]

@@ -164,7 +164,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var notes: [String] = []
         let startedAt = ms(header, "started_at_ms") ?? t[0]
         let recount = Self.squintWithoutBlinks(t: t, face: face, yaw: yaw, squint: squint, blink: blink, start0: startedAt)
-        var bItems: [(t: Double, stats: [Metric: DiffEngine.Stat]?, part: BaselinePart, yaw: Double?)] = []
+        var bItems: [(t: Double, stats: [Metric: DiffEngine.Stat]?, part: BaselinePart, yaw: Double?, metricYaw: [Metric: Double])] = []
         for b in baselines {
             // 撮る側が比べるのに使わなかった行（v1.2〜の compared: false）は使わない（振り返りレポートと同じ）
             guard let bt = ms(b), (b["compared"] as? Bool) != false else { continue }
@@ -186,12 +186,17 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             let yst = (b["pose"] as? [String: [String: Any]])?["yaw_deg"]
             let byaw = (yst?["insufficient"] as? Bool) == true ? nil
                 : ((yst?["median"] as? NSNumber)?.doubleValue ?? (yst?["mean"] as? NSNumber)?.doubleValue).map { $0 * flip }
-            bItems.append((bt, stats, BaselinePart.of(b["part"] as? String), byaw))
+            // 今日の普段から足した指標（from_today）は、今日の普段の yaw と比べる（v1.17〜、from_today_yaw_deg）
+            var my: [Metric: Double] = [:]
+            if let ty = (b["from_today_yaw_deg"] as? NSNumber)?.doubleValue {
+                for k in b["from_today"] as? [String] ?? [] { if let m = Metric(rawValue: k) { my[m] = ty * flip } }
+            }
+            bItems.append((bt, stats, BaselinePart.of(b["part"] as? String), byaw, my))
         }
         // カメラを変えたとき・表情だけの取り直し（part: "face"、v1.7〜）は表情の普段だけ消す（声の普段は続ける。review.py の restart_times と同じ）
         for e in evs where e["kind"] as? String == "baseline_restart" {
             // part: "voice"（声だけ取り直した、v1.9.2〜）は声の普段だけ消す
-            bItems.append((ms(e)!, nil, BaselinePart.of(e["part"] as? String), nil))
+            bItems.append((ms(e)!, nil, BaselinePart.of(e["part"] as? String), nil, [:]))
         }
         bItems.sort { $0.t < $1.t }
         if baselines.isEmpty { notes.append("この記録には普段（baseline 行）が無いので、いつもとの違いは出せません") }
@@ -225,7 +230,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var segs: [DiffSegment] = []
         for i in 0..<n {
             while bi < bItems.count, bItems[bi].t <= t[i] {   // その時刻のコマから使う（review.py の baseline_index）
-                engine.setBaseline(bItems[bi].stats, part: bItems[bi].part, yaw: bItems[bi].yaw)
+                engine.setBaseline(bItems[bi].stats, part: bItems[bi].part, yaw: bItems[bi].yaw, metricYaw: bItems[bi].metricYaw)
                 if bItems[bi].part != .voice { hasBase = bItems[bi].stats != nil }   // 斜線は表情の普段が無い時間
                 bi += 1
             }

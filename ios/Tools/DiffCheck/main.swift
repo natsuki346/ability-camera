@@ -29,6 +29,29 @@ if CommandLine.arguments.contains("--geo-selftest") {
     exit(bad.isEmpty ? 0 : 1)
 }
 
+// 顔の点の距離の計算時間（v1.17〜）：1コマ分（FaceGeometry.values・geo_pts を作る・その2つを JSON にする）を何度も回して、1回あたりの µs を出す。
+// Mac で測るので iPhone の値ではないが、1コマ 33ms に対してどのくらいかの目安（docs/validation-log.md）
+if CommandLine.arguments.contains("--geo-bench") {
+    var pts: [Int: (x: Double, y: Double)] = [:]
+    for i in 0..<478 { pts[i] = (Double(i % 23) * 0.03 + 0.2, Double(i / 23) * 0.03 + 0.1) }
+    pts[33] = (0.30, 0.40); pts[263] = (0.70, 0.40); pts[10] = (0.50, 0.15); pts[152] = (0.50, 0.85)
+    let n = 20000
+    let enc = JSONEncoder()
+    var bytes = 0
+    let t0 = Date()
+    for k in 0..<n {
+        let y = Double(k % 40) - 20
+        let p = { (i: Int) -> (x: Double, y: Double)? in pts[i] }
+        if let g = FaceGeometry.values(yaw: y, p) {
+            let gp = FaceGeometry.indices.compactMap { i in p(i).map { [Float(($0.x * 10000).rounded() / 10000), Float(($0.y * 10000).rounded() / 10000)] } }
+            bytes += ((try? enc.encode(g))?.count ?? 0) + ((try? enc.encode(gp))?.count ?? 0)
+        }
+    }
+    let us = Date().timeIntervalSince(t0) / Double(n) * 1e6
+    print(String(format: "1コマあたり %.1f µs（%d 回、JSON 平均 %d バイト）", us, n, bytes / n))
+    exit(0)
+}
+
 // 家族の印の詳しい中身（v1.13〜）：記録の印の行の書き直しと、前に同じ組み合わせのときの印の数え方を確かめる
 if CommandLine.arguments.contains("--mark-selftest") {
     var bad: [String] = []

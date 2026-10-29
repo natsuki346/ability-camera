@@ -235,6 +235,10 @@ struct DataTab: View {
                                                         : "（今日の普段がたまったら比べます。普段を取り直すと保存した普段にも入ります）"),
                                  icon: "info.circle", color: Palette.progress, font: .caption, lines: 4)
                     }
+                    if model.geoWaitingToday {   // v1.17〜
+                        NoteLine(text: "顔の点の距離は、保存した普段ではなく今日の普段と比べます（顔の向きで値がずれるため）。今日の普段がたまったら比べます",
+                                 icon: "info.circle", color: Palette.progress, font: .caption, lines: 4)
+                    }
                     Menu("普段を取り直す") {
                         ForEach(AnalysisModel.RestartPart.allCases) { p in Button(p.rawValue) { model.restart(p) } }
                     }

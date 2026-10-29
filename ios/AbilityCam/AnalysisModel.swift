@@ -117,6 +117,8 @@ final class AnalysisModel: ObservableObject {
     /// 比べている保存した普段に無い指標（v1.15〜。今日の普段がたまったら、その指標だけ今日の普段で比べ始める）
     @Published var missingInSaved: [Metric] = []
     @Published var missingFilled = false
+    /// 顔の点の距離を、今日の普段がたまるのを待っている（v1.17〜。保存した普段では比べない。データのタブ）
+    @Published var geoWaitingToday = false
     /// 普段の間ほとんど動いていない指標（v1.15〜。表情の数値で、普段の間の値の幅が DiffCriteria.flatRange 未満。判定から外すのは記録を見てから決める）
     @Published var flatMetrics: Set<Metric> = []            // 普段の間の左右の差（左 − 右、v1.12〜。まばたきのコマは外す）
     private var eyesRatio = EyesClosedRatio()                 // 目を閉じている割合（v1.12〜、記録だけ）
@@ -271,7 +273,7 @@ final class AnalysisModel: ObservableObject {
         }
         graph.addEvent(t: now - 25, label: "家族の印：快", isMark: true)
         // データのタブの v1.15〜の表示：保存した普段に無い指標・普段の間ほとんど動いていない指標
-        missingInSaved = [.orbit, .noseLip, .mouthTense, .cheekRaise] + Metric.geometry; missingFilled = false
+        missingInSaved = [.orbit, .noseLip, .mouthTense, .cheekRaise]; missingFilled = false; geoWaitingToday = true
         flatMetrics = [.cheekRaise, .noseLip]
         if ProcessInfo.processInfo.arguments.contains("-previewMarkDetail") {   // 「詳しく（任意）」の見た目（v1.13〜）
             markDetailPrompt = (0, .unpleasant, MarkDetails.initial.unpleasant)
@@ -467,7 +469,7 @@ final class AnalysisModel: ObservableObject {
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; diffTargets = []; diffItems = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
-            missingInSaved = []; missingFilled = false; flatMetrics = []
+            missingInSaved = []; missingFilled = false; flatMetrics = []; geoWaitingToday = false
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false; selfVoiceNow = false
             voiceWait = nil; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false; speakerEnrollNote = nil
             speakerOther.clear(); otherVoiceSourceLogged = nil; speakerLast = nil; otherVoiceBySpeaker = false
@@ -977,7 +979,7 @@ final class AnalysisModel: ObservableObject {
         link.baseline = nil   // 見る側の「いつもの範囲」も消す（記録し終えたら、また送る）
         meterZ = [:]; diffMetrics = [:]; baselineStats = nil
         comparing = nil; savedFromMs = nil; askResave = false
-        missingInSaved = []; flatMetrics = []
+        missingInSaved = []; flatMetrics = []; geoWaitingToday = false
         boxStats = (Welford(), Welford(), Welford())
         poseStats = [:]; asymStats = [:]; rangeStats = [:]; missingFilled = false; poseYaw = []
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
@@ -1097,7 +1099,9 @@ final class AnalysisModel: ObservableObject {
 
     private func applySavedFace(_ sv: SavedBaseline, now: Int64) {
         // 表情の部分（v1.5 までに保存した普段の声の数値は、本人以外の声も入っているので使わない）
-        let faceMetrics = sv.metrics.filter { Metric(rawValue: $0.key)?.isFace ?? false }
+        // 顔の点の距離（v1.17〜）は保存した普段では比べない：顔の向き・カメラとの距離で値がずれるため（記録 234756：保存した普段は yaw 16°、その日は 3〜7° で
+        // brow_inner_gap が何もしていないのに z −1〜−1.8）。その日の今日の普段がたまってから、from_today で足して比べる
+        let faceMetrics = sv.metrics.filter { Metric(rawValue: $0.key).map { $0.isFace && !$0.isGeometry } ?? false }
         var row = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
                                  yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
                                  minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: faceMetrics)
@@ -1109,8 +1113,9 @@ final class AnalysisModel: ObservableObject {
         savedFromMs = sv.savedMs
         usedFace = (sv.savedMs, faceMetrics)
         // 保存した普段に無い指標（v1.12〜・v1.15〜で足した指標。保存したのが前の版のとき）
-        missingInSaved = Metric.allCases.filter { $0.isFace && (faceMetrics[$0.rawValue].map { $0.insufficient } ?? true) }
+        missingInSaved = Metric.allCases.filter { $0.isFace && !$0.isGeometry && (faceMetrics[$0.rawValue].map { $0.insufficient } ?? true) }
         missingFilled = false
+        geoWaitingToday = true
         face.setPreferred(sv.faceBox)
     }
 
@@ -1205,7 +1210,7 @@ final class AnalysisModel: ObservableObject {
             publishBaseline(tMs: Self.nowMs())   // 見る側へ1回
             face.setPreferred(faceBox)
         } else if comparing == .saved, let used = usedFace {
-            fillMissingFromToday(out, used: used)
+            fillMissingFromToday(out, used: used, todayYaw: Self.baselineYaw(pose))
         }
         baselineSec = nil; baselineWait = nil
         baselineReady = true
@@ -1217,8 +1222,10 @@ final class AnalysisModel: ObservableObject {
 
     /// 保存した普段で比べているとき、保存した普段に無い指標（データ不足を含む）を、うしろで集めた今日の普段で比べ始める（v1.15〜）。
     /// 保存した普段の値はそのままに、足した指標を from_today に書いた baseline 行（source: saved、compared: true、part: face）を書く
-    private func fillMissingFromToday(_ today: [String: BaselineRecord.Stat], used: (startedMs: Int64, metrics: [String: BaselineRecord.Stat])) {
-        let add = missingInSaved.filter { today[$0.rawValue].map { !$0.insufficient } ?? false }
+    /// v1.17〜：顔の点の距離もいつもここで足す（保存した普段では比べない）。足した指標の目の向きの判定は、今日の普段の yaw（from_today_yaw_deg）で
+    private func fillMissingFromToday(_ today: [String: BaselineRecord.Stat], used: (startedMs: Int64, metrics: [String: BaselineRecord.Stat]),
+                                      todayYaw: Double?) {
+        let add = (missingInSaved + Metric.geometry).filter { today[$0.rawValue].map { !$0.insufficient } ?? false }
         guard !add.isEmpty, let p = PersonStore.shared.selected, let sv = p.saved(for: (lensInUse ?? camera.lens).rawValue) else { return }
         var merged = used.metrics
         for m in add { merged[m.rawValue] = today[m.rawValue] }
@@ -1229,10 +1236,13 @@ final class AnalysisModel: ObservableObject {
         row.source = BaselineSource.saved.rawValue; row.compared = true; row.part = BaselinePart.face.rawValue
         row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose; row.asym = sv.asym
         row.fromToday = add.map(\.rawValue)
+        row.fromTodayYawDeg = todayYaw
         logger.write(row)
-        engine.setBaseline(Self.engineBaseline(merged), part: .face, yaw: Self.baselineYaw(sv.pose))
+        engine.setBaseline(Self.engineBaseline(merged), part: .face, yaw: Self.baselineYaw(sv.pose),
+                           metricYaw: todayYaw.map { y in Dictionary(uniqueKeysWithValues: add.map { ($0, y) }) } ?? [:])
         usedFace = (used.startedMs, merged)
-        missingFilled = true
+        missingFilled = add.contains { !$0.isGeometry } || missingFilled
+        if add.contains(where: \.isGeometry) { geoWaitingToday = false }
         publishBaseline(tMs: now)
     }
 

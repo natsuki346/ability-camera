@@ -1786,7 +1786,7 @@ class CoChangeTest(unittest.TestCase):
     """表情のまとまりと重なりのできごと（v1.12〜）：アプリ（DiffEngine）とレポートで同じ。1つの動きだけ・短い重なりでは出さない"""
 
     @staticmethod
-    def write(path: Path, spans=None, length=52.0):
+    def write(path: Path, spans=None, length=52.0, face_extra=None):
         import json
         t0 = 1_800_000_000_000
         base_bs = {k: 0.1 for k in ("browDownLeft", "browDownRight", "eyeSquintLeft", "eyeSquintRight", "cheekSquintLeft", "cheekSquintRight",
@@ -1802,7 +1802,7 @@ class CoChangeTest(unittest.TestCase):
                  (14.0, 16.0, ("brow",), False),          # 1つだけ → 出さない
                  (20.0, 22.0, ("press",), True),          # 口の緊張＋声 → できごと
                  (30.0, 30.1, ("brow", "orbit"), False),  # 短い重なり（ならしても 0.5秒に届かない） → 出さない
-                 (36.0, 38.0, ("geo",), False),           # 顔の点の距離だけ（眉頭の間・目の開きが小さく） → できごと（v1.15〜）
+                 (36.0, 38.0, ("geo",), False),           # 顔の点の距離だけ（眉頭の間・目の開きが小さく） → v1.17〜は出さない（眉頭の間は補助、目だけになる）
                  (46.0, 53.0, ("brow", "orbit"), False)]  # 記録の終わりまで → 打ち切り
         mets = {m: {"n": 300, "mean": 0.1, "std": 0.02, "insufficient": False}
                 for m in ("mouth_smile", "brow_down", "eye_squint", "jaw_open", "orbit", "nose_lip", "mouth_tense", "cheek_raise")}
@@ -1811,7 +1811,7 @@ class CoChangeTest(unittest.TestCase):
             mets[m] = {"n": 300, "mean": v, "std": 0.005, "insufficient": False}
         pose = {"yaw_deg": {"n": 300, "mean": 0.0, "std": 1.0, "median": 0.0, "insufficient": False}}
         lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "direction_version": 2}),
-                 json.dumps({"type": "baseline", "t_ms": t0, "part": "face", "blink_masked": True, "metrics": mets, "pose": pose}),
+                 json.dumps({"type": "baseline", "t_ms": t0, "part": "face", "blink_masked": True, "metrics": mets, "pose": pose, **(face_extra or {})}),
                  json.dumps({"type": "baseline", "t_ms": t0, "part": "voice", "metrics": {"rms_db": {"n": 300, "mean": -50.0, "std": 2.0, "insufficient": False},
                                                                                          "f0_hz": {"n": 300, "mean": 150.0, "std": 10.0, "insufficient": False}}})]
         for k in range(int(length / 0.033)):
@@ -1826,6 +1826,12 @@ class CoChangeTest(unittest.TestCase):
                     for w in which:
                         if w == "geo":
                             geo["brow_eye_gap"] = 0.15; geo["brow_inner_gap"] = 0.15; geo["eye_open"] = 0.06
+                            continue
+                        if w == "inner":     # 眉頭の間だけ小さく（v1.17〜）
+                            geo["brow_inner_gap"] = 0.15
+                            continue
+                        if w == "eye_open":  # 目の開きだけ小さく（v1.17〜）
+                            geo["eye_open"] = 0.06
                             continue
                         for key in up[w]:
                             bs[key] = 0.4
@@ -1848,7 +1854,6 @@ class CoChangeTest(unittest.TestCase):
             got = [(round(float(a.rec.t[e["i0"]] - t0)), e["metrics"], e["at_end"]) for e in a.co_changes]
             self.assertEqual(got, [(3, ["brow_down", "eye_squint", "orbit", "nose_lip"], False),
                                    (20, ["rms_db", "mouth_tense"], False),
-                                   (36, ["brow_inner_gap", "eye_open"], False),   # 点の距離が小さくなる向き＝眉を寄せる・目を細める向き（v1.15〜。brow_eye_gap は v1.16 で外した）
                                    (46, ["brow_down", "eye_squint", "orbit"], True)])
             self.assertTrue(all(e["above"] for e in a.co_changes))
             self.assertGreater(float(a.rec.t[a.co_changes[0]["i1"]] - t0), 7.0)   # 5秒以内の重なりはまとめる
@@ -1862,7 +1867,7 @@ class CoChangeTest(unittest.TestCase):
             if not shutil.which("swiftc"):
                 self.skipTest("swiftc が無い")
             diffs, n = check_app.compare_co(path, check_app.build(), c)
-            self.assertEqual(n, 4)
+            self.assertEqual(n, 3)
             self.assertEqual(diffs, [])
 
     def test_rules_v116(self):
@@ -1887,6 +1892,43 @@ class CoChangeTest(unittest.TestCase):
             if shutil.which("swiftc"):
                 diffs, n = check_app.compare_co(path, check_app.build(), c)
                 self.assertEqual((diffs, n), ([], 3))
+
+    def test_rules_v117(self):
+        """v1.17〜：brow_inner_gap は browDown と同じコマのときだけ眉のまとまりに数える。今日の普段から足した指標（from_today）は、
+        今日の普段の yaw（from_today_yaw_deg）で目の向きを判定する。アプリと一致"""
+        import shutil
+        import check_app
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        spans = [(3.0, 5.0, ("inner",), True),                     # 眉頭の間だけ＋声 → 眉を光らせないので出さない
+                 (12.0, 14.0, ("brow", "inner"), True),            # browDown と眉頭の間＋声 → できごと（brow_inner_gap も入る）
+                 (22.0, 24.0, ("eye_open", "smile"), False, 15.0)]  # 顔が 15°：保存した普段（0°）では目を外すが、今日の普段（15°）から足した eye_open は比べる
+        extra = {"source": "saved", "compared": True, "from_today": ["eye_open"], "from_today_yaw_deg": 15.0}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "v117.jsonl"
+            self.write(path, spans, length=32.0, face_extra=extra)
+            a = review.analyze(review.load(path), c)
+            t0 = a.rec.t[0]
+            got = [(round(float(a.rec.t[e["i0"]] - t0)), e["groups"], e["metrics"]) for e in a.co_changes]
+            self.assertEqual(got, [(12, ["brow", "voice"], ["brow_down", "rms_db", "brow_inner_gap"]),
+                                   (22, ["eyes", "smile"], ["mouth_smile", "eye_open"])])
+            mid = (a.rec.t - t0 > 22.5) & (a.rec.t - t0 < 23.5)
+            self.assertTrue(a.judge["eye_open"][mid].all())
+            self.assertFalse(a.judge["eye_squint"][mid].any())
+            if shutil.which("swiftc"):
+                diffs, n = check_app.compare_co(path, check_app.build(), c)
+                self.assertEqual((diffs, n), ([], 2))
+
+    def test_perf_check_geo(self):
+        """perf_check.py（v1.17〜）：顔の点の距離があるコマの割合・10秒ごとの解析コマ/秒"""
+        import perf_check
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "perf.jsonl"
+            self.write(path, [], length=30.0)
+            r = perf_check.summary(path)
+        self.assertEqual(r["geo_ratio"], 1.0)
+        self.assertAlmostEqual(r["fps_win_min"], 30.0, delta=0.6)
+        self.assertAlmostEqual(r["fps_first"], r["fps_second"], delta=0.6)
+        self.assertIn("点の距離がある割合", perf_check.table([r]))
 
     def test_face_check_and_geo(self):
         """顔の点の距離（v1.15〜）：アプリの FaceGeometry（DiffCheck --geo-selftest）と、face_check.py の区間ごとの表"""
@@ -1950,6 +1992,9 @@ class CoChangeTest(unittest.TestCase):
         self.assertEqual(re.search(r'coSecondary: Set<String> = \["(\w+)"\]', src).group(1), cc["secondary_groups"][0])
         self.assertEqual(sorted(re.findall(r'"(\w+)"', re.search(r"coSplitGroups: Set<String> = \[([^\]]*)\]", src).group(1))), sorted(cc["split_groups"]))
         self.assertEqual(float(re.search(r"static let eyeYawToleranceDeg = ([\d.]+)", src).group(1)), c["eye_yaw_tolerance_deg"])
+        # 補助の指標（v1.17〜）
+        sup = {rv[k]: rv[v] for k, v in re.findall(r"\.(\w+): \.(\w+)", re.search(r"coSupport: \[Metric: Metric\] = \[([^\]]*)\]", src).group(1))}
+        self.assertEqual(sup, cc["support"])
         # 顔の点の距離（v1.15〜）：点の番号・|yaw| の上限・下限・幅
         base = (review.HERE.parent / "ios" / "AbilityCam" / "Baseline.swift").read_text(encoding="utf-8")
         g = c["geometry"]

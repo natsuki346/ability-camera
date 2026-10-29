@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-29.7",
+  "version": "2026-10-29.8",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -80,6 +80,10 @@
     {
       "date": "2026-10-29",
       "reason": "v1.16（記録 ability-cam-20261029-213623、前面から）：何もしない 108〜140秒に eye_open の z +2〜3・eye_squint の「いつもより強い」が何度も出た。普段を取ったときは yaw 13〜21°、後半は 5° くらいで、目の値が顔の向きでずれていた。目の指標（eye_squint・orbit・eye_open）は、yaw（直近1秒）が表情の普段の yaw の中央値（baseline 行の pose.yaw_deg.median、無い古い普段は平均）から eye_yaw_tolerance_deg（10°、仮の値）以上ずれたコマでは比べない（z を出さない）。co_change：brow_eye_gap を外した（眉を寄せた 65〜67・81〜91秒に変わらず、普段の標準偏差 0.021 の方が大きかった。記録は続ける）。目のまとまり（eyes：orbit・eye_open・eye_squint）は secondary_groups で、ほかのまとまり（眉・口角・口・鼻と上唇・声）が入っているときだけ数える。続いている重なりで、入っている表情のまとまり（split_groups：眉・鼻と上唇・口の緊張・口角）が前と1つも重ならなくなったら別のできごとに分ける（84.7秒からの 17.7秒が、眉 → 口角までつながっていたため）。アプリ（DiffEngine.swift の DiffCriteria）と同じ値。"
+    },
+    {
+      "date": "2026-10-29",
+      "reason": "v1.17（記録 ability-cam-20261029-234627・234756、前面から）：眉を寄せた 22・40・68〜74秒に browDown は 0.05〜0.12（普段 0.001）で「眉を寄せる」が出たが、brow_inner_gap は z ±0.4 でほとんど動かなかった（前の記録 213623 では z +2.2〜2.8）。何もしていないときも brow_inner_gap の z が −1〜−1.8 にずれていた（保存した普段は yaw の平均 16°、今回は 3〜7°）。顔の点の距離（brow_inner_gap・eye_open・mouth_corner・brow_eye_gap）は保存した普段では比べず、その日の今日の普段がたまってから比べる（アプリが保存した普段の baseline 行から外し、今日の普段から from_today で足す。足した指標の目の向きの判定は from_today_yaw_deg＝今日の普段の yaw の中央値）。co_change：support で brow_inner_gap を補助にした（同じコマで brow_down が入っているときだけ眉のまとまりに数える。記録は続ける）。アプリ（DiffEngine.swift の DiffCriteria.coSupport）と同じ値。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -306,6 +310,10 @@
     "secondary_groups": [
       "eyes"
     ],
+    "_support_note": "補助の指標（v1.17〜）：キーの指標は、同じコマで値の指標が入っているときだけ数える（brow_inner_gap だけでは眉のまとまりを光らせない）",
+    "support": {
+      "brow_inner_gap": "brow_down"
+    },
     "split_groups": [
       "brow",
       "nose_lip",

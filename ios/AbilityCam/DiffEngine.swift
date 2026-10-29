@@ -79,6 +79,9 @@ enum DiffCriteria {
         ("nose_lip", [(.noseLip, 1)]), ("mouth_tense", [(.mouthTense, 1)]),
         ("smile", [(.mouthSmile, 1), (.mouthCorner, 1)]), ("voice", [(.rmsDb, 1), (.f0Hz, 1)])]
     static let coSecondary: Set<String> = ["eyes"]
+    /// 補助の指標（v1.17〜、criteria.json の co_change.support）：同じコマで相手の指標が入っているときだけ数える。
+    /// brow_inner_gap は browDown が入っていないと眉のまとまりを光らせない（記録 234756 で、眉を寄せても z ±0.4 しか動かなかった。記録は続ける）
+    static let coSupport: [Metric: Metric] = [.browInnerGap: .browDown]
     /// 続いている重なりで、入っている表情のまとまり（目と声を除く）が前と1つも重ならなくなったら別のできごとに分ける（v1.16〜。例：眉 → 口角）
     static let coSplitGroups: Set<String> = ["brow", "nose_lip", "mouth_tense", "smile"]
     /// 目の指標（eye_squint・orbit・eye_open）は、顔の向き（yaw）が普段の中央値からこれ以上ずれたコマでは比べない（v1.16〜、仮の値。criteria.json の eye_yaw_tolerance_deg）
@@ -125,7 +128,8 @@ struct CoChangeDetector {
             let sign = above ? 1.0 : -1.0
             var lit: [String: [Metric]] = [:]
             for g in DiffCriteria.coGroups {
-                let ms = g.metrics.filter { (z[$0.m] ?? 0) * $0.sign * sign >= DiffCriteria.coZ - 1e-9 }.map(\.m)
+                var ms = g.metrics.filter { (z[$0.m] ?? 0) * $0.sign * sign >= DiffCriteria.coZ - 1e-9 }.map(\.m)
+                ms = ms.filter { m in DiffCriteria.coSupport[m].map { ms.contains($0) } ?? true }   // 補助の指標は相手が入っているときだけ（v1.17〜）
                 if !ms.isEmpty { lit[g.name] = ms }
             }
             // 目のまとまりは、ほかのまとまりが入っているときだけ数える（v1.16〜）
@@ -495,7 +499,7 @@ struct DiffEngine {
 
     private enum Item {
         case frame(DiffInput, faceValid: Bool, yaw: Double?)
-        case baseline([Metric: Stat]?, BaselinePart, yaw: Double?)
+        case baseline([Metric: Stat]?, BaselinePart, yaw: Double?, metricYaw: [Metric: Double])
     }
 
     private var queue: [Item] = []
@@ -512,6 +516,7 @@ struct DiffEngine {
     /// 重なりのできごと（v1.12〜）。終わったものは coDet.finished
     var coDet = CoChangeDetector()
     private var faceYaw: Double?                 // 表情の普段の yaw（v1.16〜）
+    private var metricYaw: [Metric: Double] = [:]   // 今日の普段から足した指標の yaw（v1.17〜。from_today の指標は今日の普段の向きと比べる）
     /// 最後に判定したコマで、顔の向きが普段と違うので目の指標を比べなかったか（データのタブ、v1.16〜）
     private(set) var eyesYawExcluded = false
 
@@ -531,8 +536,9 @@ struct DiffEngine {
     /// 普段を決めた・取り直した（nil で両方を消す）。この時刻より後のコマから使う。
     /// part が face / voice なら、その部分だけ変える（v1.6〜）
     /// yaw：その表情の普段の yaw の中央値（v1.16〜。目の指標を、顔の向きが普段から yawTolerance 以上ずれたコマでは比べない。無い古い普段は平均）
-    mutating func setBaseline(_ b: [Metric: Stat]?, part: BaselinePart = .all, yaw: Double? = nil) {
-        queue.append(.baseline(b, part, yaw: yaw))
+    /// metricYaw：指標ごとに別の普段の yaw（v1.17〜。保存した普段で比べていて、今日の普段から足した指標＝from_today は今日の普段の yaw）
+    mutating func setBaseline(_ b: [Metric: Stat]?, part: BaselinePart = .all, yaw: Double? = nil, metricYaw: [Metric: Double] = [:]) {
+        queue.append(.baseline(b, part, yaw: yaw, metricYaw: metricYaw))
     }
 
     /// 1コマ足す。0.2秒より前のコマを判定する
@@ -566,8 +572,8 @@ struct DiffEngine {
     private mutating func drain(until limit: Double) {
         while let first = queue.first {
             switch first {
-            case .baseline(let b, let part, let yaw):
-                if part != .voice { faceYaw = b == nil ? nil : yaw }
+            case .baseline(let b, let part, let yaw, let my):
+                if part != .voice { faceYaw = b == nil ? nil : yaw; metricYaw = b == nil ? [:] : my }
                 if part != .voice { faceBaseline = b.map { $0.filter { $0.key.isFace } } }
                 if part != .face { voiceBaseline = b.map { $0.filter { !$0.key.isFace } } }
                 queue.removeFirst()
@@ -585,8 +591,12 @@ struct DiffEngine {
 
     private mutating func process(_ x: DiffInput, faceValid: Bool, yaw: Double?) {
         // 目の指標（v1.16〜）：顔の向きが普段から yawTolerance 以上ずれたコマでは比べない（目の値は向きでずれるため。review.py と同じ：直近 1秒の yaw）
-        let eyesOffYaw = faceYaw.map { fy in yaw.map { abs($0 - fy) >= DiffCriteria.eyeYawToleranceDeg - 1e-9 } ?? false } ?? false
-        eyesYawExcluded = eyesOffYaw
+        // v1.17〜：今日の普段から足した指標（from_today）は、今日の普段の yaw と比べる
+        func offYaw(_ m: Metric) -> Bool {
+            guard m.isEyeMetric, let fy = metricYaw[m] ?? faceYaw, let y = yaw else { return false }
+            return abs(y - fy) >= DiffCriteria.eyeYawToleranceDeg - 1e-9
+        }
+        eyesYawExcluded = Metric.allCases.contains { offYaw($0) && (faceBaseline?[$0] != nil) }
         processedT = x.t
         blinkTimes.removeAll { $0 < x.t - DiffCriteria.blinkPadS - 1 }
         let blink = blinked(at: x.t)
@@ -612,7 +622,7 @@ struct DiffEngine {
             if m.isFace && !faceValid { zz = nil }
             if !m.isFace && x.voiceSelf == false { zz = nil }   // 本人以外の声（と言えない声）のコマでは判定しない
             if m.blinkMasked && blink { zz = nil }
-            if m.isEyeMetric && eyesOffYaw { zz = nil }
+            if offYaw(m) { zz = nil }
             z[m] = zz
             guard m.isMain else { continue }   // 表情のまとまり（v1.12〜）は z だけ。「いつもとの違い」の区間にはしない
 

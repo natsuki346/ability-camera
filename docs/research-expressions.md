@@ -62,6 +62,11 @@
 - 目を閉じている割合（30秒の窓、`kind: "eyes_closed_ratio"`）：判定には使わない
 - 振り返りレポート：重なりのできごとの一覧と、それぞれの前後10秒の家族の印
 
+## 8. v1.15：顔の点の距離
+- 実機の記録（前面）で、この人の顔では MediaPipe の blendshape の一部（browDown・cheekSquint・noseSneer・mouthSmile）がほとんど動かなかった。blendshape は AU として確かめられたものではないので、
+  顔によって動かないことがある。そこで、478点の位置から距離（眉と目の間・眉頭の間・目の開き・口角の高さ）を求めて、両方を記録する（README の「顔の点の距離」）。
+  どちらを判定に使うかは、`analysis/face_check.py` で区間ごとに比べてから決める
+
 ## 出典
 - Prkachin KM, Solomon PE. The structure, reliability and validity of pain expression: Evidence from patients with shoulder pain. *Pain*. 2008;139(2):267–274.（肩の痛みのある成人 129人、PSPI）
 - Breau LM, McGrath PJ, et al. Psychometric properties of the Non-communicating Children's Pain Checklist-Revised. *Pain*. 2002.（NCCPC-R）

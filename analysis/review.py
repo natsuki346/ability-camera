@@ -32,15 +32,18 @@ FACE_METRICS = {"mouth_smile", "brow_down", "eye_squint", "jaw_open"}
 VOICE_METRICS = ["rms_db", "f0_hz"]
 # 表情のまとまり（v1.12〜、docs/research-expressions.md）：z を求め、重なりのできごと（co_change）に使う。「いつもとの違い」の区間にはしない（criteria.json の segments: false）
 GROUP_METRICS = ["orbit", "nose_lip", "mouth_tense", "cheek_raise"]
-ALL_FACE = FACE_METRICS | set(GROUP_METRICS)
-BLINK_MASKED = ("eye_squint", "orbit")       # まばたきのコマと前後を使わない
+# 顔の点の距離（v1.15〜、アプリの FaceGeometry。記録の frame の geo。|yaw| > 25° のコマには無い）
+GEO_METRICS = ["brow_eye_gap", "brow_inner_gap", "eye_open", "mouth_corner"]
+ALL_FACE = FACE_METRICS | set(GROUP_METRICS) | set(GEO_METRICS)
+BLINK_MASKED = ("eye_squint", "orbit", "eye_open")       # まばたきのコマと前後を使わない
 ASYM_KEYS = ["brow_down", "orbit", "mouth_smile"]   # 左右の差（左 − 右、本人から見て。v1.12〜、判定には使わない）
 # 声の高さとして使う範囲（Hz、criteria.json の pitch.range_hz と同じ。アプリは ios/AbilityCam/Pitch.swift の PitchCriteria）。
 # v1.6.1 までの記録には 800Hz のような倍音の取り違えが入っているので、読むときに外す（アプリのリプレイも同じ）
 F0_RANGE = (70.0, 500.0)
 LABEL = {"mouth_smile": "口角を上げる", "brow_down": "眉を寄せる", "eye_squint": "目を細める",
          "jaw_open": "口を開ける", "rms_db": "声の大きさ", "f0_hz": "声の高さ",
-         "orbit": "目のまわりを縮める", "nose_lip": "鼻・上唇を上げる", "mouth_tense": "口を結ぶ・横に引く", "cheek_raise": "頬を上げる"}
+         "orbit": "目のまわりを縮める", "nose_lip": "鼻・上唇を上げる", "mouth_tense": "口を結ぶ・横に引く", "cheek_raise": "頬を上げる",
+         "brow_eye_gap": "眉と目の間（点）", "brow_inner_gap": "眉頭の間（点）", "eye_open": "目の開き（点）", "mouth_corner": "口角の高さ（点）"}
 UNIT = {"rms_db": " dB", "f0_hz": " Hz"}
 # 目を閉じている（v1.4〜）：普段とは比べず、閉じているかどうかの事実だけ（criteria.json の eyes_closed）
 EYES = "eyes_closed"
@@ -166,7 +169,7 @@ def load(path: Path) -> Recording:
     events.sort(key=lambda o: o["t_ms"])
 
     n = len(frames)
-    raw = {m: np.full(n, np.nan) for m in METRICS + GROUP_METRICS}
+    raw = {m: np.full(n, np.nan) for m in METRICS + GROUP_METRICS + GEO_METRICS}
     asym = {k: np.full(n, np.nan) for k in ASYM_KEYS}
     yaw, lat, proc, blink, pitch, roll, other_jaw = (np.full(n, np.nan) for _ in range(7))
     extra = {"reason": [None] * n, "corr": np.full(n, np.nan), "corr_other": np.full(n, np.nan), "match": [None] * n, "has": False}
@@ -185,6 +188,9 @@ def load(path: Path) -> Recording:
                 raw[m][i] = v
             for k, v in asymmetry(o["bs"]).items():
                 asym[k][i] = v
+            for k, v in (o.get("geo") or {}).items():   # 顔の点の距離（v1.15〜）
+                if k in raw and v is not None:
+                    raw[k][i] = v
             bs = o["bs"]
             for k in MOUTH_KEYS_ALL:
                 if bs.get(k) is not None:
@@ -464,7 +470,7 @@ def rebuild_baselines(rec: Recording, target_s: float, c: dict | None = None) ->
     starts = sorted([start0] + restart_times(rec, "face"))
     blinked = blink_mask(rec, c)
     split = bool(c and c.get("voice_self") and c.get("voice_baseline"))   # v1.6〜：声の普段は別に集める
-    face_only = ([m for m in METRICS if m in FACE_METRICS] if split else list(METRICS)) + GROUP_METRICS   # 表情のまとまり（v1.12〜）も
+    face_only = ([m for m in METRICS if m in FACE_METRICS] if split else list(METRICS)) + GROUP_METRICS + GEO_METRICS   # 表情のまとまり（v1.12〜）・顔の点の距離（v1.15〜）も
 
     out: list[dict] = []
     period = -1
@@ -1010,7 +1016,7 @@ def analyze(rec: Recording, c: dict) -> Analysis:
     a.segments.sort(key=lambda s: (t[s.i0], SEG_KINDS.index(s.metric)))
     a.weak_segments.sort(key=lambda s: (t[s.i0], SEG_KINDS.index(s.metric)))
     # 表情のまとまり（v1.12〜）：z と判定したコマだけ（区間にはしない）。アプリの DiffEngine と同じ
-    for m in GROUP_METRICS:
+    for m in GROUP_METRICS + GEO_METRICS:
         if m not in c["metrics"]:
             continue
         a.sm[m] = smooth(t, rec.raw[m], c["metrics"][m]["smooth_s"], c["stale_s"])
@@ -1037,8 +1043,9 @@ def detect_co_change(a: "Analysis", c: dict) -> list[dict]:
     if not cc:
         return []
     t = a.rec.t
-    groups = list(cc["groups"].items())
-    zs = {m: np.where(a.judge[m], a.z[m], np.nan) for _, ms in groups for m in ms if m in a.z and m in a.judge}
+    # "-brow_eye_gap" のように "-" が付いた指標は z を逆の向きで見る（v1.15〜）
+    groups = [(g, [(m.lstrip("-"), -1 if m.startswith("-") else 1) for m in ms]) for g, ms in cc["groups"].items()]
+    zs = {m: np.where(a.judge[m], a.z[m], np.nan) * sg for _, ms in groups for m, sg in ms if m in a.z and m in a.judge}
     eps = 1e-9
     state = {above: {"run0": None, "rm": set(), "rg": set(), "ev": None} for above in (True, False)}
     out: list[dict] = []
@@ -1048,7 +1055,7 @@ def detect_co_change(a: "Analysis", c: dict) -> list[dict]:
             d, sign = state[above], (1 if above else -1)
             lit, litm, face = set(), set(), False
             for name, ms in groups:
-                hit = [m for m in ms if m in zs and zs[m][i] == zs[m][i] and zs[m][i] * sign >= cc["z_min"] - eps]
+                hit = [m for m, _ in ms if m in zs and zs[m][i] == zs[m][i] and zs[m][i] * sign >= cc["z_min"] - eps]
                 if hit:
                     lit.add(name); litm.update(hit)
                     face = face or any(m not in VOICE_METRICS for m in hit)

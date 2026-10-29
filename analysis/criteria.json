@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-29.5",
+  "version": "2026-10-29.6",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -72,6 +72,10 @@
     {
       "date": "2026-10-29",
       "reason": "v1.12：表情のまとまり・重なりのできごと・目を閉じている割合・左右の差を足した（記録とレポートだけ。画面の「いま」・見る側・通知は変えない。docs/research-expressions.md）。表情のまとまり：orbit＝max(eyeSquint, cheekSquint) の左右平均（目のまわり、AU6/7 の近似。まばたきを外す）、nose_lip＝max(noseSneer, mouthUpperUp) の左右平均（AU9/10 の近似）、mouth_tense＝max(mouthPress, mouthStretch) の左右平均（AU24/20 の近似）、cheek_raise＝cheekSquint の左右平均（mouth_smile と合わせて口角・頬）。本人の普段からの z を求め、普段・保存した普段に入れるが、「いつもとの違い」の区間にはしない（metrics の segments: false）。co_change：まとまり（groups）のうち z が同じ向きに z_min 以上のものが min_groups 以上（表情を1つ以上含む。声の大きさ・高さは1つのまとまり）のコマが min_overlap_s 以上続いたら1つのできごと、そういうコマが window_s 来なかったら終わり。研究で、表情が1回に出ている長さが平均約5秒だったことから窓を5秒にしたが（docs/research-expressions.md）、z_min・min_groups・min_overlap_s・window_s はすべて仮の値で、記録で決め直す。jaw_open（話す・ジストニアでも動く）・eye_squint（orbit と重なる）・cheek_raise（orbit と同じ cheekSquint）は入れない。eyes_closed_ratio：直近30秒の顔のあるコマのうち、eyeBlink ≥ 0.5 が 0.5秒以上続いたまとまりに入るコマの割合を5秒ごとに記録（判定には使わない）。asym：brow_down・orbit・mouth_smile の 左 − 右（本人から見て）の普段を baseline 行の asym に書き、レポートで |z| ≥ 2 の時間を出す（判定には使わない）。アプリ（DiffEngine.swift の DiffCriteria・Metric）と同じ値。"
+    },
+    {
+      "date": "2026-10-29",
+      "reason": "v1.15（記録 ability-cam-20261029-192557、前面から）：この人の顔では blendshape の一部がほとんど動かなかった（browDown はほとんどの区間で 0.01 前後・最大 0.26、cheekSquint と noseSneer は記録全体で 0.00、mouthSmile は最大 0.24。eyeSquint 0.7・jawOpen 0.9 は動いていた）。顔の点（478点）から距離の指標を足した：brow_eye_gap（眉の中央と上まぶたの縦の距離、左右の平均）・brow_inner_gap（左右の眉頭の距離）・eye_open（上下のまぶたの距離、左右の平均。まばたきを外す）・mouth_corner（口の中央に対する口角の高さ）。どれも左右の目尻（33・263）の距離で割り、縦は額（10）からあご（152）への向きに沿って測る。|yaw| > 25°（geometry.max_yaw_deg）のコマは普段にも比べるのにも使わない（アプリが記録に書かない）。普段・保存した普段・z・データのタブ・co_change の対象に入れ、「いつもとの違い」の区間にはしない（segments: false）。co_change では、眉を寄せる・目を細めると小さくなる距離は向きを逆にして見る（groups の \"-brow_eye_gap\" など）。std_floor 0.01・flat_range 0.01 は仮の値。blendshape の眉と点の眉のどちらを判定に使うかはまだ決めず、face_check.py で区間ごとに比べる。保存した普段に無い指標は、うしろで集めた今日の普段がたまったら、その指標だけ比べ始める（baseline 行の from_today）。アプリ（Baseline.swift の FaceGeometry・Metric、DiffEngine.swift）と同じ値。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -85,7 +89,11 @@
     "orbit": 0.03,
     "nose_lip": 0.03,
     "mouth_tense": 0.03,
-    "cheek_raise": 0.03
+    "cheek_raise": 0.03,
+    "brow_eye_gap": 0.01,
+    "brow_inner_gap": 0.01,
+    "eye_open": 0.01,
+    "mouth_corner": 0.01
   },
   "face_below_counts": false,
   "metrics": {
@@ -170,6 +178,42 @@
       "end_z": 1.5,
       "end_min_s": 0.5,
       "segments": false
+    },
+    "brow_eye_gap": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5,
+      "segments": false
+    },
+    "brow_inner_gap": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5,
+      "segments": false
+    },
+    "eye_open": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5,
+      "segments": false,
+      "blink_mask": {
+        "threshold": 0.3,
+        "pad_s": 0.2
+      }
+    },
+    "mouth_corner": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5,
+      "segments": false
     }
   },
   "face_valid": {
@@ -221,7 +265,7 @@
     "mark_window_s": 10.0
   },
   "co_change": {
-    "_note": "重なりのできごと（v1.12〜、記録の event kind: \"co_change\"）。まとまり（groups）のうち、z が同じ向きに z_min 以上（下なら −z_min 以下）のメンバーがあるものが min_groups 以上（表情のまとまりを1つ以上含む）のコマが、min_overlap_s 秒以上続いたら1つのできごとを始める。そういうコマが window_s 秒来なかったら終わり（終わりは最後にそうだったコマ）。続いている間の指標・まとまりは全部書く。状態の名前は付けない。すべて仮の値で、記録で決め直す（docs/validation-log.md）。アプリ（DiffEngine.swift の DiffCriteria.co*）と同じ値",
+    "_note": "重なりのできごと（v1.12〜、記録の event kind: \"co_change\"）。まとまり（groups）のうち、z が同じ向きに z_min 以上（下なら −z_min 以下）のメンバーがあるものが min_groups 以上（表情のまとまりを1つ以上含む）のコマが、min_overlap_s 秒以上続いたら1つのできごとを始める。そういうコマが window_s 秒来なかったら終わり（終わりは最後にそうだったコマ）。続いている間の指標・まとまりは全部書く。状態の名前は付けない。すべて仮の値で、記録で決め直す（docs/validation-log.md）。アプリ（DiffEngine.swift の DiffCriteria.co*）と同じ値。v1.15〜：groups の名前の前の \"-\" は、その指標の z を逆の向きで見る（眉を寄せる・目を細めると小さくなる顔の点の距離）",
     "provisional": true,
     "z_min": 2.0,
     "min_groups": 2,
@@ -229,10 +273,13 @@
     "window_s": 5.0,
     "groups": {
       "brow": [
-        "brow_down"
+        "brow_down",
+        "-brow_eye_gap",
+        "-brow_inner_gap"
       ],
       "orbit": [
-        "orbit"
+        "orbit",
+        "-eye_open"
       ],
       "nose_lip": [
         "nose_lip"
@@ -241,7 +288,8 @@
         "mouth_tense"
       ],
       "smile": [
-        "mouth_smile"
+        "mouth_smile",
+        "mouth_corner"
       ],
       "voice": [
         "rms_db",
@@ -264,6 +312,44 @@
     ],
     "z_min": 2.0,
     "std_floor": 0.03
+  },
+  "geometry": {
+    "_note": "顔の点の距離（v1.15〜、アプリの FaceGeometry）。どれも左右の目尻（eye_outer）の距離で割る。縦は額（forehead）からあご（chin）への向きに沿って測る。|yaw| が max_yaw_deg を超えるコマはアプリが書かない（記録の frame の geo が無い）。geo_pts に使った点（indices の順、[x, y]、高さを 1 とした単位）を書く",
+    "max_yaw_deg": 25.0,
+    "points": {
+      "eye_outer": [
+        33,
+        263
+      ],
+      "brow_mid": [
+        105,
+        334
+      ],
+      "upper_lid": [
+        159,
+        386
+      ],
+      "lower_lid": [
+        145,
+        374
+      ],
+      "brow_inner": [
+        107,
+        336
+      ],
+      "mouth_center": [
+        13,
+        14
+      ],
+      "mouth_corners": [
+        61,
+        291
+      ],
+      "forehead": 10,
+      "chin": 152
+    },
+    "flat_range": 0.01,
+    "flat_note": "普段の間の値の幅（max − min）が flat_range 未満の表情の数値は、データのタブに「この顔では値がほとんど動いていません」と出す（判定から外すかは記録を見てから決める）"
   },
   "pose": {
     "_note": "顔の向きの普段と特徴（v1.8〜）。振り返りレポートだけ（区間・通知候補・アプリの画面には使わない）。右・左は本人から見て。std_floor_deg：普段の標準偏差の下限。range_z：いつもの範囲（平均 ± range_z × 標準偏差）。min_s：外れて続いたら出す秒数。smooth_s：ならし。quick_deg・quick_window_s：急な向きの変化。dwell_bins_s：ひとつの向きにとどまった長さの区切り。mark_window_s：家族の印の前後",

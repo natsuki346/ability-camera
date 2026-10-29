@@ -71,13 +71,17 @@ enum DiffCriteria {
     static let coMinGroups = 2
     static let coMinOverlapS = 0.5
     static let coWindowS = 5.0
-    static let coGroups: [(name: String, metrics: [Metric])] = [
-        ("brow", [.browDown]), ("orbit", [.orbit]), ("nose_lip", [.noseLip]), ("mouth_tense", [.mouthTense]),
-        ("smile", [.mouthSmile]), ("voice", [.rmsDb, .f0Hz])]
+    /// sign：その指標の z をこの向きで見る（v1.15〜の顔の点の距離は、眉を寄せる・目を細めると小さくなるので −1。criteria.json では "-brow_eye_gap"）
+    static let coGroups: [(name: String, metrics: [(m: Metric, sign: Double)])] = [
+        ("brow", [(.browDown, 1), (.browEyeGap, -1), (.browInnerGap, -1)]), ("orbit", [(.orbit, 1), (.eyeOpen, -1)]),
+        ("nose_lip", [(.noseLip, 1)]), ("mouth_tense", [(.mouthTense, 1)]),
+        ("smile", [(.mouthSmile, 1), (.mouthCorner, 1)]), ("voice", [(.rmsDb, 1), (.f0Hz, 1)])]
     // 目を閉じている割合（v1.12〜、criteria.json の eyes_closed_ratio。判定には使わない）：直近 windowS 秒の顔のあるコマのうち、
     // eyeBlink 左右平均 ≥ eyesClosedThreshold が eyesClosedMinS 秒以上続いたまとまりに入るコマの割合。stepS 秒ごとに記録に書く
     static let eyesRatioWindowS = 30.0
     static let eyesRatioStepS = 5.0
+    /// 普段の間の値の幅（最大 − 最小）がこれ未満の表情の数値は「この顔では値がほとんど動いていません」（v1.15〜、データのタブに出すだけ。criteria.json の flat_range）
+    static let flatRange = 0.01
 }
 
 /// 重なりのできごと（v1.12〜、記録の event kind: "co_change"。review.py の detect_co_change と同じ決まり）
@@ -113,7 +117,7 @@ struct CoChangeDetector {
             var lit: Set<String> = [], litMetrics: Set<Metric> = []
             var face = false
             for g in DiffCriteria.coGroups {
-                let ms = g.metrics.filter { (z[$0] ?? 0) * sign >= DiffCriteria.coZ - 1e-9 }
+                let ms = g.metrics.filter { (z[$0.m] ?? 0) * $0.sign * sign >= DiffCriteria.coZ - 1e-9 }.map(\.m)
                 if !ms.isEmpty {
                     lit.insert(g.name); litMetrics.formUnion(ms)
                     if ms.contains(where: \.isFace) { face = true }

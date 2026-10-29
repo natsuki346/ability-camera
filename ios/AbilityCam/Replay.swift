@@ -106,6 +106,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         var pitch = [Double?](repeating: nil, count: n), roll = [Double?](repeating: nil, count: n)
         var recordedVoiceSelf = [Bool??](repeating: nil, count: n)   // 記録の voice_self（v1.6〜。キーが無い古い記録は nil）
         var otherJaw = [Double?](repeating: nil, count: n)           // もう1つの顔の jawOpen（v1.9〜）
+        var geoList = [[String: Double]?](repeating: nil, count: n)  // 顔の点の距離（v1.15〜）
         for (i, o) in frames.enumerated() {
             if let v = o["voice_self"] { recordedVoiceSelf[i] = .some(v as? Bool) }
             t[i] = ms(o)!
@@ -114,6 +115,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             roll[i] = (o["roll_deg"] as? NSNumber).map { $0.doubleValue * flip }
             rms[i] = (o["rms_db"] as? NSNumber)?.doubleValue
             otherJaw[i] = (o["other_jaw_open"] as? NSNumber)?.doubleValue
+            if let g = o["geo"] as? [String: Any] { geoList[i] = g.compactMapValues { ($0 as? NSNumber)?.doubleValue } }
             // 声の高さの範囲の外（v1.6.1 までの記録の 800Hz のような取り違え）は使わない（review.py の F0_RANGE と同じ）
             f0[i] = ((o["f0_hz"] as? NSNumber)?.doubleValue).flatMap {
                 $0 >= Double(PitchCriteria.minHz) && $0 <= Double(PitchCriteria.maxHz) ? $0 : nil }
@@ -228,7 +230,9 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
                 else { noBase.append(ReplayRun(start: t[i], end: t[i], value: true)) }
             }
             var fv: [Metric: Double] = [:]
-            if face[i] { fv = Metric.faceValues { bsList[i][$0] ?? 0 } }   // 表情のまとまり（v1.12〜）も（重なりのできごとに使う）
+            if face[i] {   // 表情のまとまり（v1.12〜）と顔の点の距離（v1.15〜）も（重なりのできごとに使う）
+                fv = Metric.faceValues { bsList[i][$0] ?? 0 }.merging(Metric.geometryValues(geoList[i])) { a, _ in a }
+            }
             var voice: [Metric: Double] = [:]
             if let r = rms[i] { voice[.rmsDb] = r }
             if let f = f0[i] { voice[.f0Hz] = f }

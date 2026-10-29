@@ -95,7 +95,8 @@ struct NowCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Spacer(minLength: 0)
                 HStack(spacing: 10) {
-                    FaceSketch(shape: model.cameraActive && model.faceReadable ? [:] : nil, size: face, highlights: highlights)
+                    // 表情に合わせて動かす（v1.15〜。v1.14 は中立の形）。違いが出た部位は光らせる
+                    FaceSketch(shape: model.cameraActive ? model.faceShape : nil, size: face, highlights: highlights)
                     if !voiceItems.isEmpty {
                         VStack(spacing: 8) {
                             ForEach(Array(voiceItems.enumerated()), id: \.offset) { _, d in
@@ -228,6 +229,12 @@ struct DataTab: View {
                         ProgressView(value: min(Double(sec), model.baselineTarget), total: model.baselineTarget).tint(Palette.progress)
                     }
                     LiveNotes(model: model)
+                    if !model.missingInSaved.isEmpty {   // v1.15〜
+                        NoteLine(text: "保存した普段に無い指標：" + model.missingInSaved.map(\.label).joined(separator: "・")
+                                 + (model.missingFilled ? "（今日の普段で比べています。普段を取り直すと保存した普段にも入ります）"
+                                                        : "（今日の普段がたまったら比べます。普段を取り直すと保存した普段にも入ります）"),
+                                 icon: "info.circle", color: Palette.progress, font: .caption, lines: 4)
+                    }
                     Menu("普段を取り直す") {
                         ForEach(AnalysisModel.RestartPart.allCases) { p in Button(p.rawValue) { model.restart(p) } }
                     }
@@ -299,6 +306,9 @@ struct DataTab: View {
                     MeterTrack(z: model.meterZ[m], hasRange: model.baselineStats?[m] != nil, outside: model.diffMetrics[m] != nil)
                         .frame(height: 18)
                     Text(valueLine(m, last)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    if model.flatMetrics.contains(m) {   // v1.15〜：普段の間ほとんど動いていない（判定から外すかは記録を見てから決める）
+                        NoteLine(text: "この顔では値がほとんど動いていません", icon: "info.circle", color: Palette.progress, font: .caption2)
+                    }
                 }
                 .opacity(m.isFace && !model.faceReadable ? 0.4 : 1)
                 .accessibilityElement(children: .combine)

@@ -3,6 +3,32 @@
 // 使い方：diffcheck 記録.jsonl ...      --heads を付けると、区間の代わりに顔の向きの段と head_turn の文を出す（v1.7.1〜）。--co で重なりのできごと（v1.12〜）
 import Foundation
 
+// 顔の点の距離（v1.15〜、FaceGeometry）：作り物の点で値・頭の傾き・横を向いたときを確かめる
+if CommandLine.arguments.contains("--geo-selftest") {
+    var bad: [String] = []
+    let base: [Int: (x: Double, y: Double)] = [33: (100, 200), 263: (200, 200), 10: (150, 100), 152: (150, 300),
+        105: (125, 170), 334: (175, 170), 159: (125, 190), 386: (175, 190), 145: (125, 200), 374: (175, 200),
+        107: (140, 172), 336: (160, 172), 13: (150, 250), 14: (150, 256), 61: (130, 248), 291: (170, 248)]
+    let want = ["brow_eye_gap": 0.2, "eye_open": 0.1, "brow_inner_gap": 0.2, "mouth_corner": 0.05]
+    func check(_ pts: [Int: (x: Double, y: Double)], _ label: String) {
+        guard let v = FaceGeometry.values(yaw: 0, { pts[$0] }) else { bad.append("\(label)：求まらない"); return }
+        for (k, w) in want where abs((v[k] ?? .nan) - w) > 1.5e-3 { bad.append("\(label)：\(k) が \(v[k] ?? .nan)（\(w) のはず）") }
+    }
+    check(base, "まっすぐ")
+    let a = 30 * Double.pi / 180
+    check(base.mapValues { p in (150 + (p.x - 150) * cos(a) - (p.y - 200) * sin(a), 200 + (p.x - 150) * sin(a) + (p.y - 200) * cos(a)) }, "30°傾けた")
+    check(base.mapValues { ($0.x * 2.5 + 7, $0.y * 2.5 - 3) }, "大きさを変えた")
+    if FaceGeometry.values(yaw: 26, { base[$0] }) != nil { bad.append("|yaw| > 25° なのに求めた") }
+    if FaceGeometry.values(yaw: nil, { base[$0] }) != nil { bad.append("向きが無いのに求めた") }
+    if FaceGeometry.values(yaw: -25, { base[$0] }) == nil { bad.append("|yaw| = 25° で求めない") }
+    var smile = base; smile[61] = (130, 240); smile[291] = (170, 240)
+    if (FaceGeometry.values(yaw: 0, { smile[$0] })?["mouth_corner"] ?? 0) <= 0.05 { bad.append("口角が上がっても大きくならない") }
+    var frown = base; frown[105] = (125, 180); frown[334] = (175, 180)
+    if (FaceGeometry.values(yaw: 0, { frown[$0] })?["brow_eye_gap"] ?? 1) >= 0.2 { bad.append("眉が下がっても小さくならない") }
+    print(bad.isEmpty ? "OK" : bad.joined(separator: "\n"))
+    exit(bad.isEmpty ? 0 : 1)
+}
+
 // 家族の印の詳しい中身（v1.13〜）：記録の印の行の書き直しと、前に同じ組み合わせのときの印の数え方を確かめる
 if CommandLine.arguments.contains("--mark-selftest") {
     var bad: [String] = []

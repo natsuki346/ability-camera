@@ -29,6 +29,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         let faceCount: Int          // 映っていた顔の数（numFaces まで）
         let box: Box?               // 本人として使った顔の枠
         var otherJaw: Double? = nil // もう1つの顔の jawOpen（2つ映っているとき、v1.9〜。口と声のタイミングを顔ごとに見るため）
+        var geo: [String: Double]? = nil   // 顔の点から求めた距離（v1.15〜、FaceGeometry。|yaw| > 25° のコマは nil）
+        var geoPts: [[Float]]? = nil       // それに使った点 [x, y]（高さを 1 とした単位。x は幅÷高さ倍。v1.15〜、あとから確かめるため）
     }
 
     /// 鼻先・額・あご・両目尻・両口角（追跡の安定性を後で確かめる用）
@@ -192,6 +194,7 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
         var pts: [[Float]] = []
         var mesh: [CGPoint] = []
         var pose: Pose?
+        var geo: [String: Double]?, geoPts: [[Float]]?
         let lms = faces.indices.contains(pick) ? faces[pick] : nil   // 網目（画面だけ）は映像のままの座標（プレビューも同じ鏡）
         if let lms, !lms.isEmpty {
             let blend = result?.faceBlendshapes ?? []
@@ -216,6 +219,13 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
                 let imageYaw = mir ? -p.yaw : p.yaw, imageRoll = mir ? -p.roll : p.roll
                 pose = Pose(yaw: -imageYaw, pitch: p.pitch, roll: -imageRoll)
             }
+            // 顔の点の距離（v1.15〜）：x と y の縮尺をそろえる（高さを 1 に）。左右で平均するので鏡でも同じ値
+            let ar = size.height > 0 ? Double(size.width / size.height) : 1
+            let pt = { (i: Int) -> (x: Double, y: Double)? in i < lms.count ? (Double(lms[i].x) * ar, Double(lms[i].y)) : nil }
+            geo = FaceGeometry.values(yaw: pose?.yaw, pt)
+            if geo != nil {
+                geoPts = FaceGeometry.indices.compactMap { i in pt(i).map { [Float(($0.x * 10000).rounded() / 10000), Float(($0.y * 10000).rounded() / 10000)] } }
+            }
         }
         onResult?(Result(
             captureMs: timestampInMilliseconds,
@@ -229,7 +239,8 @@ final class FaceAnalyzer: NSObject, FaceLandmarkerLiveStreamDelegate {
             latMs: now * 1000 - Double(timestampInMilliseconds),
             faceCount: boxes.compactMap { $0 }.count,
             box: boxes.indices.contains(pick) ? boxes[pick] : nil,
-            otherJaw: Self.otherJaw(result?.faceBlendshapes ?? [], boxes: boxes, pick: pick)
+            otherJaw: Self.otherJaw(result?.faceBlendshapes ?? [], boxes: boxes, pick: pick),
+            geo: geo, geoPts: geoPts
         ))
     }
 }

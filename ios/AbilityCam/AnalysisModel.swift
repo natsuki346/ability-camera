@@ -109,7 +109,13 @@ final class AnalysisModel: ObservableObject {
     private var lastAudioAtEngine: CFTimeInterval = 0         // 違いの判定に入れた最後の音
     private var lastBlinkT = -Double.infinity                 // 最後にまばたき（eyeBlink ≥ 0.3）があった撮影時刻
     private var squintPending: [(t: Double, m: Metric, x: Double)] = []  // 普段に数える前の目を細める・目のまわり（v1.12〜）の値（後ろ 0.2秒にまばたきが無いか待つ）
-    private var asymStats: [String: Welford] = [:]            // 普段の間の左右の差（左 − 右、v1.12〜。まばたきのコマは外す）
+    private var asymStats: [String: Welford] = [:]
+    private var rangeStats: [Metric: (lo: Double, hi: Double)] = [:]   // 普段の間の値の幅（v1.15〜）
+    /// 比べている保存した普段に無い指標（v1.15〜。今日の普段がたまったら、その指標だけ今日の普段で比べ始める）
+    @Published var missingInSaved: [Metric] = []
+    @Published var missingFilled = false
+    /// 普段の間ほとんど動いていない指標（v1.15〜。表情の数値で、普段の間の値の幅が DiffCriteria.flatRange 未満。判定から外すのは記録を見てから決める）
+    @Published var flatMetrics: Set<Metric> = []            // 普段の間の左右の差（左 − 右、v1.12〜。まばたきのコマは外す）
     private var eyesRatio = EyesClosedRatio()                 // 目を閉じている割合（v1.12〜、記録だけ）
     private var recentFace: [(t: Double, face: Bool)] = []   // 直近1秒のコマ
     private var lastChange: (diffs: [String], faceReadable: Bool)?
@@ -261,6 +267,9 @@ final class AnalysisModel: ObservableObject {
             graph.append(t: t, z: z, values: v, baseline: stats)
         }
         graph.addEvent(t: now - 25, label: "家族の印：快", isMark: true)
+        // データのタブの v1.15〜の表示：保存した普段に無い指標・普段の間ほとんど動いていない指標
+        missingInSaved = [.orbit, .noseLip, .mouthTense, .cheekRaise] + Metric.geometry; missingFilled = false
+        flatMetrics = [.cheekRaise, .noseLip]
         if ProcessInfo.processInfo.arguments.contains("-previewMarkDetail") {   // 「詳しく（任意）」の見た目（v1.13〜）
             markDetailPrompt = (0, .unpleasant, MarkDetails.initial.unpleasant)
         }
@@ -455,6 +464,7 @@ final class AnalysisModel: ObservableObject {
             sessionStartedAt = nil
             baselineSec = nil; baselineReady = false; differences = []; diffTargets = []; diffItems = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
+            missingInSaved = []; missingFilled = false; flatMetrics = []
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false; selfVoiceNow = false
             voiceWait = nil; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false; speakerEnrollNote = nil
             speakerOther.clear(); otherVoiceSourceLogged = nil; speakerLast = nil; otherVoiceBySpeaker = false
@@ -544,6 +554,7 @@ final class AnalysisModel: ObservableObject {
                 frame.voiceCorr = r2(dec.corr); frame.voiceCorrOther = r2(dec.corrOther); frame.voiceMatch = dec.match?.rawValue
             }
             frame.otherJawOpen = r.otherJaw
+            frame.geo = r.geo; frame.geoPts = r.geoPts   // 顔の点の距離（v1.15〜）
             // ファイルが開いていないとき・記録の開始より前のコマは書かれない
             logger.write(frame, notBefore: tMs)
             let reason = dec.reason
@@ -959,8 +970,9 @@ final class AnalysisModel: ObservableObject {
         link.baseline = nil   // 見る側の「いつもの範囲」も消す（記録し終えたら、また送る）
         meterZ = [:]; diffMetrics = [:]; baselineStats = nil
         comparing = nil; savedFromMs = nil; askResave = false
+        missingInSaved = []; flatMetrics = []
         boxStats = (Welford(), Welford(), Welford())
-        poseStats = [:]; asymStats = [:]
+        poseStats = [:]; asymStats = [:]; rangeStats = [:]; missingFilled = false
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
         usedFace = nil
         guard !keepVoice else { return }
@@ -1040,6 +1052,11 @@ final class AnalysisModel: ObservableObject {
         for (k, v) in usedVoice ?? [:] { merged[k] = v }
         let b = Self.engineBaseline(merged)
         baselineStats = b
+        // 普段の間ほとんど動いていない表情の数値（v1.15〜。値の幅を書いた普段だけ）
+        flatMetrics = Set(merged.compactMap { k, st in
+            guard let m = Metric(rawValue: k), m.isFace, !m.isGeometry, let lo = st.min, let hi = st.max else { return nil }
+            return hi - lo < DiffCriteria.flatRange ? m : nil
+        })
         // 声の普段を集めている間は、声を「データ不足」には入れない（集めていると別に出す）
         insufficient = Metric.main.filter { m in (m.isFace || usedVoice != nil) && b[m] == nil }   // 画面・見る側に出すのは今までの6つだけ
         link.baseline = LiveBaseline(startedMs: f.startedMs, tMs: tMs, metrics: merged.filter { Metric(rawValue: $0.key)?.isMain ?? false })   // 見る側へ（名前は送らない）
@@ -1084,6 +1101,9 @@ final class AnalysisModel: ObservableObject {
         comparing = .saved
         savedFromMs = sv.savedMs
         usedFace = (sv.savedMs, faceMetrics)
+        // 保存した普段に無い指標（v1.12〜・v1.15〜で足した指標。保存したのが前の版のとき）
+        missingInSaved = Metric.allCases.filter { $0.isFace && (faceMetrics[$0.rawValue].map { $0.insufficient } ?? true) }
+        missingFilled = false
         face.setPreferred(sv.faceBox)
     }
 
@@ -1139,10 +1159,12 @@ final class AnalysisModel: ObservableObject {
         var out: [String: BaselineRecord.Stat] = [:]
         for m in Metric.allCases where m.isFace {   // 声の普段は別に集める（v1.6〜）
             let w = stats[m] ?? Welford()
-            out[m.rawValue] = BaselineRecord.Stat(n: w.n,
-                                                  mean: w.n > 0 ? (w.mean * 10000).rounded() / 10000 : nil,
-                                                  std: w.n > 0 ? (w.std * 10000).rounded() / 10000 : nil,
-                                                  insufficient: w.n < Self.minSamples)
+            var st = BaselineRecord.Stat(n: w.n,
+                                         mean: w.n > 0 ? (w.mean * 10000).rounded() / 10000 : nil,
+                                         std: w.n > 0 ? (w.std * 10000).rounded() / 10000 : nil,
+                                         insufficient: w.n < Self.minSamples)
+            if let r = rangeStats[m] { st.min = (r.lo * 10000).rounded() / 10000; st.max = (r.hi * 10000).rounded() / 10000 }   // 値の幅（v1.15〜）
+            out[m.rawValue] = st
         }
         func box(_ w: Welford) -> FaceBoxStats.S {
             FaceBoxStats.S(n: w.n, mean: (w.mean * 10000).rounded() / 10000, std: (w.std * 10000).rounded() / 10000)
@@ -1173,6 +1195,8 @@ final class AnalysisModel: ObservableObject {
             usedFace = (baselineStartMs, out)
             publishBaseline(tMs: Self.nowMs())   // 見る側へ1回
             face.setPreferred(faceBox)
+        } else if comparing == .saved, let used = usedFace {
+            fillMissingFromToday(out, used: used)
         }
         baselineSec = nil; baselineWait = nil
         baselineReady = true
@@ -1180,6 +1204,27 @@ final class AnalysisModel: ObservableObject {
         todayBaseline = SavedBaseline(metrics: out, camera: (lensInUse ?? camera.lens).rawValue, targetS: baselineTarget,
                                       savedMs: Self.nowMs(), faceBox: faceBox, pose: pose, asym: row.asym)
         saveTodayIfNew()   // 人を選んでいて、保存した普段がまだ無ければ保存する（あれば、画面に出して取ったときだけ保存し直すか聞く）
+    }
+
+    /// 保存した普段で比べているとき、保存した普段に無い指標（データ不足を含む）を、うしろで集めた今日の普段で比べ始める（v1.15〜）。
+    /// 保存した普段の値はそのままに、足した指標を from_today に書いた baseline 行（source: saved、compared: true、part: face）を書く
+    private func fillMissingFromToday(_ today: [String: BaselineRecord.Stat], used: (startedMs: Int64, metrics: [String: BaselineRecord.Stat])) {
+        let add = missingInSaved.filter { today[$0.rawValue].map { !$0.insufficient } ?? false }
+        guard !add.isEmpty, let p = PersonStore.shared.selected, let sv = p.saved(for: (lensInUse ?? camera.lens).rawValue) else { return }
+        var merged = used.metrics
+        for m in add { merged[m.rawValue] = today[m.rawValue] }
+        let now = Self.nowMs()
+        var row = BaselineRecord(tMs: now, startedMs: nil, wallS: nil, validS: nil,
+                                 yawLimitDeg: Self.baselineYawLimit, warmupS: Self.baselineWarmup,
+                                 minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: merged)
+        row.source = BaselineSource.saved.rawValue; row.compared = true; row.part = BaselinePart.face.rawValue
+        row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose; row.asym = sv.asym
+        row.fromToday = add.map(\.rawValue)
+        logger.write(row)
+        engine.setBaseline(Self.engineBaseline(merged), part: .face)
+        usedFace = (used.startedMs, merged)
+        missingFilled = true
+        publishBaseline(tMs: now)
     }
 
     /// 声の普段：本人の声のコマが合計 10秒たまったら（v1.6〜）。表情の普段とは別の baseline 行（part: "voice"）
@@ -1351,7 +1396,7 @@ final class AnalysisModel: ObservableObject {
         if !squintPending.isEmpty {   // 後ろ 0.2秒にまばたきが無かった値だけ、普段に数える
             let ready = squintPending.filter { $0.t < epochT - DiffCriteria.blinkPadS }
             if !ready.isEmpty {
-                for p in ready { stats[p.m, default: Welford()].add(p.x) }
+                for p in ready { addBaselineValue(p.m, p.x) }
                 squintPending.removeFirst(ready.count)
             }
         }
@@ -1416,7 +1461,7 @@ final class AnalysisModel: ObservableObject {
                     // まばたき（と前後 0.2秒）のコマは普段に数えない。後ろ 0.2秒を確かめてから数える（目のまわりも、v1.12〜）
                     if epochT - lastBlinkT > DiffCriteria.blinkPadS { squintPending.append((epochT, m, x)) }
                 } else {
-                    stats[m, default: Welford()].add(x)
+                    addBaselineValue(m, x)
                 }
             }
             if let b = r.box { boxStats.cx.add(b.cx); boxStats.cy.add(b.cy); boxStats.w.add(b.w) }
@@ -1571,7 +1616,15 @@ final class AnalysisModel: ObservableObject {
     /// アプリと同じ式（左右の平均）。顔が無いときは空
     static func faceValues(_ r: FaceAnalyzer.Result) -> [Metric: Double] {
         guard r.face else { return [:] }
-        return Metric.faceValues { Double(r.blendshapes[$0] ?? 0) }   // 表情のまとまり（v1.12〜）も
+        // 表情のまとまり（v1.12〜）と、顔の点の距離（v1.15〜。|yaw| > 25° のコマは無い）も
+        return Metric.faceValues { Double(r.blendshapes[$0] ?? 0) }.merging(Metric.geometryValues(r.geo)) { a, _ in a }
+    }
+
+    /// 普段に1つ数える（値の幅も、v1.15〜）
+    private func addBaselineValue(_ m: Metric, _ x: Double) {
+        stats[m, default: Welford()].add(x)
+        let r = rangeStats[m]
+        rangeStats[m] = (min(r?.lo ?? x, x), max(r?.hi ?? x, x))
     }
 
     /// DiffEngine が判定した違いを、画面・見る側・記録の change に出す。

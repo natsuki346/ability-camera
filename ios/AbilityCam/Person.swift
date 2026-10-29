@@ -444,6 +444,12 @@ struct PersonEditView: View {
                 ForEach(CameraLens.allCases) { l in
                     if let s = p?.saved(for: l.rawValue) {
                         LabeledContent(l.label, value: "\(PersonPickerView.date(s.savedDate))（\(Int(s.targetS))秒）")
+                        // 保存した普段に無い指標（v1.15〜。前の版で保存した普段）
+                        let missing = Metric.allCases.filter { m in m.isFace && (s.metrics[m.rawValue].map { $0.insufficient } ?? true) }
+                        if !missing.isEmpty {
+                            Text("保存した普段に無い指標：" + missing.map(\.label).joined(separator: "・") + "（普段を取り直すと比べます）")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         Button("\(l.shortLabel)の普段を消す") { store.setSaved(id, camera: l.rawValue, nil) }
                     } else {
                         LabeledContent(l.label, value: "ありません")

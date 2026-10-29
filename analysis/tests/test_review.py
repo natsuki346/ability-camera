@@ -1801,24 +1801,32 @@ class CoChangeTest(unittest.TestCase):
                  (14.0, 16.0, ("brow",), False),          # 1つだけ → 出さない
                  (20.0, 22.0, ("press",), True),          # 口の緊張＋声 → できごと
                  (30.0, 30.1, ("brow", "orbit"), False),  # 短い重なり（ならしても 0.5秒に届かない） → 出さない
-                 (36.0, 41.0, ("brow", "orbit"), False)]  # 記録の終わりまで → 打ち切り
+                 (36.0, 38.0, ("geo",), False),           # 顔の点の距離だけ（眉と目の間・目の開きが小さく） → できごと（v1.15〜）
+                 (46.0, 53.0, ("brow", "orbit"), False)]  # 記録の終わりまで → 打ち切り
         mets = {m: {"n": 300, "mean": 0.1, "std": 0.02, "insufficient": False}
                 for m in ("mouth_smile", "brow_down", "eye_squint", "jaw_open", "orbit", "nose_lip", "mouth_tense", "cheek_raise")}
+        geo_base = {"brow_eye_gap": 0.2, "brow_inner_gap": 0.2, "eye_open": 0.1, "mouth_corner": 0.02}
+        for m, v in geo_base.items():
+            mets[m] = {"n": 300, "mean": v, "std": 0.005, "insufficient": False}
         lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "direction_version": 2}),
                  json.dumps({"type": "baseline", "t_ms": t0, "part": "face", "blink_masked": True, "metrics": mets}),
                  json.dumps({"type": "baseline", "t_ms": t0, "part": "voice", "metrics": {"rms_db": {"n": 300, "mean": -50.0, "std": 2.0, "insufficient": False},
                                                                                          "f0_hz": {"n": 300, "mean": 150.0, "std": 10.0, "insufficient": False}}})]
-        for k in range(int(40 / 0.033)):
+        for k in range(int(52 / 0.033)):
             ts = k * 0.033
             bs = dict(base_bs)
+            geo = dict(geo_base)
             loud = False
             for a, b, which, voice in spans:
                 if a <= ts < b:
                     for w in which:
+                        if w == "geo":
+                            geo["brow_eye_gap"] = 0.15; geo["eye_open"] = 0.06
+                            continue
                         for key in up[w]:
                             bs[key] = 0.4
                     loud = loud or voice
-            lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(ts * 1000), "face": True, "bs": bs, "yaw_deg": 0.0,
+            lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(ts * 1000), "face": True, "bs": bs, "yaw_deg": 0.0, "geo": geo,
                                      "rms_db": -30.0 if loud else -50.0, "f0_hz": 150.0, "voice_self": True}))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1834,7 +1842,8 @@ class CoChangeTest(unittest.TestCase):
             got = [(round(float(a.rec.t[e["i0"]] - t0)), e["metrics"], e["at_end"]) for e in a.co_changes]
             self.assertEqual(got, [(3, ["brow_down", "orbit", "nose_lip"], False),
                                    (20, ["rms_db", "mouth_tense"], False),
-                                   (36, ["brow_down", "orbit"], True)])
+                                   (36, ["brow_eye_gap", "eye_open"], False),   # 点の距離が小さくなる向き＝眉を寄せる・目を細める向き（v1.15〜）
+                                   (46, ["brow_down", "orbit"], True)])
             self.assertTrue(all(e["above"] for e in a.co_changes))
             self.assertGreater(float(a.rec.t[a.co_changes[0]["i1"]] - t0), 7.0)   # 5秒以内の重なりはまとめる
             # 区間（いつもとの違い）は今までの6つだけ（表情のまとまりは区間にしない）
@@ -1847,8 +1856,31 @@ class CoChangeTest(unittest.TestCase):
             if not shutil.which("swiftc"):
                 self.skipTest("swiftc が無い")
             diffs, n = check_app.compare_co(path, check_app.build(), c)
-            self.assertEqual(n, 3)
+            self.assertEqual(n, 4)
             self.assertEqual(diffs, [])
+
+    def test_face_check_and_geo(self):
+        """顔の点の距離（v1.15〜）：アプリの FaceGeometry（DiffCheck --geo-selftest）と、face_check.py の区間ごとの表"""
+        import argparse
+        import shutil
+        import subprocess
+        import face_check
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "co.jsonl"
+            self.write(path)
+            rec = review.load(path)
+            a = review.analyze(rec, c)
+            ns = argparse.Namespace(calm=["0-2"], frown=["36-38"], smile=None)
+            rows = {r[0]: r for r in face_check.table(rec, a, ns, 0.01)}
+        import re
+        self.assertGreaterEqual(int(re.search(r"z≥2 (\d+)%", rows["眉と目の間（点）"][3]).group(1)), 80)   # 眉を寄せた時間（ならしの分、始めは少し遅れる）
+        self.assertIn("z≥2 0%", rows["眉と目の間（点）"][2])       # 落ち着いている時間
+        self.assertIn("z≥2 0%", rows["眉を寄せる"][3])            # blendshape の眉は動いていない
+        if shutil.which("swiftc"):
+            import check_app
+            p = subprocess.run([str(check_app.build()), "--geo-selftest"], capture_output=True, text=True)
+            self.assertEqual(p.stdout.strip(), "OK", p.stdout + p.stderr)
 
     def test_criteria_same_as_app(self):
         import json
@@ -1863,10 +1895,26 @@ class CoChangeTest(unittest.TestCase):
         self.assertEqual(num("coWindowS"), cc["window_s"])
         self.assertEqual(num("eyesRatioWindowS"), er["window_s"])
         self.assertEqual(num("eyesRatioStepS"), er["step_s"])
-        app_groups = re.findall(r'\("(\w+)", \[([^\]]*)\]\)', src[src.index("static let coGroups"):src.index("static let coGroups") + 400])
+        block = src[src.index("static let coGroups"):src.index("static let coGroups") + 700]
         rv = {"browDown": "brow_down", "orbit": "orbit", "noseLip": "nose_lip", "mouthTense": "mouth_tense", "mouthSmile": "mouth_smile",
-              "rmsDb": "rms_db", "f0Hz": "f0_hz"}
-        self.assertEqual({g: [rv[x.strip().lstrip(".")] for x in ms.split(",")] for g, ms in app_groups}, cc["groups"])
+              "rmsDb": "rms_db", "f0Hz": "f0_hz", "browEyeGap": "brow_eye_gap", "browInnerGap": "brow_inner_gap", "eyeOpen": "eye_open",
+              "mouthCorner": "mouth_corner"}
+        app_groups = {g: [("-" if sg == "-1" else "") + rv[m] for m, sg in re.findall(r"\(\.(\w+), (-?1)\)", ms)]
+                      for g, ms in re.findall(r'\("(\w+)", \[((?:\(\.\w+, -?1\)(?:, )?)+)\]\)', block)}
+        self.assertEqual(app_groups, cc["groups"])
+        # 顔の点の距離（v1.15〜）：点の番号・|yaw| の上限・下限・幅
+        base = (review.HERE.parent / "ios" / "AbilityCam" / "Baseline.swift").read_text(encoding="utf-8")
+        g = c["geometry"]
+        self.assertEqual(float(re.search(r"static let maxYaw = ([\d.]+)", base).group(1)), g["max_yaw_deg"])
+        for k, swift in (("eye_outer", "eyeOuter"), ("brow_mid", "browMid"), ("upper_lid", "upperLid"), ("lower_lid", "lowerLid"),
+                         ("brow_inner", "browInner"), ("mouth_center", "mouthCenter"), ("mouth_corners", "mouthCorners")):
+            a_, b_ = re.search(rf"{swift} = \((\d+), (\d+)\)", base).groups()
+            self.assertEqual([int(a_), int(b_)], g["points"][k], k)
+        self.assertEqual(float(re.search(r"static let flatRange = ([\d.]+)", src).group(1)), g["flat_range"])
+        self.assertIn("case .browEyeGap, .browInnerGap, .eyeOpen, .mouthCorner: 0.01", base)
+        for m in review.GEO_METRICS:
+            self.assertEqual(c["std_floor"][m], 0.01)
+            self.assertFalse(c["metrics"][m]["segments"])
         for m in review.GROUP_METRICS:
             self.assertEqual(c["std_floor"][m], 0.03)
             self.assertFalse(c["metrics"][m]["segments"])
@@ -1993,7 +2041,7 @@ class StartScreenTest(unittest.TestCase):
         guide = (root / "docs" / "wording-guide.md").read_text(encoding="utf-8")
         self.assertIn("highlights", sketch)
         self.assertIn("NowCard(model: model", cv)
-        self.assertIn("FaceSketch(shape: model.cameraActive && model.faceReadable ? [:] : nil", live)   # 表情は変えない中立の形
+        self.assertIn("FaceSketch(shape: model.cameraActive ? model.faceShape : nil", live)   # 表情に合わせて動かす（v1.15〜）
         self.assertIn(".font(.largeTitle.bold())", live)
         self.assertIn("minHeight: 80", cv)                                   # 家族の印
         self.assertGreaterEqual(cv.count("minHeight: 52"), 2)                # 詳しく（任意）と場面

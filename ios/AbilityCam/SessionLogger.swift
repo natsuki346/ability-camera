@@ -25,12 +25,14 @@ struct FrameRecord: Encodable {
     var voiceCorrOther: Double?   // もう1つの顔の相関（2つ映っているとき）
     var voiceMatch: String?       // どの顔の口と声のタイミングが合っていたか：self / other / none（判定は本人として選んだ顔で）
     var otherJawOpen: Double?     // もう1つの顔の jawOpen（2つ映っているとき。声が出ていなくても書く）
+    var geo: [String: Double]?    // 顔の点から求めた距離（v1.15〜：brow_eye_gap・brow_inner_gap・eye_open・mouth_corner。|yaw| > 25° のコマは書かない）
+    var geoPts: [[Float]]?        // それに使った点（FaceGeometry.indices の順、[x, y]。高さを 1 とした単位）
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", face, bs, pts, rmsDb = "rms_db", f0Hz = "f0_hz", procMs = "proc_ms", latMs = "lat_ms"
         case yawDeg = "yaw_deg", pitchDeg = "pitch_deg", rollDeg = "roll_deg", faceCx = "face_cx", faceCy = "face_cy", faceW = "face_w"
         case voiceSelf = "voice_self", voiceSelfReason = "voice_self_reason", voiceCorr = "voice_corr", voiceCorrOther = "voice_corr_other"
-        case voiceMatch = "voice_match", otherJawOpen = "other_jaw_open"
+        case voiceMatch = "voice_match", otherJawOpen = "other_jaw_open", geo, geoPts = "geo_pts"
     }
 }
 
@@ -159,6 +161,8 @@ struct BaselineRecord: Encodable {
         let insufficient: Bool  // サンプルが足りず、比べるのに使わない
         var median: Double? = nil   // 声の高さ（f0_hz）だけ：中央値と四分位範囲（v1.9.1〜。声の高さの範囲に使う）
         var iqr: Double? = nil
+        var min: Double? = nil      // 普段の間の値の幅（v1.15〜。ほとんど動かない指標を見分ける）
+        var max: Double? = nil
     }
 
     let type = "baseline"
@@ -184,11 +188,12 @@ struct BaselineRecord: Encodable {
     var voiceDays: Int?         // voice：集めた日の数（v1.7〜）
     var voiceCarriedS: Double?  // voice：前のセッションまでに集めていた本人の声の秒数（v1.7〜）
     var eyesClosedS: Double?    // 普段の間に目を閉じていた秒数（v1.4〜。目を閉じているの決まりで、数えたコマから。保存した普段には無い）
+    var fromToday: [String]?    // 保存した普段に無かったので、今日の普段から足した指標（v1.15〜。saved の行で、この時刻からその指標も比べる）
     var asym: [String: Stat]?   // 左右の差（左 − 右、本人から見て）の普段（v1.12〜。brow_down・orbit・mouth_smile。判定には使わず、振り返りレポートで比べる）
 
     enum CodingKeys: String, CodingKey {
         case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", pose, eyesClosedS = "eyes_closed_s", part, voiceValidS = "voice_valid_s"
-        case voiceSessions = "voice_sessions", voiceDays = "voice_days", voiceCarriedS = "voice_carried_s", asym
+        case voiceSessions = "voice_sessions", voiceDays = "voice_days", voiceCarriedS = "voice_carried_s", asym, fromToday = "from_today"
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
         case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics
     }

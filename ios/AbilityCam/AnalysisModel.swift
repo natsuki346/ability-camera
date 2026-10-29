@@ -48,6 +48,7 @@ final class AnalysisModel: ObservableObject {
     @Published var otherVoice = false         // 本人以外の声（と言えない声）だけが入っている（直近1秒）
     @Published var voiceRetaking = false      // 声の普段だけを取り直している（v1.9.3〜：この間は声の高さの範囲を使わず、口の動きだけで本人の声を数える）
     @Published var voiceSpreadWide = false    // 比べている保存した声の普段の声の高さのばらつきが大きい（v1.9.1〜、取り直せます）
+    @Published var speakerEnrollNote: String?  // 撮る側の「いま」：声の登録の進み具合・登録した（v1.10.1〜）
     @Published var voiceWait: String?         // 声の普段の進み具合が3秒増えていない理由（v1.6.2〜、VoiceWaitTracker）
     @Published var pitchRatio: Double?        // 「数字」：声の高さが取れた割合（直近10秒、声が出ていたときのうち。v1.6.2〜）
     @Published var insufficient: [Metric] = []  // データ不足で比べない指標
@@ -127,8 +128,9 @@ final class AnalysisModel: ObservableObject {
     private var voiceSessionFirstMs: Int64?                   // このセッションで初めて本人の声を数えた時刻
     // 話者の区別（v1.10〜、記録に書くだけ）
     private var speakerOn = false
-    private var speakerEnroll: (id: String, partial: SpeakerEnrollPartial, retake: Bool)?
+    private var speakerEnroll: (id: String, partial: SpeakerEnrollPartial, retake: Bool, collect: SpeakerEnrollCollect)?
     private var speakerEnrollSavedSec = -1
+    private var speakerGate = SpeakerSelfGate<(endMs: Int64, spanS: Double, embedding: [Float])>()   // 本人を登録するとき（v1.10.1〜）
     private var voiceRetake = false                           // 声の普段だけを取り直した（集め終えたら、その人の声の普段を置き換える。v1.9.2〜）
     private var voiceF0Values: [Double] = []                  // このセッションで数えた声の高さ（v1.9.1〜、中央値・四分位範囲を求める）
     private var voiceSavedSec = -1                            // 最後に保存した秒（1秒ごとに保存する）
@@ -280,7 +282,7 @@ final class AnalysisModel: ObservableObject {
             baselineSec = nil; baselineReady = false; differences = []; insufficient = []
             comparing = nil; savedFromMs = nil; askResave = false; todayBaseline = nil; todayShown = false
             todayVoice = nil; resaveAccepted = false; comparingVoice = nil; usedFace = nil; usedVoice = nil; voiceSec = nil; otherVoice = false
-            voiceWait = nil; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false
+            voiceWait = nil; voiceSpreadWide = false; voiceRetake = false; voiceRetaking = false; speakerEnrollNote = nil
             PersonStore.shared.voiceRestarting = nil
             liveZ = [:]; liveDiffs = []; link.baseline = nil; link.headTurns = []
             scene = nil; markMessage = nil
@@ -463,44 +465,101 @@ final class AnalysisModel: ObservableObject {
         }
         logger.write(SpeakerRecord(tMs: endMs, windowMs: Int((spanS * 1000).rounded()), scores: scores,
                                    calcMs: (calcMs * 10).rounded() / 10, model: SpeakerCriteria.model), notBefore: endMs)
-        guard var en = speakerEnroll else { return }
-        SpeakerMath.add(&en.partial, embedding: e, spanS: min(spanS, SpeakerCriteria.hopS))   // 0.5秒ごとなので、重ならない分だけ数える
-        speakerEnroll = en
-        let sec = Int(en.partial.validS)
-        if PersonStore.shared.speakerEnrollSec != sec { PersonStore.shared.speakerEnrollSec = sec }
-        if en.partial.validS >= SpeakerCriteria.enrollTargetS {
-            let done = SpeakerMath.finish(en.partial, now: Self.nowMs())
-            PersonStore.shared.setSpeaker(en.id, done)
-            let name = PersonStore.shared.people.first { $0.id == en.id }?.displayName ?? ""
-            showMessage("\(name)の声を\(en.retake ? "登録し直しました" : "登録しました")")
-            speakerEnroll = nil; PersonStore.shared.speakerEnrolling = nil
-        } else if !en.retake, sec != speakerEnrollSavedSec {   // 初めての登録は、途中の分を1秒ごとに残す（取り直しは、たまるまで今の登録を残し、途中の分は残さない）
-            speakerEnrollSavedSec = sec
-            PersonStore.shared.setSpeakerPartial(en.id, en.partial)
+        guard let en = speakerEnroll else { return }
+        switch en.collect {
+        case .voiced: addSpeakerEnroll(endMs: endMs, spanS: spanS, embedding: e)
+        case .voiceSelf:   // 本人：そのまとまりのコマの voice_self が分かってから決める（v1.10.1〜）
+            speakerGate.embedding(endMs: endMs, spanS: spanS, item: (endMs, spanS, e))
+            drainSpeakerGate()
         }
     }
 
-    /// 設定の「人」で「声を登録する」：記録中で話者の区別がオンなら、その人の声の登録を集め始める
+    /// 本人を登録しているとき、映像のコマごとの voice_self を入れる（update から）
+    private func speakerGateFrame(tMs: Int64, voiceSelf: Bool?) {
+        guard let en = speakerEnroll, en.collect == .voiceSelf else { return }
+        speakerGate.frame(tMs: tMs, voiceSelf: voiceSelf)
+        drainSpeakerGate()
+    }
+
+    private func drainSpeakerGate() {
+        for r in speakerGate.ready(nowMs: Self.nowMs()) {
+            // 途中で選んでいる人を変えたら、voice_self はほかの人のものなので数えない
+            guard r.counted, let en = speakerEnroll, en.collect == .voiceSelf, PersonStore.shared.selectedID == en.id else { continue }
+            addSpeakerEnroll(endMs: r.item.endMs, spanS: r.item.spanS, embedding: r.item.embedding)
+        }
+    }
+
+    private func addSpeakerEnroll(endMs: Int64, spanS: Double, embedding e: [Float]) {
+        guard var en = speakerEnroll else { return }
+        // 0.5秒ごとなので、重ならない分だけ数える
+        let score = SpeakerMath.addWithProgress(&en.partial, embedding: e, spanS: min(spanS, SpeakerCriteria.hopS))
+        speakerEnroll = en
+        if let score {   // たまった秒数が5秒増えるごと（v1.10.1〜）。埋め込みは書かない
+            var ev = EventRecord(tMs: endMs, kind: "speaker_enroll_progress", value: nil)
+            ev.personId = en.id; ev.validS = (en.partial.validS * 10).rounded() / 10; ev.score = score
+            logger.write(ev)
+        }
+        let sec = Int(en.partial.validS)
+        if PersonStore.shared.speakerEnrollSec != sec { PersonStore.shared.speakerEnrollSec = sec }
+        let name = PersonStore.shared.people.first { $0.id == en.id }?.displayName ?? ""
+        if en.partial.validS >= SpeakerCriteria.enrollTargetS {
+            let done = SpeakerMath.finish(en.partial, now: Self.nowMs())
+            PersonStore.shared.setSpeaker(en.id, done)
+            showSpeakerDone("\(name)の声を\(en.retake ? "登録し直しました" : "登録しました")")
+            speakerEnroll = nil; speakerGate.clear(); PersonStore.shared.speakerEnrolling = nil
+        } else {
+            setSpeakerProgress(name: name, sec: sec)
+            if !en.retake, sec != speakerEnrollSavedSec {   // 初めての登録は、途中の分を1秒ごとに残す（取り直しは、たまるまで今の登録を残し、途中の分は残さない）
+                speakerEnrollSavedSec = sec
+                PersonStore.shared.setSpeakerPartial(en.id, en.partial)
+            }
+        }
+    }
+
+    /// 撮る側の「いま」の進み具合（docs/wording-guide.md）
+    private func setSpeakerProgress(name: String, sec: Int) {
+        let t = "\(name)の声を集めています（\(sec)/\(Int(SpeakerCriteria.enrollTargetS))秒）。黙っている間は数えません"
+        if speakerEnrollNote != t { speakerEnrollNote = t }
+    }
+
+    private func showSpeakerDone(_ msg: String) {
+        speakerEnrollNote = msg
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            if speakerEnrollNote == msg { speakerEnrollNote = nil }
+        }
+    }
+
+    /// 設定の「人」で「声を登録する」：記録中で話者の区別がオンなら、その人の声の登録を集め始める。
+    /// 選んでいる人（本人）なら、本人の声とされた時間だけを集める（v1.10.1〜）
     private func startSpeakerEnroll(_ id: String, consentBy: String) -> Bool {
         guard running, speakerOn, let p = PersonStore.shared.people.first(where: { $0.id == id }) else { return false }
         let now = Self.nowMs()
         let retake = p.speaker != nil
+        let collect: SpeakerEnrollCollect = PersonStore.shared.selectedID == id ? .voiceSelf : .voiced
         var part = SpeakerEnrollPartial(model: SpeakerCriteria.model, sum: [], embeddings: 0, validS: 0, startedMs: now, consentBy: consentBy, consentMs: now)
         if !retake, let old = p.speakerPartial, old.model == SpeakerCriteria.model, !old.expired(now: now) {
             part = old; part.consentBy = consentBy; part.consentMs = now   // 続きから（同意はこのとき聞き直したもの）
         }
-        speakerEnroll = (id, part, retake)
+        speakerEnroll = (id, part, retake, collect)
         speakerEnrollSavedSec = -1
+        speakerGate.clear()
+        PersonStore.shared.speakerEnrollCollect = collect
+        PersonStore.shared.speakerEnrollSec = Int(part.validS)
         var e = EventRecord(tMs: now, kind: "speaker_enroll", value: .text(retake ? "取り直し" : "登録"))
         e.personId = id   // 名前・同意した人は記録に書かない
+        e.collect = collect.rawValue
         logger.write(e)
+        setSpeakerProgress(name: p.displayName, sec: Int(part.validS))
         return true
     }
 
     private func stopSpeakerEnroll() {
         if let en = speakerEnroll, !en.retake, en.partial.embeddings > 0 { PersonStore.shared.setSpeakerPartial(en.id, en.partial) }
         speakerEnroll = nil
+        speakerGate.clear()
         PersonStore.shared.speakerEnrolling = nil
+        if speakerEnrollNote?.hasSuffix("黙っている間は数えません") == true { speakerEnrollNote = nil }
     }
 
     /// 声の普段だけを、その場で初めから集め直す（v1.9.2〜）。表情の普段はそのまま。記録には baseline_restart（part: "voice"）
@@ -955,6 +1014,7 @@ final class AnalysisModel: ObservableObject {
                         voiceReason: VoiceSelfTracker.Reason? = nil) {
         guard cameraActive else { return }
         collectVoice(tMs: tMs, voiceSelf: voiceSelf, faceValid: r.face && voiceFaceValid, reason: voiceReason, audio: a)
+        speakerGateFrame(tMs: tMs, voiceSelf: voiceSelf)
         if a.at > lastAudioAtCoverage, let db = a.rmsDb {   // 音の塊ごとに1回
             lastAudioAtCoverage = a.at
             pitchCoverage.add(t: a.at, db: db, f0: a.f0Hz != nil)

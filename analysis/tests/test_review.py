@@ -1528,6 +1528,10 @@ class SpeakerTest(unittest.TestCase):
             for k in range(20):
                 lines.append(json.dumps({"type": "speaker", "t_ms": t0 + 500 * (k + 1), "window_ms": 400 if k < 5 else 3000,
                                          "scores": {"aaaa1111": 0.7, "bbbb2222": 0.3}, "calc_ms": 8.0 + k % 3, "model": "wespeaker-r34lm-fluid-coreml-v1"}))
+            lines.append(json.dumps({"type": "event", "t_ms": t0 + 100, "kind": "speaker_enroll", "value": "登録", "person_id": "aaaa1111", "collect": "voice_self"}))
+            for k, sc in enumerate((0.61, 0.74, 0.78)):
+                lines.append(json.dumps({"type": "event", "t_ms": t0 + 5000 * (k + 1), "kind": "speaker_enroll_progress",
+                                         "person_id": "aaaa1111", "valid_s": 5.0 * (k + 1), "score": sc}))
         p = Path(d) / f"spk_{on}.jsonl"
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return p
@@ -1549,3 +1553,6 @@ class SpeakerTest(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["fps"], 1000 / 33, delta=0.2)
         self.assertIn("オン", text)
         self.assertNotIn("embedding", raw)       # 記録に埋め込みは無い
+        en = sp["enroll"]["aaaa1111"]
+        self.assertEqual(en["collect"], "voice_self")
+        self.assertEqual(en["points"], [(5.0, 0.61), (10.0, 0.74), (15.0, 0.78)])

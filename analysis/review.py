@@ -1461,6 +1461,14 @@ def quality(a: Analysis, calm: bool) -> dict:
                         "model": rec.header.get("speaker_model") or rec.speaker[0].get("model"),
                         "scores": {k: (roles.get(k, "?"), tuple(np.percentile([r["scores"][k] for r in rec.speaker if k in (r.get("scores") or {})], [10, 50, 90])))
                                    for k in ids}}
+        # 声の登録の途中の似ている度合い（v1.10.1〜、5秒ごと）：何秒で落ち着くかを見る
+        prog: dict = {}
+        for e in rec.events:
+            if e.get("kind") == "speaker_enroll" and e.get("person_id"):
+                prog.setdefault(e["person_id"], {"collect": None, "points": []})["collect"] = e.get("collect")
+            elif e.get("kind") == "speaker_enroll_progress" and e.get("person_id") and e.get("score") is not None:
+                prog.setdefault(e["person_id"], {"collect": None, "points": []})["points"].append((float(e.get("valid_s", 0)), float(e["score"])))
+        q["speaker"]["enroll"] = {k: v for k, v in prog.items() if v["points"]}
 
     yaw = rec.yaw[np.isfinite(rec.yaw)]
     if len(yaw):
@@ -1944,6 +1952,10 @@ def write_html(path: Path, a: Analysis, q: dict, rows: list[dict], csv_name: str
                       + (f"。計算時間 中央値 {sp['calc'][0]:.1f}ms・95% {sp['calc'][1]:.1f}ms" if sp["calc"] else "") + f"。モデル {sp['model']}"])
         for k, (role, (p10, p50, p90)) in sp["scores"].items():
             qrows.append([f"声を登録した人 {k[:8]}（{rl.get(role, role)}）との似ている度合い（10% / 中央値 / 90%）", f"{p10:.2f} / {p50:.2f} / {p90:.2f}"])
+        cl = {"voice_self": "本人の声とされた時間だけ", "voiced": "声が出ている時間すべて", None: "集めたものが書かれていない"}
+        for k, v in sp.get("enroll", {}).items():
+            qrows.append([f"声の登録の途中 {k[:8]}（{cl.get(v['collect'], v['collect'])}。たまった秒数：その時点までの登録と最新の声の似ている度合い）",
+                          "、".join(f"{t:.0f}秒 {sc:.2f}" for t, sc in v["points"])])
     p = q["pitch"]
     qrows.append(["声の高さ（f0）が取れたコマ",
                   f"{p['f0_frames']}コマ（求め方 {p['version']}："

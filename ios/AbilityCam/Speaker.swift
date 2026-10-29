@@ -21,6 +21,54 @@ enum SpeakerCriteria {
     static let voiceGapS = 0.3                              // これより長く声が途切れたら、声のまとまりを切る
     static let enrollTargetS = 30.0                         // 登録：声が合計これだけたまったら作る（仮の値）
     static let enrollMaxAgeDays = 14.0                      // 途中まで集めた登録は、集め始めてから14日で捨てる（声の普段と同じ）
+    static let enrollProgressStepS = 5.0                    // 登録の途中、たまった秒数がこれだけ増えるごとに、似ている度合いを記録に書く（v1.10.1〜、30秒の根拠を決めるため）
+    static let selfGateWaitMs: Int64 = 3000                 // 本人を登録するとき、声のまとまりの終わりのコマがこれだけ待っても来なければ数えない（v1.10.1〜）
+}
+
+/// 声の登録で、何を集めるか（v1.10.1〜。記録の event speaker_enroll の collect）
+enum SpeakerEnrollCollect: String {
+    case voiceSelf = "voice_self"   // 選んでいる人（本人）：今の判定で本人の声とされた時間（voice_self が true）だけ
+    case voiced                     // ほかの人：声が出ている時間すべて（v1.10 と同じ）
+}
+
+/// 本人を登録するとき（v1.10.1〜）：声のまとまりの埋め込みを、そのまとまりのコマの voice_self が分かるまで待ち、数えるかを決める。
+/// 数える：使った声のまとまり全体に voice_self が false のコマが無く、数える分（終わりから min(使った長さ, 0.5秒)）のコマがすべて true（1コマ以上）
+struct SpeakerSelfGate<Item> {
+    private var frames: [(t: Int64, v: Bool?)] = []        // 時刻の順（映像のコマ）
+    private var pending: [(endMs: Int64, spanS: Double, item: Item)] = []
+
+    mutating func frame(tMs: Int64, voiceSelf: Bool?) {
+        if let last = frames.last, tMs <= last.t { return }
+        frames.append((tMs, voiceSelf))
+        let keep = tMs - Int64((SpeakerCriteria.maxSpanS + 7) * 1000)
+        if let i = frames.firstIndex(where: { $0.t >= keep }), i > 0 { frames.removeFirst(i) }
+    }
+
+    mutating func embedding(endMs: Int64, spanS: Double, item: Item) { pending.append((endMs, spanS, item)) }
+
+    /// 決まったもの（数えるか）を古い順に返す。nowMs：今の時刻（コマが来ないまま待ちすぎたものは数えない）
+    mutating func ready(nowMs: Int64) -> [(item: Item, counted: Bool)] {
+        var out: [(item: Item, counted: Bool)] = []
+        let lastT = frames.last?.t ?? Int64.min
+        while let p = pending.first, lastT >= p.endMs || nowMs - p.endMs > SpeakerCriteria.selfGateWaitMs {
+            pending.removeFirst()
+            out.append((p.item, lastT >= p.endMs && decide(endMs: p.endMs, spanS: p.spanS)))
+        }
+        return out
+    }
+
+    mutating func clear() { frames = []; pending = [] }
+
+    private func decide(endMs: Int64, spanS: Double) -> Bool {
+        let start = endMs - Int64((spanS * 1000).rounded())
+        let counted = endMs - Int64((min(spanS, SpeakerCriteria.hopS) * 1000).rounded())
+        var n = 0
+        for f in frames where f.t >= start && f.t <= endMs {
+            if f.v == false { return false }
+            if f.t >= counted { if f.v != true { return false }; n += 1 }
+        }
+        return n > 0
+    }
 }
 
 /// 声の登録（persons.json の中だけ。記録には書かない）
@@ -79,6 +127,16 @@ enum SpeakerMath {
         if p.sum.isEmpty { p.sum = u } else { for i in p.sum.indices where i < u.count { p.sum[i] += u[i] } }
         p.embeddings += 1
         p.validS += spanS
+    }
+
+    /// 登録に1つ足し、たまった秒数が 5秒の区切りを越えたら、足す前の登録（平均）と、この声との似ている度合いを返す（v1.10.1〜、記録の speaker_enroll_progress）
+    static func addWithProgress(_ p: inout SpeakerEnrollPartial, embedding e: [Float], spanS: Double) -> Double? {
+        let step = SpeakerCriteria.enrollProgressStepS
+        let before = p.validS
+        let score = p.sum.isEmpty ? nil : cosine(normalized(e), p.sum)
+        add(&p, embedding: e, spanS: spanS)
+        guard let s = score, s.isFinite, (p.validS + 1e-9) / step >= ((before + 1e-9) / step).rounded(.down) + 1 else { return nil }
+        return (s * 1000).rounded() / 1000
     }
 
     /// 集め終えた登録

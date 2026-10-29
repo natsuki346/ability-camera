@@ -58,6 +58,34 @@ if args.first == "--selftest" {
     r.mark(voiced: false, at: 0.5)
     if r.span(now: 0.5) != nil { bad.append("声が途切れても長さがある") }
     if r.window().count != SpeakerCriteria.windowSamples || r.window().last != 0.1 { bad.append("輪のバッファの並びが違う") }
+    // 5秒ごとの似ている度合い（v1.10.1〜）：0.5秒ずつ足すと 5・10秒で1回ずつ、足す前の平均と比べる
+    var q = SpeakerEnrollPartial(model: SpeakerCriteria.model, sum: [], embeddings: 0, validS: 0, startedMs: 0, consentBy: "x", consentMs: 0)
+    var marks: [(Double, Double)] = []
+    for k in 0..<20 {
+        let e: [Float] = k == 9 ? [0, 1] : [1, 0]
+        if let s = SpeakerMath.addWithProgress(&q, embedding: e, spanS: 0.5) { marks.append((q.validS, s)) }
+    }
+    if marks.map(\.0) != [5, 10] { bad.append("5秒ごとに書かない \(marks)") }
+    if abs((marks.first?.1 ?? -1) - 0) > 1e-9 || abs((marks.last?.1 ?? -1) - 0.998) > 1e-9 { bad.append("足す前の平均と比べていない \(marks)") }
+    var q2 = SpeakerEnrollPartial(model: SpeakerCriteria.model, sum: [], embeddings: 0, validS: 4.8, startedMs: 0, consentBy: "x", consentMs: 0)
+    if SpeakerMath.addWithProgress(&q2, embedding: [1, 0], spanS: 0.5) != nil { bad.append("初めの1つで書いた") }
+    if SpeakerMath.addWithProgress(&q2, embedding: [1, 0], spanS: 0.5) != nil { bad.append("区切りを越えないのに書いた") }
+    // 本人を登録するときの決め方（v1.10.1〜）
+    func gate(_ vs: [(Int64, Bool?)], end: Int64, span: Double) -> Bool? {
+        var g = SpeakerSelfGate<Int>()
+        g.embedding(endMs: end, spanS: span, item: 1)
+        for (t, v) in vs { g.frame(tMs: t, voiceSelf: v) }
+        return g.ready(nowMs: end).first?.counted
+    }
+    let allTrue = stride(from: Int64(0), through: 3000, by: 33).map { ($0, Optional(true)) }
+    if gate(allTrue, end: 2970, span: 3) != true { bad.append("本人の声だけなのに数えない") }
+    if gate(allTrue.map { ($0.0, $0.0 == 1023 ? false : $0.1) }, end: 2970, span: 3) != false { bad.append("ほかの人の声が混じっても数えた") }
+    if gate(allTrue.map { ($0.0, $0.0 > 2700 ? nil : $0.1) }, end: 2970, span: 3) != false { bad.append("数える分に分からないコマがあっても数えた") }
+    if gate(allTrue.map { ($0.0, $0.0 < 2400 ? nil : $0.1) }, end: 2970, span: 3) != true { bad.append("前の方が分からないだけで数えない") }
+    if gate(allTrue.filter { $0.0 < 2900 }, end: 2970, span: 3) != nil { bad.append("終わりのコマを待たない") }
+    var g = SpeakerSelfGate<Int>()
+    g.embedding(endMs: 1000, spanS: 0.5, item: 7)
+    if let r = g.ready(nowMs: 1000 + SpeakerCriteria.selfGateWaitMs + 1).first, r.counted || r.item != 7 { bad.append("待ちすぎたのに数えた") }
     print(bad.isEmpty ? "OK" : bad.joined(separator: "\n"))
     exit(bad.isEmpty ? 0 : 1)
 }

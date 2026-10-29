@@ -98,10 +98,14 @@ struct EventRecord: Encodable {
     var median: Double?         // voice_pitch_range：声の高さの範囲に使う中央値（Hz）。無ければ範囲を外した（v1.9.4〜）
     var iqr: Double?            // voice_pitch_range：その四分位範囲（Hz）
     var part: String?           // baseline_restart：face＝表情の普段だけ取り直した（カメラを変えたとき、v1.7〜。声の普段は続ける）。無ければ両方
+    var collect: String?        // speaker_enroll：何を集めるか（voice_self＝本人の声とされた時間だけ / voiced＝声が出ている時間すべて、v1.10.1〜）
+    var validS: Double?         // speaker_enroll_progress：たまった声の秒数（v1.10.1〜）
+    var score: Double?          // speaker_enroll_progress：その時点までの登録（平均、最新の声を足す前）と最新の声との似ている度合い
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
         case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part, median, iqr
+        case collect, validS = "valid_s", score
     }
 }
 

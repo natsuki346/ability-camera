@@ -161,6 +161,7 @@ final class PersonStore: ObservableObject {
     /// 声の登録を集めている人（記録中だけ）と、集めた秒数（設定の「人」に出す）
     @Published var speakerEnrolling: String?
     @Published var speakerEnrollSec: Int = 0
+    @Published var speakerEnrollCollect: SpeakerEnrollCollect?   // 集めているもの（本人の声とされた時間だけ／声が出ている時間すべて、v1.10.1〜）
     /// 撮る側が、記録中ならその人の声の登録を集め始める（始めたら true）。AnalysisModel が入れる
     var onSpeakerEnroll: ((_ id: String, _ consentBy: String) -> Bool)?
     var onSpeakerEnrollStop: (() -> Void)?
@@ -168,7 +169,7 @@ final class PersonStore: ObservableObject {
     @discardableResult
     func startSpeakerEnroll(_ id: String, consentBy: String) -> Bool {
         let live = onSpeakerEnroll?(id, consentBy) ?? false
-        if live { speakerEnrolling = id; speakerEnrollSec = 0 }
+        if live { speakerEnrolling = id }   // 秒数は AnalysisModel が入れる（続きからなら途中の秒数）
         return live
     }
 
@@ -359,10 +360,21 @@ struct PersonEditView: View {
             } else {
                 Button("声を登録する") { consentName = p?.name ?? ""; askConsent = true }
             }
+            // どちらで集めるか（v1.10.1〜）：集めている間は始めたときのもの、それ以外は今選んでいる人かで
+            let collect: SpeakerEnrollCollect? = store.speakerEnrolling == id ? store.speakerEnrollCollect : (store.selectedID == id ? .voiceSelf : .voiced)
+            if let c = collect { Text(Self.collectNote(c)).font(.caption).foregroundStyle(.secondary) }
             if let n = speakerNote { Text(n).font(.caption).foregroundStyle(.secondary) }
             if !speakerRecord { Text("設定の「話者の区別を記録する」がオフのあいだは、集めず、記録にも書きません").font(.caption).foregroundStyle(.secondary) }
         } header: { Text("声の登録（話者の区別・記録に書くだけ）") } footer: {
             Text("記録しているときに、この人がひとりで話している間に押してください。声が\(target)秒たまると登録します（取り直すときは、たまるまで今の登録を残します）。声の特徴の数値はこの端末の中だけに置き、記録にはだれの声か分けるための似ている度合いだけを書きます。本人確認・認証には使いません")
+        }
+    }
+
+    /// 登録の画面に小さく出す、どちらで集めるか（docs/wording-guide.md）
+    static func collectNote(_ c: SpeakerEnrollCollect) -> String {
+        switch c {
+        case .voiceSelf: return "選んでいる人なので、本人の声として数えた時間だけを集めます"
+        case .voiced: return "選んでいる人ではないので、声が出ている時間をすべて集めます"
         }
     }
 

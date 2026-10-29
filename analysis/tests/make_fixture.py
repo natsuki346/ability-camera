@@ -231,6 +231,77 @@ def build_voice():
     return lines + [r[1] for r in rows]
 
 
+# fixture_cues.jsonl（試すモード、v1.18〜）：10秒で表情の普段（中央値つき）。10秒から CuePlan と同じ指示を記録に書き、指示どおりに値を動かす。
+# 眉を寄せる（3秒）×5：browDown 0.01 → 0.06（3回目だけ 0.012）。今の下限 0.03 では z≈1.7 で出ず、いちばん強く寄せた 0.15 から決めた下限 0.014 では z≈3.6 で出る。
+# 点の距離は brow_inner_eye（眉頭と目頭の間）だけが大きく動き、brow_inner_gap はほとんど動かない。笑う ×5：mouthSmile 0.5・mouth_corner 0.05。
+# 横を向く：yaw 30°（点の距離は書かない）
+CUE_STEPS = ([("calm", 30)] + [("frown", 3), ("rest", 3)] * 5 + [("smile", 3), ("rest", 3)] * 5
+             + [("turn", 20), ("calm", 30), ("frown_max", 3), ("rest", 3), ("smile_max", 3), ("rest", 3)])
+CUE_GEO = {"brow_eye_gap": 0.2, "brow_inner_gap": 0.2, "eye_open": 0.1, "mouth_corner": 0.02, "brow_inner_eye": 0.22, "brow_inner_gap2": 0.24}
+CUE_BASE = {"mouth_smile": (0.10, 0.02), "brow_down": (0.01, 0.002), "eye_squint": (0.10, 0.02), "jaw_open": (0.05, 0.02)}
+
+
+def cue_at(t):
+    """その時刻の指示と、何回目か"""
+    s, count = 10.0, {}
+    for k, d in CUE_STEPS:
+        if s <= t < s + d:
+            return k, count.get(k, 0), s
+        count[k] = count.get(k, 0) + 1
+        s += d
+    return None, 0, s
+
+
+def build_cues():
+    lines = [{"schema": "ability-cam.ios.v0.2", "started_at_ms": T0_MS, "camera": "front", "camera_label": "前面", "direction_version": 2,
+              "note": "テスト用の作り物（試すモード）"}]
+    m = {k: {"n": 300, "mean": mu, "std": sd, "median": mu, "insufficient": False} for k, (mu, sd) in CUE_BASE.items()}
+    for k, v in CUE_GEO.items():
+        m[k] = {"n": 300, "mean": v, "std": 0.003, "median": v, "insufficient": False}
+    for k in ("orbit", "nose_lip", "mouth_tense", "cheek_raise"):
+        m[k] = {"n": 300, "mean": 0.05, "std": 0.02, "median": 0.05, "insufficient": False}
+    lines.append({"type": "baseline", "t_ms": T0_MS + 10_000, "started_ms": T0_MS, "valid_s": 10.0, "min_n": 30, "target_s": 10.0,
+                  "blink_masked": True, "source": "today", "compared": True, "part": "face", "metrics": m,
+                  "pose": {"yaw_deg": {"n": 300, "mean": 2.0, "std": 1.0, "median": 2.0, "insufficient": False}}})
+    rows = []
+    s = 10.0
+    for k, d in CUE_STEPS:
+        e = event(s + d, "cue", k)
+        e["start_ms"], e["end_ms"] = T0_MS + int(round(s * 1000)), T0_MS + int(round((s + d) * 1000))
+        rows.append((s + d, e))
+        s += d
+    end = s + 3
+    for i in range(int(end * FPS)):
+        t = i / FPS
+        kind, rep, _ = cue_at(t)
+        v = {k: mu for k, (mu, _) in CUE_BASE.items()}
+        v["rms_db"] = -50.0
+        v["brow_down"] = round(0.01 + 0.001 * math.sin(t * 1.3), 4)
+        geo = dict(CUE_GEO)
+        yaw = 2.0
+        if kind == "frown":
+            v["brow_down"] = 0.012 if rep == 2 else 0.06
+            geo["brow_inner_eye"] = 0.22 if rep == 2 else 0.195
+            geo["brow_inner_gap"] = 0.198
+        if kind == "smile":
+            v["mouth_smile"] = 0.5
+            geo["mouth_corner"] = 0.05
+        if kind == "frown_max":
+            v["brow_down"] = 0.15
+            geo.update(brow_inner_eye=0.18, brow_eye_gap=0.19, brow_inner_gap=0.195, brow_inner_gap2=0.22)
+        if kind == "smile_max":
+            v["mouth_smile"] = 0.9
+            geo["mouth_corner"] = 0.08
+        if kind == "turn":
+            yaw = 30.0
+        o = frame_obj(t, v, True, yaw, None)
+        if abs(yaw) <= 25:
+            o["geo"] = geo
+        rows.append((t, o))
+    rows.sort(key=lambda r: r[0])
+    return lines + [r[1] for r in rows]
+
+
 def write(name, objs):
     out = Path(__file__).with_name(name)
     out.write_text("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in objs), encoding="utf-8")
@@ -241,3 +312,4 @@ if __name__ == "__main__":
     write("fixture_basic.jsonl", build())
     write("fixture_eyes.jsonl", build_eyes())
     write("fixture_voice.jsonl", build_voice())
+    write("fixture_cues.jsonl", build_cues())

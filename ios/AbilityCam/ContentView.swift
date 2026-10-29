@@ -39,7 +39,14 @@ struct ContentView: View {
         .padding(.horizontal)
         .padding(.bottom, 8)
         .overlay { if cameraLarge { largeCamera } }
-        .sheet(isPresented: $showSettings) { SettingsView(link: model.link) }
+        .overlay { if model.cueStage != nil { CueOverlay(model: model) } }   // 試すモードの指示（v1.18〜）
+        .sheet(isPresented: $showSettings) { SettingsView(link: model.link, startCues: { showSettings = false; model.startCues() }) }
+        .sheet(isPresented: Binding(get: { model.cueResult != nil }, set: { if !$0 { model.cueResult = nil } })) {
+            if let r = model.cueResult { CueResultView(result: r) }
+        }
+        .alert("試すモード", isPresented: Binding(get: { model.cueError != nil }, set: { if !$0 { model.cueError = nil } })) {
+            Button("閉じる", role: .cancel) { model.cueError = nil }
+        } message: { Text(model.cueError ?? "") }
         .confirmationDialog("記録を終えますか？", isPresented: $confirmEnd, titleVisibility: .visible) {
             Button("記録を終える") { model.endRecording() }
             Button("続ける", role: .cancel) {}

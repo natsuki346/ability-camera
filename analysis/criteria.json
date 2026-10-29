@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-29.8",
+  "version": "2026-10-30.1",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -84,6 +84,10 @@
     {
       "date": "2026-10-29",
       "reason": "v1.17（記録 ability-cam-20261029-234627・234756、前面から）：眉を寄せた 22・40・68〜74秒に browDown は 0.05〜0.12（普段 0.001）で「眉を寄せる」が出たが、brow_inner_gap は z ±0.4 でほとんど動かなかった（前の記録 213623 では z +2.2〜2.8）。何もしていないときも brow_inner_gap の z が −1〜−1.8 にずれていた（保存した普段は yaw の平均 16°、今回は 3〜7°）。顔の点の距離（brow_inner_gap・eye_open・mouth_corner・brow_eye_gap）は保存した普段では比べず、その日の今日の普段がたまってから比べる（アプリが保存した普段の baseline 行から外し、今日の普段から from_today で足す。足した指標の目の向きの判定は from_today_yaw_deg＝今日の普段の yaw の中央値）。co_change：support で brow_inner_gap を補助にした（同じコマで brow_down が入っているときだけ眉のまとまりに数える。記録は続ける）。アプリ（DiffEngine.swift の DiffCriteria.coSupport）と同じ値。"
+    },
+    {
+      "date": "2026-10-30",
+      "reason": "v1.18（記録 ability-cam-20261029-234627・234756、前面から。眉を5回寄せたはずが、はっきり取れたのは3回。brow_inner_gap は z ±0.4 で動かなかった）：正解つきで確かめる「試すモード」（cues：指示ごとに記録の event kind \"cue\"）と、その人の動く幅（calibration：「いちばん強く眉を寄せる」「いちばん大きく笑う」の p95 をその人の最大とし、標準偏差の下限を min(今の下限, |最大 − 普段の中央値| × floor_frac)、ただし floor_min 以上にする。baseline 行の std_floor に使った下限を書く）。眉の点の距離の候補 brow_inner_eye（眉頭 55・285 → 目頭 133・362 の縦）・brow_inner_gap2（眉頭 55・285 の間）を足した（co_change には入れない）。どれも仮の値。アプリ（Cues.swift の Calibration・CueReport、Baseline.swift の FaceGeometry）と同じ値。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -101,7 +105,9 @@
     "brow_eye_gap": 0.01,
     "brow_inner_gap": 0.01,
     "eye_open": 0.01,
-    "mouth_corner": 0.01
+    "mouth_corner": 0.01,
+    "brow_inner_eye": 0.01,
+    "brow_inner_gap2": 0.01
   },
   "face_below_counts": false,
   "metrics": {
@@ -216,6 +222,22 @@
       }
     },
     "mouth_corner": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5,
+      "segments": false
+    },
+    "brow_inner_eye": {
+      "smooth_s": 0.3,
+      "start_z": 2.0,
+      "start_min_s": 0.5,
+      "end_z": 1.5,
+      "end_min_s": 0.5,
+      "segments": false
+    },
+    "brow_inner_gap2": {
       "smooth_s": 0.3,
       "start_z": 2.0,
       "start_min_s": 0.5,
@@ -369,7 +391,15 @@
         291
       ],
       "forehead": 10,
-      "chin": 152
+      "chin": 152,
+      "brow_inner2": [
+        55,
+        285
+      ],
+      "inner_canthus": [
+        133,
+        362
+      ]
     },
     "flat_range": 0.01,
     "flat_note": "普段の間の値の幅（max − min）が flat_range 未満の表情の数値は、データのタブに「この顔では値がほとんど動いていません」と出す（判定から外すかは記録を見てから決める）"
@@ -465,5 +495,43 @@
     "smooth_s": 0.3,
     "mark_window_s": 30,
     "min_marks": 10
+  },
+  "calibration": {
+    "_note": "その人の動く幅（v1.18〜、仮の値）。試すモードの frown_max・smile_max の指示の間の、顔のあるコマの生の値から、動く向きの q 分位（小さくなる指標は 1−q）を「その人の最大」にする（値が min_n 未満の指標は決めない）。persons.json に保存し、その人の普段で比べるとき、指標ごとの標準偏差の下限を max(floor_min, min(std_floor, |最大 − 普段の中央値（無い普段は平均）| × floor_frac)) にする（std_floor より小さくなるときだけ。baseline 行の std_floor に書く）。最大が無い人は今まで通り",
+    "provisional": true,
+    "q": 0.95,
+    "min_n": 10,
+    "floor_frac": 0.1,
+    "floor_min": 0.001,
+    "frown": [
+      "brow_down",
+      "-brow_eye_gap",
+      "-brow_inner_gap",
+      "-brow_inner_eye",
+      "-brow_inner_gap2"
+    ],
+    "smile": [
+      "mouth_smile",
+      "mouth_corner"
+    ]
+  },
+  "cues": {
+    "_note": "試すモード（v1.18〜、仮の値）。frown・smile：指示の始まり〜終わり + grace_s 秒に始まった target の「いつもより強い」を「出た」と数え、指示の始まりからの秒数を出す。指標ごと：指示の始まり〜終わり + grace_s に動く向きの z ≥ hit_z のコマがあった回数と、指示の間の z の中央値。calm・turn・rest：その間に始まった「いつもとの違い」（声が出たは入れない）と co_change の数",
+    "provisional": true,
+    "grace_s": 2.0,
+    "hit_z": 2.0,
+    "target": {
+      "frown": "brow_down",
+      "smile": "mouth_smile"
+    },
+    "metrics": [
+      "brow_down",
+      "-brow_eye_gap",
+      "-brow_inner_gap",
+      "-brow_inner_eye",
+      "-brow_inner_gap2",
+      "mouth_smile",
+      "mouth_corner"
+    ]
   }
 }

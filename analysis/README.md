@@ -86,7 +86,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回だ
   保存した声の普段のばらつきを記録の質に出し、`warn_spread_hz` を超えたら「取り直せます」。`RobustPitchTest`・`AudioLagTest`・`VoiceCheckSpansTest`
 - **本人の声の見分け（voice_self.sync・pitch_range、v1.9〜）**：声のコマを pitch（保存した声の普段の範囲の外）→ no_face → no_mouth → timing（直近1秒の jawOpen と rms_db の相関が min_corr 未満）の順に見る。
   記録に `voice_self` があるコマはその値（と `voice_self_reason`・`voice_corr`・`voice_match`）を使い、無い古い記録は同じ決まりで決め直す。
-  `check_app.py` は区間に加えて、声のコマごとの判定・理由・相関・どの顔の口と合っていたかも、アプリ（DiffCheck `--voice`）と比べる。`VoiceSyncTest` が作り物の記録で確かめる
+  `face_check.py 記録.jsonl --cues` は試すモード（v1.18〜）の結果を、アプリの画面と同じ表で出す（`--json` は `DiffCheck --cues` と同じ形）。`check_app.py` は試すモードの結果もアプリと比べる（`CueTest`、`tests/fixture_cues.jsonl`）。
+`check_app.py` は区間に加えて、声のコマごとの判定・理由・相関・どの顔の口と合っていたかも、アプリ（DiffCheck `--voice`）と比べる。`VoiceSyncTest` が作り物の記録で確かめる
 - **顔の向きの普段と特徴（pose、v1.8〜、`pose.py`）**：区間・通知候補には使わず、レポートの節に出すだけ。いつもの向き（baseline 行の `pose`。無い v1.7 までの記録は普段を集めた時間のコマから数え直す）、
   いつもの範囲（平均 ± `range_z` × 標準偏差、下限 `std_floor_deg`）から同じ向きに `min_s` 秒以上外れた時間、向きを変えた回数・とどまった長さの分布・急な向きの変化（`quick_window_s` 秒で `quick_deg` 以上）、
   場面ごと・家族の印の前後 `mark_window_s` 秒の向きの分布。`--baseline-s` で作り直した普段にも `pose` を入れる。`PoseTest` が作り物の記録で確かめる

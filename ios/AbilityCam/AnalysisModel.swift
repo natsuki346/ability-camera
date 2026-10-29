@@ -111,12 +111,20 @@ final class AnalysisModel: ObservableObject {
     private var squintPending: [(t: Double, m: Metric, x: Double)] = []  // 普段に数える前の目を細める・目のまわり（v1.12〜）の値（後ろ 0.2秒にまばたきが無いか待つ）
     private var asymStats: [String: Welford] = [:]
     private var rangeStats: [Metric: (lo: Double, hi: Double)] = [:]   // 普段の間の値の幅（v1.15〜）
+    private var baseVals: [Metric: [Double]] = [:]            // 普段の間の値（v1.18〜、中央値を求める。その人の最大から下限を決めるため）
     private var poseYaw: [Double] = []                        // 普段の間の yaw（v1.16〜、中央値を求める）
     /// 顔の向きが普段と違うので、目の指標を比べていない（v1.16〜、データのタブ）
     @Published var eyesOffYaw = false
     /// 比べている保存した普段に無い指標（v1.15〜。今日の普段がたまったら、その指標だけ今日の普段で比べ始める）
     @Published var missingInSaved: [Metric] = []
     @Published var missingFilled = false
+    // 試すモード（v1.18〜、extension の「試すモード」）
+    @Published var cueStage: CueStage?
+    @Published var cueRemaining = 0            // 今の指示の残り秒
+    @Published var cueResult: CueTrial?        // 終わったときの結果（画面に出す）
+    @Published var cueError: String?
+    fileprivate var cueTask: Task<Void, Never>?
+    private var thermalObserver: NSObjectProtocol?
     /// 顔の点の距離を、今日の普段がたまるのを待っている（v1.17〜。保存した普段では比べない。データのタブ）
     @Published var geoWaitingToday = false
     /// 普段の間ほとんど動いていない指標（v1.15〜。表情の数値で、普段の間の値の幅が DiffCriteria.flatRange 未満。判定から外すのは記録を見てから決める）
@@ -275,6 +283,22 @@ final class AnalysisModel: ObservableObject {
         // データのタブの v1.15〜の表示：保存した普段に無い指標・普段の間ほとんど動いていない指標
         missingInSaved = [.orbit, .noseLip, .mouthTense, .cheekRaise]; missingFilled = false; geoWaitingToday = true
         flatMetrics = [.cheekRaise, .noseLip]
+        // 試すモードの見た目（v1.18〜）：-previewCueStep で指示の画面、-previewCueResult で結果の画面（作り物の数）
+        if ProcessInfo.processInfo.arguments.contains("-previewCueStep") { cueStage = .step(3); cueRemaining = 2 }
+        if ProcessInfo.processInfo.arguments.contains("-previewCueResult") {
+            func rep(_ frown: Int, _ calm: Int, _ z: Double) -> CueReport {
+                var r = CueReport()
+                r.hits = [.init(kind: "frown", n: 5, hit: frown, latencyS: Array(repeating: 0.6, count: frown)),
+                          .init(kind: "smile", n: 5, hit: 5, latencyS: [0.3, 0.3, 0.4, 0.3, 0.5])]
+                r.quiet = [.init(kind: "calm", seconds: 60, diffs: calm, co: 0), .init(kind: "turn", seconds: 20, diffs: 0, co: 0),
+                           .init(kind: "rest", seconds: 60, diffs: 1, co: 0)]
+                r.rows = CueReport.metrics.flatMap { item in [CueKind.frown, .smile].map { k in
+                    CueReport.Row(metric: item.m.rawValue, kind: k.rawValue, n: 5, hit: k == .frown && item.m == .browDown ? frown : 0,
+                                  zMedian: k == .frown && item.m == .browDown ? z : 0.2) } }
+                return r
+            }
+            cueResult = CueTrial(max: ["brow_down": 0.15, "brow_inner_eye": 0.18, "mouth_smile": 0.9], before: rep(3, 0, 1.8), after: rep(5, 1, 3.4))
+        }
         if ProcessInfo.processInfo.arguments.contains("-previewMarkDetail") {   // 「詳しく（任意）」の見た目（v1.13〜）
             markDetailPrompt = (0, .unpleasant, MarkDetails.initial.unpleasant)
         }
@@ -392,6 +416,12 @@ final class AnalysisModel: ObservableObject {
         }
         recordingFlag.set(true)   // ここからのコマを記録・判定する
         previewFace = nil
+        // 端末の熱の状態（v1.18〜）：始めたときと、変わるたびに記録に書く
+        if thermalObserver == nil {
+            thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.writeThermal() }
+            }
+        }
         var note = ""
         micOn = await AVAudioApplication.requestRecordPermission()
         if micOn {
@@ -422,6 +452,7 @@ final class AnalysisModel: ObservableObject {
         applySaved()   // 保存した普段があれば、その普段ですぐ比べ始める（今日の普段はうしろで黙って記録する）
         running = true
         PersonStore.shared.inSession = true
+        writeThermal()   // 始めたときの端末の熱の状態（v1.18〜）
         // 前に同じ組み合わせのとき家族が付けた印（v1.13〜）：同じ人のこれまでの記録から、裏で数える
         pastMarks = PastMarks(); markCombos = [:]
         if let pid = PersonStore.shared.selectedID {
@@ -453,6 +484,7 @@ final class AnalysisModel: ObservableObject {
     /// ファイルを閉じて、要約を sessions.jsonl に足す
     private func finalizeSession() {
         finalizeTask?.cancel(); finalizeTask = nil
+        cancelCues()   // 試すモードの途中なら、やめる（v1.18〜）
         if running {
             stopSpeakerEnroll()   // 途中まで集めた声の登録は残す（取り直しなら捨てる）
             engine.coDet.flush(); writeCoChanges(atEnd: true)   // 続いている重なりのできごと（v1.12〜）
@@ -981,7 +1013,7 @@ final class AnalysisModel: ObservableObject {
         comparing = nil; savedFromMs = nil; askResave = false
         missingInSaved = []; flatMetrics = []; geoWaitingToday = false
         boxStats = (Welford(), Welford(), Welford())
-        poseStats = [:]; asymStats = [:]; rangeStats = [:]; missingFilled = false; poseYaw = []
+        poseStats = [:]; asymStats = [:]; rangeStats = [:]; missingFilled = false; poseYaw = []; baseVals = [:]
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
         usedFace = nil
         guard !keepVoice else { return }
@@ -1059,7 +1091,7 @@ final class AnalysisModel: ObservableObject {
         guard let f = usedFace else { return }
         var merged = f.metrics.filter { Metric(rawValue: $0.key)?.isFace ?? false }
         for (k, v) in usedVoice ?? [:] { merged[k] = v }
-        let b = Self.engineBaseline(merged)
+        let b = Self.engineBaseline(merged, floors: calibFloors(merged))
         baselineStats = b
         // 普段の間ほとんど動いていない表情の数値（v1.15〜。値の幅を書いた普段だけ）
         flatMetrics = Set(merged.compactMap { k, st in
@@ -1107,8 +1139,10 @@ final class AnalysisModel: ObservableObject {
                                  minN: Self.minSamples, targetS: sv.targetS, blinkMasked: true, metrics: faceMetrics)
         row.source = BaselineSource.saved.rawValue; row.compared = true; row.part = BaselinePart.face.rawValue
         row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose; row.asym = sv.asym
+        let floors = calibFloors(faceMetrics)
+        setFloors(&row, floors)
         logger.write(row)
-        engine.setBaseline(Self.engineBaseline(faceMetrics), part: .face, yaw: Self.baselineYaw(sv.pose))
+        engine.setBaseline(Self.engineBaseline(faceMetrics, floors: floors), part: .face, yaw: Self.baselineYaw(sv.pose))
         comparing = .saved
         savedFromMs = sv.savedMs
         usedFace = (sv.savedMs, faceMetrics)
@@ -1161,7 +1195,7 @@ final class AnalysisModel: ObservableObject {
         if p.saved(for: t.camera) == nil {   // このカメラの普段がまだ無い（ほかのカメラの普段は変えない）
             PersonStore.shared.setSaved(p.id, camera: t.camera, t)
             showMessage("\(p.displayName)の\(CameraLens(rawValue: t.camera)?.shortLabel ?? "")の普段を保存しました")
-        } else if todayShown {
+        } else if todayShown, cueStage == nil {   // 試すモードの間は聞かない（v1.18〜）
             askResave = true
         }
     }
@@ -1176,6 +1210,7 @@ final class AnalysisModel: ObservableObject {
                                          std: w.n > 0 ? (w.std * 10000).rounded() / 10000 : nil,
                                          insufficient: w.n < Self.minSamples)
             if let r = rangeStats[m] { st.min = (r.lo * 10000).rounded() / 10000; st.max = (r.hi * 10000).rounded() / 10000 }   // 値の幅（v1.15〜）
+            if let xs = baseVals[m], !xs.isEmpty { st.median = (DiffCriteria.quantile(xs.sorted(), 0.5) * 10000).rounded() / 10000 }   // 中央値（v1.18〜）
             out[m.rawValue] = st
         }
         func box(_ w: Welford) -> FaceBoxStats.S {
@@ -1202,9 +1237,11 @@ final class AnalysisModel: ObservableObject {
         row.asym = asymStats.isEmpty ? nil : asymStats.mapValues { w in   // 左右の差の普段（v1.12〜）
             BaselineRecord.Stat(n: w.n, mean: (w.mean * 10000).rounded() / 10000, std: (w.std * 10000).rounded() / 10000, insufficient: w.n < Self.minSamples)
         }
+        let todayFloors = calibFloors(out)
+        if useToday { setFloors(&row, todayFloors) }   // 比べるのに使う行だけ（v1.18〜）
         logger.write(row)
         if useToday {
-            engine.setBaseline(Self.engineBaseline(out), part: .face, yaw: Self.baselineYaw(pose))
+            engine.setBaseline(Self.engineBaseline(out, floors: todayFloors), part: .face, yaw: Self.baselineYaw(pose))
             comparing = .today
             usedFace = (baselineStartMs, out)
             publishBaseline(tMs: Self.nowMs())   // 見る側へ1回
@@ -1237,8 +1274,10 @@ final class AnalysisModel: ObservableObject {
         row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose; row.asym = sv.asym
         row.fromToday = add.map(\.rawValue)
         row.fromTodayYawDeg = todayYaw
+        let floors = calibFloors(merged)
+        setFloors(&row, floors)
         logger.write(row)
-        engine.setBaseline(Self.engineBaseline(merged), part: .face, yaw: Self.baselineYaw(sv.pose),
+        engine.setBaseline(Self.engineBaseline(merged, floors: floors), part: .face, yaw: Self.baselineYaw(sv.pose),
                            metricYaw: todayYaw.map { y in Dictionary(uniqueKeysWithValues: add.map { ($0, y) }) } ?? [:])
         usedFace = (used.startedMs, merged)
         missingFilled = add.contains { !$0.isGeometry } || missingFilled
@@ -1339,13 +1378,29 @@ final class AnalysisModel: ObservableObject {
     }
 
     /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない
-    static func engineBaseline(_ metrics: [String: BaselineRecord.Stat]) -> [Metric: DiffEngine.Stat] {
+    static func engineBaseline(_ metrics: [String: BaselineRecord.Stat], floors: [Metric: Double] = [:]) -> [Metric: DiffEngine.Stat] {
         var b: [Metric: DiffEngine.Stat] = [:]
         for m in Metric.allCases {
             guard let st = metrics[m.rawValue] else { continue }
-            b[m] = DiffEngine.stat(for: m, mean: st.mean, std: st.std, insufficient: st.insufficient)
+            b[m] = DiffEngine.stat(for: m, mean: st.mean, std: st.std, insufficient: st.insufficient, floor: floors[m])
         }
         return b
+    }
+
+    /// 選んだ人の最大（v1.18〜、試すモード）から、この普段で使う標準偏差の下限（指標の下限より小さくなるものだけ）。最大が無い人は空
+    private func calibFloors(_ metrics: [String: BaselineRecord.Stat]) -> [Metric: Double] {
+        guard let cal = PersonStore.shared.selected?.calibration else { return [:] }
+        return Calibration.floors(ref: { m in
+            guard let st = metrics[m.rawValue], !st.insufficient else { return nil }
+            return st.median ?? st.mean
+        }, max: cal.metricMax)
+    }
+
+    /// baseline 行に、使った下限とその人の最大の日時を書く（v1.18〜）
+    private func setFloors(_ row: inout BaselineRecord, _ floors: [Metric: Double]) {
+        guard !floors.isEmpty else { return }
+        row.stdFloor = Dictionary(uniqueKeysWithValues: floors.map { ($0.key.rawValue, $0.value) })
+        row.calibMs = PersonStore.shared.selected?.calibration?.savedMs
     }
 
     private func update(_ r: FaceAnalyzer.Result, audio a: AudioAnalyzer.Snapshot, tMs: Int64, voiceSelf: Bool?, voiceFaceValid: Bool,
@@ -1649,6 +1704,7 @@ final class AnalysisModel: ObservableObject {
     /// 普段に1つ数える（値の幅も、v1.15〜）
     private func addBaselineValue(_ m: Metric, _ x: Double) {
         stats[m, default: Welford()].add(x)
+        baseVals[m, default: []].append(x)
         let r = rangeStats[m]
         rangeStats[m] = (min(r?.lo ?? x, x), max(r?.hi ?? x, x))
     }
@@ -1715,4 +1771,97 @@ final class LockedFlag: @unchecked Sendable {
     private var value = false
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
     func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
+}
+
+// MARK: 試すモード（v1.18〜、設定の「確かめる用の設定」から。撮る側だけ）
+extension AnalysisModel {
+    /// 今の段：baseline＝普段を取り直している、step＝指示（CuePlan.steps の番号）、computing＝結果を計算している
+    enum CueStage: Equatable { case baseline, step(Int), computing }
+
+    /// 試すモードを始める：「普段を取り直す（表情だけ）」をしてから、普段がそろったら指示を順に出す
+    func startCues() {
+        guard running, cueStage == nil else { return }
+        cueResult = nil; cueError = nil
+        logger.write(EventRecord(tMs: Self.nowMs(), kind: "cue_run", value: .text("start")))
+        restart(.face)
+        cueStage = .baseline
+        cueTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            // 普段がそろうまで待つ（取り直したので、今日の普段で比べ始めたら）
+            while !Task.isCancelled, self.comparing == nil {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            for (i, st) in CuePlan.steps.enumerated() {
+                guard !Task.isCancelled else { return }
+                let start = Self.nowMs(), end = start + Int64(st.seconds * 1000)
+                self.cueStage = .step(i)
+                self.cueRemaining = Int(st.seconds.rounded(.up))
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()   // 指示が変わったことを、画面を見ていなくても分かるように
+                while !Task.isCancelled, Self.nowMs() < end {
+                    self.cueRemaining = Int((Double(end - Self.nowMs()) / 1000).rounded(.up))
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                guard !Task.isCancelled, self.running else { return }
+                var e = EventRecord(tMs: end, kind: "cue", value: .text(st.kind.rawValue))
+                e.startMs = start; e.endMs = end
+                self.logger.write(e)
+            }
+            self.logger.write(EventRecord(tMs: Self.nowMs(), kind: "cue_run", value: .text("end")))
+            await self.finishCues()
+        }
+    }
+
+    /// 途中でやめる（記録には cue_run: stopped。そこまでの指示は記録に残る）
+    func stopCues() {
+        guard cueStage != nil else { return }
+        cueTask?.cancel(); cueTask = nil
+        if running { logger.write(EventRecord(tMs: Self.nowMs(), kind: "cue_run", value: .text("stopped"))) }
+        cueStage = nil
+    }
+
+    /// 記録を閉じるとき（裏に回った・記録を終えた）
+    func cancelCues() {
+        cueTask?.cancel(); cueTask = nil
+        cueStage = nil
+    }
+
+    /// 終わった：記録を読み直して結果を出し（DiffCheck --cues と同じ CueTrial.run）、その人の最大を保存する（次に普段を決めたときから下限に使う）
+    private func finishCues() async {
+        cueStage = .computing
+        guard let url = logger.flushedURL() else { cueStage = nil; cueError = "記録のファイルが見つかりませんでした"; return }
+        let name = url.lastPathComponent
+        let result: Result<CueTrial?, Error> = await Task.detached(priority: .userInitiated) {
+            Result { try CueTrial.run(data: Data(contentsOf: url), name: name) }
+        }.value
+        guard cueStage == .computing else { return }   // 計算している間に記録を閉じた
+        cueStage = nil
+        switch result {
+        case .failure(let e): cueError = "結果を出せませんでした：\(e.localizedDescription)"
+        case .success(nil): cueError = "記録に試すモードの指示がありませんでした"
+        case .success(let r?):
+            cueResult = r
+            guard !r.max.isEmpty else { return }
+            var e = EventRecord(tMs: Self.nowMs(), kind: "calibration", value: nil)
+            e.max = r.max
+            e.camera = (lensInUse ?? camera.lens).rawValue
+            logger.write(e)
+            if let p = PersonStore.shared.selected {
+                PersonStore.shared.setCalibration(p.id, PersonCalibration(savedMs: Self.nowMs(), camera: e.camera ?? "", max: r.max))
+                showMessage("\(p.displayName)の動く幅を保存しました（次に普段を決めたときから使います）")
+            }
+        }
+    }
+
+    /// 端末の熱の状態（v1.18〜、記録の event kind: "thermal"。解析のコマ/秒が落ちたときに見分けるため）
+    func writeThermal() {
+        guard running else { return }
+        let s: String = switch ProcessInfo.processInfo.thermalState {
+        case .nominal: "nominal"
+        case .fair: "fair"
+        case .serious: "serious"
+        case .critical: "critical"
+        @unknown default: "unknown"
+        }
+        logger.write(EventRecord(tMs: Self.nowMs(), kind: "thermal", value: .text(s)))
+    }
 }

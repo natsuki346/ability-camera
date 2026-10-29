@@ -492,9 +492,10 @@ struct DiffEngine {
     struct Stat { let mean: Double; let sd: Double }   // sd は下限をかけたもの
 
     /// baseline 行の1指標から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足なら nil（比べない）
-    static func stat(for m: Metric, mean: Double?, std: Double?, insufficient: Bool) -> Stat? {
+    /// floor：その普段で使う標準偏差の下限（v1.18〜、その人の最大から決めた下限。baseline 行の std_floor）。無ければ指標の下限
+    static func stat(for m: Metric, mean: Double?, std: Double?, insufficient: Bool, floor: Double? = nil) -> Stat? {
         guard !insufficient, let mean else { return nil }
-        return Stat(mean: mean, sd: max(std ?? 0, m.stdFloor))
+        return Stat(mean: mean, sd: max(std ?? 0, floor ?? m.stdFloor))
     }
 
     private enum Item {
@@ -520,6 +521,8 @@ struct DiffEngine {
     /// 最後に判定したコマで、顔の向きが普段と違うので目の指標を比べなかったか（データのタブ、v1.16〜）
     private(set) var eyesYawExcluded = false
 
+    /// 判定したコマごとの z（v1.18〜。nil でなければ足していく。試すモードの結果・DiffCheck --cues 用）
+    var zLog: [(t: Double, z: [Metric: Double])]?
     /// 今の z（判定できたコマのもの。判定できないときは入れない）
     private(set) var z: [Metric: Double] = [:]
     /// 今のならした値（判定したコマのもの。値が古いときは入れない）
@@ -646,6 +649,7 @@ struct DiffEngine {
 
         // 重なりのできごと（v1.12〜）：判定できた指標の z だけで
         coDet.step(t: x.t, z: z)
+        zLog?.append((x.t, z))
 
         // 目を閉じている：普段とは比べないが、ほかの違いと同じく普段がある間だけ、顔が読めて |yaw| < 35° のコマで判定する
         let judgeable = faceBaseline != nil && faceValid

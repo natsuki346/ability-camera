@@ -33,7 +33,7 @@ VOICE_METRICS = ["rms_db", "f0_hz"]
 # 表情のまとまり（v1.12〜、docs/research-expressions.md）：z を求め、重なりのできごと（co_change）に使う。「いつもとの違い」の区間にはしない（criteria.json の segments: false）
 GROUP_METRICS = ["orbit", "nose_lip", "mouth_tense", "cheek_raise"]
 # 顔の点の距離（v1.15〜、アプリの FaceGeometry。記録の frame の geo。|yaw| > 25° のコマには無い）
-GEO_METRICS = ["brow_eye_gap", "brow_inner_gap", "eye_open", "mouth_corner"]
+GEO_METRICS = ["brow_eye_gap", "brow_inner_gap", "eye_open", "mouth_corner", "brow_inner_eye", "brow_inner_gap2"]   # 後ろの2つは v1.18〜の眉の候補
 ALL_FACE = FACE_METRICS | set(GROUP_METRICS) | set(GEO_METRICS)
 BLINK_MASKED = ("eye_squint", "orbit", "eye_open")       # まばたきのコマと前後を使わない
 ASYM_KEYS = ["brow_down", "orbit", "mouth_smile"]   # 左右の差（左 − 右、本人から見て。v1.12〜、判定には使わない）
@@ -43,7 +43,8 @@ F0_RANGE = (70.0, 500.0)
 LABEL = {"mouth_smile": "口角を上げる", "brow_down": "眉を寄せる", "eye_squint": "目を細める",
          "jaw_open": "口を開ける", "rms_db": "声の大きさ", "f0_hz": "声の高さ",
          "orbit": "目のまわりを縮める", "nose_lip": "鼻・上唇を上げる", "mouth_tense": "口を結ぶ・横に引く", "cheek_raise": "頬を上げる",
-         "brow_eye_gap": "眉と目の間（点）", "brow_inner_gap": "眉頭の間（点）", "eye_open": "目の開き（点）", "mouth_corner": "口角の高さ（点）"}
+         "brow_eye_gap": "眉と目の間（点）", "brow_inner_gap": "眉頭の間（点）", "eye_open": "目の開き（点）", "mouth_corner": "口角の高さ（点）",
+         "brow_inner_eye": "眉頭と目頭の間（点）", "brow_inner_gap2": "眉頭の間2（点）"}
 UNIT = {"rms_db": " dB", "f0_hz": " Hz"}
 # 目を閉じている（v1.4〜）：普段とは比べず、閉じているかどうかの事実だけ（criteria.json の eyes_closed）
 EYES = "eyes_closed"
@@ -421,6 +422,59 @@ def baseline_index(rec: Recording, part: str = "face") -> np.ndarray:
         if p >= 0:
             out[i] = marks[p][1]
     return out
+
+
+def floor_of(b: dict, m: str, c: dict) -> float:
+    """その普段の標準偏差の下限：baseline 行の std_floor（v1.18〜、その人の最大から決めた下限）、無ければ criteria.json の std_floor"""
+    f = (b.get("std_floor") or {}).get(m)
+    return float(f) if f is not None else c["std_floor"][m]
+
+
+def swift_round(x: float, k: int) -> float:
+    """アプリの (x * 10^k).rounded() / 10^k と同じ丸め（0.5 は 0 から遠い方へ）"""
+    p = 10 ** k
+    return math.copysign(math.floor(abs(x) * p + 0.5), x) / p
+
+
+# 試すモード・その人の最大（v1.18〜、アプリの Cues.swift の Calibration と同じ。criteria.json の calibration）
+CALIB_FROWN = [("brow_down", 1), ("brow_eye_gap", -1), ("brow_inner_gap", -1), ("brow_inner_eye", -1), ("brow_inner_gap2", -1)]
+CALIB_SMILE = [("mouth_smile", 1), ("mouth_corner", 1)]
+
+
+def calib_floors(b: dict, mx: dict[str, float], c: dict) -> dict[str, float]:
+    """その普段で使う下限（指標の下限より小さくなるものだけ）：max(floor_min, min(今の下限, |最大 − 普段の中央値（無ければ平均）| × floor_frac))"""
+    cal = c["calibration"]
+    out = {}
+    for m, x in mx.items():
+        st = (b.get("metrics") or {}).get(m)
+        if not st or st.get("insufficient"):
+            continue
+        ref = st.get("median", st.get("mean"))
+        if ref is None:
+            continue
+        f = max(cal["floor_min"], min(c["std_floor"][m], abs(x - ref) * cal["floor_frac"]))
+        if f < c["std_floor"][m] - 1e-12:
+            out[m] = swift_round(f, 6)
+    return out
+
+
+def with_floors(rec: "Recording", c: dict, mode: str = "recorded", mx: dict[str, float] | None = None) -> "Recording":
+    """標準偏差の下限の決め方を変えた記録（アプリの ReplayData の FloorMode と同じ）。
+    recorded：記録の std_floor のまま、defaults：std_floor を使わない、calibrated：mx（その人の最大）から行ごとに決め直す"""
+    if mode == "recorded":
+        return rec
+    rec = copy.copy(rec)
+    rows = []
+    for b in rec.baselines:
+        b = dict(b)
+        b.pop("std_floor", None)
+        if mode == "calibrated" and mx:
+            f = calib_floors(b, mx, c)
+            if f:
+                b["std_floor"] = f
+        rows.append(b)
+    rec.baselines = rows
+    return rec
 
 
 # アプリ（AnalysisModel）が普段に数える条件
@@ -1032,7 +1086,7 @@ def analyze(rec: Recording, c: dict) -> Analysis:
                 continue
             sel = bidx == bi
             mean[sel] = st["mean"]
-            sd[sel] = max(st.get("std") or 0, c["std_floor"][m])
+            sd[sel] = max(st.get("std") or 0, floor_of(b, m, c))
         a.usable[m] = bool(np.isfinite(mean).any())
         a.z[m] = (a.sm[m] - mean) / sd
         ok = np.isfinite(mean)
@@ -1082,7 +1136,7 @@ def analyze(rec: Recording, c: dict) -> Analysis:
                 continue
             sel = a.bidx == bi
             mean[sel] = st["mean"]
-            sd[sel] = max(st.get("std") or 0, c["std_floor"][m])
+            sd[sel] = max(st.get("std") or 0, floor_of(b, m, c))
         a.usable[m] = bool(np.isfinite(mean).any())
         a.z[m] = (a.sm[m] - mean) / sd
         a.judge[m] = np.isfinite(mean) & a.fvalid & (~blinked if m in BLINK_MASKED else True) & (eyes_ok_m[m] if m in EYE_METRICS else True)

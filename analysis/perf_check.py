@@ -3,7 +3,7 @@
 話者の区別のオン／オフで同じ場面を記録し、両方を渡して比べる（ヘッダの speaker_on で見分ける）。
 
 v1.17〜：顔の点の距離（v1.15〜の frame の geo）があるコマと無いコマの解析時間・撮影→結果、10秒ごとの解析コマ/秒の最小と、
-前半・後半の解析コマ/秒も出す（点の距離を足したことで遅くなったか、時間がたって遅くなったか（熱など）を見分ける）。
+前半・後半の解析コマ/秒、端末の熱の状態（v1.18〜の event kind: "thermal"、記録の始まりからの秒）、探す顔の数の変更（faces_limit）も出す（点の距離を足したことで遅くなったか、時間がたって遅くなったか（熱など）を見分ける）。
 点の距離は |yaw| > 25° と顔の無いコマで求めないので、無いコマは横を向いた・顔の無いコマでもあることに気をつける。
 
 使い方：python perf_check.py 記録.jsonl ...
@@ -39,6 +39,11 @@ def summary(path: Path) -> dict:
     win_fps = [float(((t >= a) & (t < a + 10)).sum()) / 10 for a in np.arange(t[0], t[-1] - 10 + 1e-9, 10)] if dur >= 10 else []
     half = t[0] + dur / 2 if dur > 0 else 0
     fps_of = lambda sel, d: (int(sel.sum()) / d) if d > 0 else None
+    # 端末の熱の状態（v1.18〜、event kind: "thermal"）と、探す顔の数（faces_limit）
+    th = [e for e in rec.events if e.get("kind") == "thermal"]
+    thermal = " → ".join(f"{e.get('value')}@{(e['t_ms'] / 1000 - t[0]):.0f}s" for e in th) if th else None
+    fl = [e.get("count") for e in rec.events if e.get("kind") == "faces_limit" and e.get("count") is not None]
+    faces_limit = " → ".join(str(x) for x in fl) if fl else None
     f0r = np.array([r["f0_ratio"] for r in rec.speaker if r.get("f0_ratio") is not None], float)   # v1.10.2〜
     part = {k: np.array([r[k] for r in rec.speaker if r.get(k) is not None], float) for k in ("fbank_ms", "predict_ms", "wait_ms")}   # v1.10.3〜
     m = next((e for e in rec.events if e.get("kind") == "speaker_model"), None)                     # v1.10.2〜
@@ -57,7 +62,8 @@ def summary(path: Path) -> dict:
             "proc_geo_p50": pct(rec.proc_ms[pm & geo], 50), "proc_nogeo_p50": pct(rec.proc_ms[pm & face & ~geo], 50),
             "lat_geo_p50": pct(rec.lat_ms[lm & geo], 50), "lat_nogeo_p50": pct(rec.lat_ms[lm & face & ~geo], 50),
             "fps_win_min": min(win_fps) if win_fps else None,
-            "fps_first": fps_of(t < half, dur / 2), "fps_second": fps_of(t >= half, dur / 2)}
+            "fps_first": fps_of(t < half, dur / 2), "fps_second": fps_of(t >= half, dur / 2),
+            "thermal": thermal, "faces_limit": faces_limit}
 
 
 COLS = [("file", "記録", "{}"), ("speaker_on", "話者の区別", "{}"), ("duration_s", "長さ 秒", "{:.0f}"), ("fps", "解析コマ/秒", "{:.1f}"),
@@ -69,6 +75,7 @@ COLS = [("file", "記録", "{}"), ("speaker_on", "話者の区別", "{}"), ("dur
         ("proc_geo_p50", "解析時間 ms 中央値（点の距離あり）", "{:.1f}"), ("proc_nogeo_p50", "解析時間 ms 中央値（顔はあるが点の距離なし）", "{:.1f}"),
         ("lat_geo_p50", "撮影→結果 ms 中央値（点の距離あり）", "{:.0f}"), ("lat_nogeo_p50", "撮影→結果 ms 中央値（顔はあるが点の距離なし）", "{:.0f}"),
         ("fps_win_min", "10秒ごとの解析コマ/秒 最小", "{:.1f}"), ("fps_first", "解析コマ/秒 前半", "{:.1f}"), ("fps_second", "解析コマ/秒 後半", "{:.1f}"),
+        ("thermal", "端末の熱（v1.18〜）", "{}"), ("faces_limit", "探す顔の数の変更", "{}"),
         ("load_ms", "読み込み ms", "{:.0f}"), ("cached", "前に読み込んだもの", "{}"),
         ("fbank_p50", "fbank ms 中央値", "{:.1f}"), ("predict_p50", "predict ms 中央値", "{:.1f}"), ("predict_p95", "predict ms 95%", "{:.1f}"),
         ("wait_p50", "待ち ms 中央値", "{:.1f}"), ("wait_p95", "待ち ms 95%", "{:.1f}"), ("qos", "優先度", "{}"), ("units", "computeUnits", "{}")]

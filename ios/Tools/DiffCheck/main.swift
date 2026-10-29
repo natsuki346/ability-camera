@@ -8,8 +8,9 @@ if CommandLine.arguments.contains("--geo-selftest") {
     var bad: [String] = []
     let base: [Int: (x: Double, y: Double)] = [33: (100, 200), 263: (200, 200), 10: (150, 100), 152: (150, 300),
         105: (125, 170), 334: (175, 170), 159: (125, 190), 386: (175, 190), 145: (125, 200), 374: (175, 200),
-        107: (140, 172), 336: (160, 172), 13: (150, 250), 14: (150, 256), 61: (130, 248), 291: (170, 248)]
-    let want = ["brow_eye_gap": 0.2, "eye_open": 0.1, "brow_inner_gap": 0.2, "mouth_corner": 0.05]
+        107: (140, 172), 336: (160, 172), 13: (150, 250), 14: (150, 256), 61: (130, 248), 291: (170, 248),
+        55: (138, 178), 285: (162, 178), 133: (138, 200), 362: (162, 200)]   // v1.18〜：眉頭（下の縁）・目頭
+    let want = ["brow_eye_gap": 0.2, "eye_open": 0.1, "brow_inner_gap": 0.2, "mouth_corner": 0.05, "brow_inner_eye": 0.22, "brow_inner_gap2": 0.24]
     func check(_ pts: [Int: (x: Double, y: Double)], _ label: String) {
         guard let v = FaceGeometry.values(yaw: 0, { pts[$0] }) else { bad.append("\(label)：求まらない"); return }
         for (k, w) in want where abs((v[k] ?? .nan) - w) > 1.5e-3 { bad.append("\(label)：\(k) が \(v[k] ?? .nan)（\(w) のはず）") }
@@ -25,6 +26,10 @@ if CommandLine.arguments.contains("--geo-selftest") {
     if (FaceGeometry.values(yaw: 0, { smile[$0] })?["mouth_corner"] ?? 0) <= 0.05 { bad.append("口角が上がっても大きくならない") }
     var frown = base; frown[105] = (125, 180); frown[334] = (175, 180)
     if (FaceGeometry.values(yaw: 0, { frown[$0] })?["brow_eye_gap"] ?? 1) >= 0.2 { bad.append("眉が下がっても小さくならない") }
+    var inner = base; inner[55] = (142, 184); inner[285] = (158, 184)   // 眉頭が下がって寄る（v1.18〜）
+    if let v = FaceGeometry.values(yaw: 0, { inner[$0] }), (v["brow_inner_eye"] ?? 1) < 0.22, (v["brow_inner_gap2"] ?? 1) < 0.24 {} else { bad.append("眉頭が下がって寄っても小さくならない") }
+    var old = base; for i in [55, 285, 133, 362] { old[i] = nil }   // 点が足りないときは前の4つだけ
+    if let v = FaceGeometry.values(yaw: 0, { old[$0] }), v.count == 4 {} else { bad.append("点 55・285・133・362 が無いと前の4つも求めない") }
     print(bad.isEmpty ? "OK" : bad.joined(separator: "\n"))
     exit(bad.isEmpty ? 0 : 1)
 }
@@ -116,6 +121,12 @@ for path in CommandLine.arguments.dropFirst() where !path.hasPrefix("--") {
                 let line = try JSONSerialization.data(withJSONObject: o, options: [.sortedKeys])
                 print(String(decoding: line, as: UTF8.self))
             }
+            continue
+        }
+        if CommandLine.arguments.contains("--cues") {   // v1.18〜：試すモードの結果（face_check.py --cues --json と比べる）
+            let r = try CueTrial.run(data: Data(contentsOf: url), name: url.lastPathComponent)
+            let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
+            print(r.map { String(decoding: try! enc.encode($0), as: UTF8.self) } ?? "null")
             continue
         }
         if CommandLine.arguments.contains("--co") {   // v1.12〜：重なりのできごと

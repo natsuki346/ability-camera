@@ -143,12 +143,16 @@ struct EventRecord: Encodable {
     // mark（v1.13〜）：家族の印の詳しい中身（家族の言葉。選んだら同じ行に書き直す）と、付けた時刻
     var detail: String?
     var detailAt: Int64?
+    // cue（v1.18〜、試すモードの指示。t_ms は終わり）：指示の始まり・終わり
+    var startMs: Int64?
+    // calibration（v1.18〜）：その人の最大（指標 → 値）
+    var max: [String: Double]?
 
     enum CodingKeys: String, CodingKey {
         case type, tMs = "t_ms", kind, value, faceReadable = "face_readable", source, by
         case clockCorrected = "clock_corrected", head, from, yawDeg = "yaw_deg", camera, count, baseline, personId = "person_id", savedCamera = "saved_camera", mirrorCorrected = "mirror_corrected", orientationVersion = "camera_orientation_version", part, median, iqr
         case collect, validS = "valid_s", score, computedS = "computed_s", notSelfS = "not_self_s", noF0S = "no_f0_s", noFramesS = "no_frames_s", final, gateVersion = "gate_version", cached, computeUnits = "compute_units", loadMs = "load_ms", plan, audio
-        case endMs = "end_ms", durationS = "duration_s", above, metrics, groups, atEnd = "at_end", ratio, windowS = "window_s", faceFrames = "face_frames", closedFrames = "closed_frames", detail, detailAt = "detail_at"
+        case endMs = "end_ms", durationS = "duration_s", above, metrics, groups, atEnd = "at_end", ratio, windowS = "window_s", faceFrames = "face_frames", closedFrames = "closed_frames", detail, detailAt = "detail_at", startMs = "start_ms", max
     }
 }
 
@@ -188,13 +192,15 @@ struct BaselineRecord: Encodable {
     var voiceDays: Int?         // voice：集めた日の数（v1.7〜）
     var voiceCarriedS: Double?  // voice：前のセッションまでに集めていた本人の声の秒数（v1.7〜）
     var eyesClosedS: Double?    // 普段の間に目を閉じていた秒数（v1.4〜。目を閉じているの決まりで、数えたコマから。保存した普段には無い）
+    var stdFloor: [String: Double]?   // その人の最大から決めた標準偏差の下限（v1.18〜。指標の下限より小さくしたものだけ。振り返りレポート・リプレイもこれで比べる）
+    var calibMs: Int64?           // そのとき使ったその人の最大を保存した日時（v1.18〜）
     var fromTodayYawDeg: Double?  // from_today の指標の普段の yaw（今日の普段の yaw の中央値、v1.17〜。目の指標を顔の向きで外すのに使う）
     var fromToday: [String]?    // 保存した普段に無かったので、今日の普段から足した指標（v1.15〜。saved の行で、この時刻からその指標も比べる）
     var asym: [String: Stat]?   // 左右の差（左 − 右、本人から見て）の普段（v1.12〜。brow_down・orbit・mouth_smile。判定には使わず、振り返りレポートで比べる）
 
     enum CodingKeys: String, CodingKey {
         case source, compared, savedMs = "saved_ms", camera, faceBox = "face_box", pose, eyesClosedS = "eyes_closed_s", part, voiceValidS = "voice_valid_s"
-        case voiceSessions = "voice_sessions", voiceDays = "voice_days", voiceCarriedS = "voice_carried_s", asym, fromToday = "from_today", fromTodayYawDeg = "from_today_yaw_deg"
+        case voiceSessions = "voice_sessions", voiceDays = "voice_days", voiceCarriedS = "voice_carried_s", asym, fromToday = "from_today", fromTodayYawDeg = "from_today_yaw_deg", stdFloor = "std_floor", calibMs = "calib_ms"
         case type, tMs = "t_ms", startedMs = "started_ms", wallS = "wall_s", validS = "valid_s"
         case yawLimitDeg = "yaw_limit_deg", warmupS = "warmup_s", minN = "min_n", targetS = "target_s", blinkMasked = "blink_masked", metrics
     }
@@ -302,6 +308,14 @@ final class SessionLogger {
 
     /// 書いた分を端末に書き出す（このあと終了されても、次に開いたときに読み直せるように）
     func flush() { queue.async { try? self.handle?.synchronize() } }
+
+    /// それまでに頼んだ書き込みを終えて書き出し、記録中のファイルの場所を返す（v1.18〜、試すモードの結果を記録から読み直すため）
+    func flushedURL() -> URL? {
+        queue.sync {
+            try? handle?.synchronize()
+            return fileName.map { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent($0) }
+        }
+    }
 
     /// ファイルを閉じて、このセッションの要約を返す
     func finish() -> SessionSummary? {

@@ -138,7 +138,8 @@ struct CameraShell: View {
                     ContentView(model: model, openMenu: menu)
                 }
             case .history: CameraHistoryView(sessions: model.sessions, openMenu: menu)
-            case .settings: SettingsView(link: model.link, inSidebar: true, openMenu: menu)
+            case .settings: SettingsView(link: model.link, inSidebar: true, openMenu: menu,
+                                         startCues: { page = .now; model.startCues() })   // 試すモードは「いま」で出す（v1.18〜）
             }
         }
         .onChange(of: cameraLens) { model.applyLens() }   // 設定で広角／超広角を変えた

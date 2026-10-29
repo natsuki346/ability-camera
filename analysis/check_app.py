@@ -2,7 +2,7 @@
 """アプリ（撮る側・リプレイの DiffEngine）と振り返りレポート（review.py）で、同じ記録の区間が一致するかを確かめる（Mac のみ）。
 
 ios/Tools/DiffCheck と、アプリのファイル（Replay.swift など）を swiftc でビルドし、記録を両方に流して比べる。
-比べるもの：区間の数・種類（指標と向き / 目を閉じている）・開始の時刻・終了の時刻・ピークの z。重なりのできごと（v1.12〜）の数・時刻・向き・指標。
+比べるもの：区間の数・種類（指標と向き / 目を閉じている）・開始の時刻・終了の時刻・ピークの z。重なりのできごと（v1.12〜）の数・時刻・向き・指標。試すモード（v1.18〜）の結果（DiffCheck --cues と face_check.py --cues）。
 記録の終わりで打ち切った区間の終了の時刻は比べない（アプリは最後に続いていたコマ、レポートは最後のコマにするため）。
 
 使い方：python check_app.py 記録.jsonl ...      一致すれば 0、違えば 1 を返す
@@ -21,7 +21,7 @@ import review
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / "ios" / "AbilityCam"
-SOURCES = [APP / n for n in ("Replay.swift", "FaceSketch.swift", "HeadTurn.swift", "Baseline.swift", "DiffEngine.swift", "Pitch.swift", "MarkDetail.swift")] \
+SOURCES = [APP / n for n in ("Replay.swift", "FaceSketch.swift", "HeadTurn.swift", "Baseline.swift", "DiffEngine.swift", "Pitch.swift", "MarkDetail.swift", "Cues.swift")] \
     + [ROOT / "ios" / "Tools" / "DiffCheck" / "main.swift"]
 TOL_S = 0.0015      # 時刻は ms で書かれているので、1.5ms までの差は同じとみなす
 TOL_Z = 1e-6
@@ -123,6 +123,37 @@ def compare_co(path: Path, exe: Path, c: dict) -> tuple[list[str], int]:
     return out, len(rep)
 
 
+def diff_json(x, y, where: str = "", tol: float = 1e-6) -> list[str]:
+    """2つの JSON の値の違い（数は tol まで同じとみなす）"""
+    if isinstance(x, dict) and isinstance(y, dict):
+        out = []
+        for k in sorted(set(x) | set(y)):
+            if k not in x or k not in y:
+                out.append(f"{where}.{k}：片方にしか無い（アプリ {x.get(k)} / レポート {y.get(k)}）")
+            else:
+                out += diff_json(x[k], y[k], f"{where}.{k}", tol)
+        return out
+    if isinstance(x, list) and isinstance(y, list):
+        if len(x) != len(y):
+            return [f"{where}：数が違う（アプリ {len(x)} / レポート {len(y)}）"]
+        return [d for i, (a, b) in enumerate(zip(x, y)) for d in diff_json(a, b, f"{where}[{i}]", tol)]
+    if isinstance(x, (int, float)) and isinstance(y, (int, float)) and not isinstance(x, bool) and not isinstance(y, bool):
+        return [] if abs(x - y) <= tol else [f"{where}：アプリ {x} / レポート {y}"]
+    return [] if x == y else [f"{where}：アプリ {x} / レポート {y}"]
+
+
+def compare_cues(path: Path, exe: Path, c: dict) -> tuple[list[str], bool]:
+    """試すモード（v1.18〜）：アプリ（DiffCheck --cues）と face_check.py --cues の結果（その人の最大・下限を変える前と後の表）を比べる。
+    返り値：(違い, 試すモードの指示があったか)"""
+    import face_check
+    p = subprocess.run([str(exe), "--cues", str(path)], check=True, capture_output=True, text=True)
+    app = json.loads(p.stdout.strip() or "null")
+    rep = face_check.cue_trial(review.load(path), c)
+    if app is None and rep is None:
+        return [], False
+    return diff_json(app, rep, "試すモード", tol=2e-3), True
+
+
 def main(argv=None) -> int:
     args = [Path(x) for x in (argv if argv is not None else sys.argv[1:])]
     if not args:
@@ -137,11 +168,13 @@ def main(argv=None) -> int:
         diffs += vd[:10] + ([f"ほか本人の声の判定の違い {len(vd) - 10}件"] if len(vd) > 10 else [])
         cd, nco = compare_co(p, exe, c)   # 重なりのできごと（v1.12〜）
         diffs += cd
+        qd, has_cues = compare_cues(p, exe, c)   # 試すモード（v1.18〜）
+        diffs += qd
         kinds = {}
         for s in report_segments(p, c):
             kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
         detail = "、".join(f"{review.LABEL[k]} {v}" for k, v in sorted(kinds.items(), key=lambda kv: review.SEG_KINDS.index(kv[0])))
-        print(f"{p.name}: {'一致' if not diffs else '違いあり'}（区間 {n}件{'：' + detail if detail else ''}・重なり {nco}件）")
+        print(f"{p.name}: {'一致' if not diffs else '違いあり'}（区間 {n}件{'：' + detail if detail else ''}・重なり {nco}件{'・試すモードの結果' if has_cues else ''}）")
         for d in diffs:
             print("  " + d)
         bad += bool(diffs)

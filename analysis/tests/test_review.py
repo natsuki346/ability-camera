@@ -2000,11 +2000,12 @@ class CoChangeTest(unittest.TestCase):
         g = c["geometry"]
         self.assertEqual(float(re.search(r"static let maxYaw = ([\d.]+)", base).group(1)), g["max_yaw_deg"])
         for k, swift in (("eye_outer", "eyeOuter"), ("brow_mid", "browMid"), ("upper_lid", "upperLid"), ("lower_lid", "lowerLid"),
-                         ("brow_inner", "browInner"), ("mouth_center", "mouthCenter"), ("mouth_corners", "mouthCorners")):
+                         ("brow_inner", "browInner"), ("mouth_center", "mouthCenter"), ("mouth_corners", "mouthCorners"),
+                         ("brow_inner2", "browInner2"), ("inner_canthus", "innerCanthus")):
             a_, b_ = re.search(rf"{swift} = \((\d+), (\d+)\)", base).groups()
             self.assertEqual([int(a_), int(b_)], g["points"][k], k)
         self.assertEqual(float(re.search(r"static let flatRange = ([\d.]+)", src).group(1)), g["flat_range"])
-        self.assertIn("case .browEyeGap, .browInnerGap, .eyeOpen, .mouthCorner: 0.01", base)
+        self.assertIn("case .browEyeGap, .browInnerGap, .eyeOpen, .mouthCorner, .browInnerEye, .browInnerGap2: 0.01", base)
         for m in review.GEO_METRICS:
             self.assertEqual(c["std_floor"][m], 0.01)
             self.assertFalse(c["metrics"][m]["segments"])
@@ -2201,3 +2202,74 @@ class PaletteTest(unittest.TestCase):
                 deg = hue * 360
                 if sat > 0.45:
                     self.assertFalse(deg < 20 or deg > 340 or 45 <= deg <= 70 or 80 <= deg <= 160, (name, hex(h), deg))
+
+
+class CueTest(unittest.TestCase):
+    """試すモード（v1.18〜）：face_check.py --cues の結果・その人の最大・下限を変える前と後・アプリ（DiffCheck --cues）と一致・決まりの値が同じ"""
+    FIX = Path(__file__).with_name("fixture_cues.jsonl")
+
+    def test_trial(self):
+        import face_check
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        rec = review.load(self.FIX)
+        tr = face_check.cue_trial(rec, c)
+        self.assertEqual(tr["max"], {"brow_down": 0.15, "brow_eye_gap": 0.19, "brow_inner_gap": 0.195, "brow_inner_eye": 0.18,
+                                     "brow_inner_gap2": 0.22, "mouth_smile": 0.9, "mouth_corner": 0.08})
+        hit = lambda rep, k: next(h for h in rep["hits"] if h["kind"] == k)
+        row = lambda rep, m, k: next(r for r in rep["rows"] if r["metric"] == m and r["kind"] == k)
+        # 今の下限 0.03 では browDown 0.01 → 0.06 は z≈1.7 で出ない。最大 0.15 から決めた下限 0.014 では 4回（3回目は動かしていない）
+        self.assertEqual((hit(tr["before"], "frown")["hit"], hit(tr["after"], "frown")["hit"]), (0, 4))
+        self.assertEqual(hit(tr["before"], "smile")["hit"], 5)
+        # 点の眉の候補：brow_inner_eye は z が出て、brow_inner_gap はほとんど動かない
+        self.assertEqual(row(tr["before"], "brow_inner_eye", "frown")["hit"], 4)
+        self.assertEqual(row(tr["before"], "brow_inner_gap", "frown")["hit"], 0)
+        self.assertEqual(row(tr["before"], "mouth_smile", "frown")["hit"], 0)
+        # 何もしない・横を向く・戻すの間に違いは出ない（作り物なので）
+        for rep in (tr["before"], tr["after"]):
+            self.assertEqual({q["kind"]: q["seconds"] for q in rep["quiet"]}, {"calm": 60.0, "turn": 20.0, "rest": 36.0})
+            self.assertTrue(all(q["diffs"] == 0 and q["co"] == 0 for q in rep["quiet"]))
+        text = "\n".join(face_check.cue_text(tr))
+        self.assertIn("眉を寄せる：いつもとの違いが出た 4／5回", text)
+        for w in ("痛み", "発作", "眠気", "正常", "異常"):
+            self.assertNotIn(w, text)
+
+    def test_floors(self):
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        b = {"metrics": {"brow_down": {"mean": 0.01, "median": 0.01, "std": 0.002},
+                         "mouth_smile": {"mean": 0.1, "std": 0.02},                 # 中央値の無い普段は平均
+                         "brow_inner_eye": {"mean": 0.22, "median": 0.22, "std": 0.003},
+                         "jaw_open": {"insufficient": True}}}
+        f = review.calib_floors(b, {"brow_down": 0.15, "mouth_smile": 0.9, "brow_inner_eye": 0.2199, "jaw_open": 0.5}, c)
+        # 0.014 < 0.03 は使う。0.08 は今の下限 0.03 より大きいので書かない。動かなかった指標は floor_min。データ不足は決めない
+        self.assertEqual(f, {"brow_down": 0.014, "brow_inner_eye": 0.001})
+        rec = review.load(self.FIX)
+        r2 = review.with_floors(rec, c, "calibrated", {"brow_down": 0.15})
+        self.assertEqual(r2.baselines[0]["std_floor"], {"brow_down": 0.014})
+        self.assertNotIn("std_floor", rec.baselines[0])
+        self.assertNotIn("std_floor", review.with_floors(r2, c, "defaults").baselines[0])
+
+    def test_app_and_criteria(self):
+        import json
+        import re
+        import shutil
+        src = (review.HERE.parent / "ios" / "AbilityCam" / "Cues.swift").read_text(encoding="utf-8")
+        c = json.loads((review.HERE / "criteria.json").read_text(encoding="utf-8"))
+        num = lambda name: float(re.search(rf"static let {name} = ([\d.]+)", src).group(1))
+        cal, cc = c["calibration"], c["cues"]
+        self.assertEqual((num("q"), num("minN"), num("floorFrac"), num("floorMin")), (cal["q"], cal["min_n"], cal["floor_frac"], cal["floor_min"]))
+        self.assertEqual((num("graceS"), num("hitZ")), (cc["grace_s"], cc["hit_z"]))
+        rv = {"browDown": "brow_down", "browEyeGap": "brow_eye_gap", "browInnerGap": "brow_inner_gap", "browInnerEye": "brow_inner_eye",
+              "browInnerGap2": "brow_inner_gap2", "mouthSmile": "mouth_smile", "mouthCorner": "mouth_corner"}
+        def lst(name):
+            body = re.search(rf"static let {name}: \[\(m: Metric, sign: Double\)\] = \[([^\]]*)\]", src).group(1)
+            return [("-" if sg == "-1" else "") + rv[m] for m, sg in re.findall(r"\(\.(\w+), (-?1)\)", body)]
+        self.assertEqual(lst("frown"), cal["frown"])
+        self.assertEqual(lst("smile"), cal["smile"])
+        self.assertEqual(lst("frown") + lst("smile"), cc["metrics"])
+        self.assertIn("[.frown: .browDown, .smile: .mouthSmile]", src)
+        if not shutil.which("swiftc"):
+            self.skipTest("swiftc が無い")
+        import check_app
+        diffs, has = check_app.compare_cues(self.FIX, check_app.build(), review.load_criteria(review.HERE / "criteria.json", []))
+        self.assertTrue(has)
+        self.assertEqual(diffs, [])

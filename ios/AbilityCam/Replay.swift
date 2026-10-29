@@ -59,6 +59,16 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
     let detailOptions: MarkDetails
     /// 読んだファイル（あとから詳しい中身を書くとき。見る側で開いたものは、選んだファイルそのもの）
     var sourceURL: URL?
+    /// 試すモードの指示（v1.18〜、記録の event kind: "cue"）と、その人の最大（kind: "calibration" の max。最後のもの）
+    let cues: [Cue]
+    let calibMax: [Metric: Double]?
+    /// keepZ のとき：判定したコマごとの z と、顔のあるコマの生の値（試すモードの結果・DiffCheck --cues 用）
+    let zLog: [(t: Double, z: [Metric: Double])]
+    let rawFace: [(t: Double, v: [Metric: Double])]
+
+    /// 標準偏差の下限の決め方（v1.18〜）。recorded：記録の baseline 行の std_floor（無ければ指標の下限）。defaults：いつも指標の下限。
+    /// calibrated：その人の最大から、行ごとに決め直した下限（Calibration.floors。試すモードの「下限を変えた後」）
+    enum FloorMode { case recorded, defaults, calibrated([Metric: Double]) }
 
     enum LoadError: LocalizedError {
         case empty
@@ -66,7 +76,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
     }
 
     /// 重いので裏のスレッドで呼ぶ
-    init(data: Data, name: String) throws {
+    init(data: Data, name: String, floorMode: FloorMode = .recorded, keepZ: Bool = false) throws {
         self.name = name
         var header: [String: Any] = [:]
         var frames: [[String: Any]] = []
@@ -170,6 +180,18 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             guard let bt = ms(b), (b["compared"] as? Bool) != false else { continue }
             let metrics = b["metrics"] as? [String: [String: Any]] ?? [:]
             var stats: [Metric: DiffEngine.Stat] = [:]
+            // 標準偏差の下限（v1.18〜）
+            let recFloor = (b["std_floor"] as? [String: Any] ?? [:]).compactMapValues { ($0 as? NSNumber)?.doubleValue }
+            var floors: [Metric: Double] = [:]
+            switch floorMode {
+            case .recorded: for m in Metric.allCases { if let f = recFloor[m.rawValue] { floors[m] = f } }
+            case .defaults: break
+            case .calibrated(let mx):
+                floors = Calibration.floors(ref: { m in
+                    guard let st = metrics[m.rawValue], (st["insufficient"] as? Bool) != true else { return nil }
+                    return ((st["median"] as? NSNumber) ?? (st["mean"] as? NSNumber))?.doubleValue
+                }, max: mx)
+            }
             for m in Metric.allCases {
                 var st = metrics[m.rawValue] ?? [:]
                 if m == .eyeSquint, (b["blink_masked"] as? Bool) != true {
@@ -178,7 +200,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
                 }
                 if let s = DiffEngine.stat(for: m, mean: (st["mean"] as? NSNumber)?.doubleValue,
                                            std: (st["std"] as? NSNumber)?.doubleValue,
-                                           insufficient: (st["insufficient"] as? Bool) ?? true) {
+                                           insufficient: (st["insufficient"] as? Bool) ?? true, floor: floors[m]) {
                     stats[m] = s
                 }
             }
@@ -203,6 +225,8 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
 
         // いつもとの違い：撮る側と同じ決まりで、コマを順に流す
         var engine = DiffEngine()
+        if keepZ { engine.zLog = [] }
+        var raws: [(t: Double, v: [Metric: Double])] = []
         var voiceTracker = VoiceSelfTracker()
         // 保存した声の普段の行（source: saved、声を含む行）の時刻と f0 の平均・標準偏差（データ不足なら使わない）
         // 中央値の無い行（v1.9 までに保存した声の普段）は使わない（review.py の pitch_ranges と同じ）
@@ -242,6 +266,7 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
             if face[i] {   // 表情のまとまり（v1.12〜）と顔の点の距離（v1.15〜）も（重なりのできごとに使う）
                 fv = Metric.faceValues { bsList[i][$0] ?? 0 }.merging(Metric.geometryValues(geoList[i])) { a, _ in a }
             }
+            if keepZ && !fv.isEmpty { raws.append((t[i], fv)) }
             var voice: [Metric: Double] = [:]
             if let r = rms[i] { voice[.rmsDb] = r }
             if let f = f0[i] { voice[.f0Hz] = f }
@@ -265,6 +290,19 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         segs += engine.finished
         segments = segs.filter(\.shown).sorted { $0.startT < $1.startT }
         coChanges = engine.coDet.finished
+        zLog = engine.zLog ?? []
+        rawFace = raws
+        // 試すモード（v1.18〜）
+        cues = evs.compactMap { e in
+            guard e["kind"] as? String == "cue", let k = CueKind(rawValue: e["value"] as? String ?? ""),
+                  let s = ms(e, "start_ms"), let en = ms(e, "end_ms") else { return nil }
+            return Cue(kind: k, start: s, end: en)
+        }
+        calibMax = evs.last { $0["kind"] as? String == "calibration" }.flatMap { e in
+            (e["max"] as? [String: Any]).map { d in
+                Dictionary(uniqueKeysWithValues: d.compactMap { k, v in Metric(rawValue: k).flatMap { m in (v as? NSNumber).map { (m, $0.doubleValue) } } })
+            }
+        }
         selfVoiceS = selfS; otherVoiceS = otherS
         voiceDetail = detail
         noBaseline = noBase

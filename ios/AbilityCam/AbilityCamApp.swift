@@ -62,6 +62,7 @@ struct SettingsView: View {
     var link: CameraLink? = nil   // 撮る側のときだけ
     var inSidebar = false         // サイドバーの「設定」として出す（閉じるボタンは出さない）
     var openMenu: (() -> Void)? = nil
+    var startCues: (() -> Void)? = nil   // 試すモードを始める（v1.18〜、撮る側だけ）
     @AppStorage("role") private var role = ""
     @AppStorage("deviceName") private var deviceName = ""
     @AppStorage("sendVideo") private var sendVideo = false
@@ -141,6 +142,16 @@ struct SettingsView: View {
                                 Text("切り替えは次の記録から効きます").font(.caption.bold())
                             }
                             Text("初めはオフ。オンのあいだは、声が出ている間（声の高さが取れている、または声の大きさが -52dB 以上）0.5秒ごとに声の特徴を数値にし、設定の「人」で声を登録した人ごとの似ている度合いを記録に書きます（type: \"speaker\" の行）。画面には出しません。声の特徴の数値はこの端末の persons.json の中だけで、記録にも見る側にも送りません。本人確認・認証には使いません。次に記録を始めたときから使います")
+                        }
+                    }
+                    if let startCues {
+                        Section {
+                            DisclosureGroup("確かめる用：試すモード") {
+                                Button("試すモードを始める") { startCues() }
+                                    .disabled(!people.inSession)
+                                Text("自分の顔で、指示どおりに動かして「いつもとの違い」が出るかを確かめるもの（約\(Int((CuePlan.totalS / 60).rounded()))分と、始める前に普段を取り直す時間）。始めると「普段を取り直す（表情だけ）」をしてから、画面に大きく指示を出します：何もしない・眉を寄せる×5・笑う×5・顔を横に向ける・何もしない・いちばん強く眉を寄せる・いちばん大きく笑う。指示ごとに記録へ書き（event kind: cue）、終わったら結果を出し、その人の動く幅を保存します。記録中だけ使えます")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                         }
                     }
                     Section {

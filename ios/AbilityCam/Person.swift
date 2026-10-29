@@ -23,6 +23,19 @@ struct SavedBaseline: Codable, Equatable {
     var savedDate: Date { Date(timeIntervalSince1970: Double(savedMs) / 1000) }
 }
 
+/// その人の動く幅（v1.18〜）：試すモードの「いちばん強く眉を寄せる」「いちばん大きく笑う」の間の値の p95（小さくなる点の距離は p5）。
+/// その人の普段で比べるとき、標準偏差の下限を指標ごとに min(今の下限, |最大 − 普段の中央値| × 10%) にする（Calibration.floors）
+struct PersonCalibration: Codable, Equatable {
+    let savedMs: Int64
+    let camera: String
+    let max: [String: Double]
+
+    var metricMax: [Metric: Double] {
+        Dictionary(uniqueKeysWithValues: max.compactMap { k, v in Metric(rawValue: k).map { ($0, v) } })
+    }
+    enum CodingKeys: String, CodingKey { case savedMs = "saved_ms", camera, max }
+}
+
 /// 保存した声の普段（v1.6〜）：本人の声のコマだけで集めた声の大きさ・高さ
 struct SavedVoice: Codable, Equatable {
     let metrics: [String: BaselineRecord.Stat]   // rms_db / f0_hz
@@ -51,6 +64,7 @@ struct Person: Codable, Identifiable, Equatable {
     var speaker: SpeakerEnrollment?              // 声の登録（話者の区別、v1.10〜）。声の特徴の数値と、だれが同意したか。この端末の中だけ（バックアップにも入れない）
     var speakerPartial: SpeakerEnrollPartial?    // 途中まで集めた声の登録（14日で捨てる）
     var markDetails: MarkDetails?                // 家族の印の詳しい中身の選択肢（v1.13〜。nil なら初めの選択肢）
+    var calibration: PersonCalibration?          // その人の動く幅（v1.18〜、試すモードの「いちばん強く・大きく」から）
 
     var markOptions: MarkDetails { markDetails ?? .initial }
 
@@ -63,7 +77,7 @@ struct Person: Codable, Identifiable, Equatable {
     init(id: String, name: String) { self.id = id; self.name = name }
 
     enum CodingKeys: String, CodingKey { case id, name, savedByCamera = "saved_by_camera", voice, saved, voicePartial = "voice_partial", voiceRetakePending = "voice_retake_pending"
-        case speaker, speakerPartial = "speaker_partial", markDetails = "mark_details" }
+        case speaker, speakerPartial = "speaker_partial", markDetails = "mark_details", calibration }
 
     /// v1.6 までの persons.json（saved が1つ）は、そのカメラの普段として移す。声の普段は人ごとに移す
     init(from decoder: Decoder) throws {
@@ -77,6 +91,7 @@ struct Person: Codable, Identifiable, Equatable {
         speaker = try c.decodeIfPresent(SpeakerEnrollment.self, forKey: .speaker)
         speakerPartial = try c.decodeIfPresent(SpeakerEnrollPartial.self, forKey: .speakerPartial)
         markDetails = try c.decodeIfPresent(MarkDetails.self, forKey: .markDetails)
+        calibration = try c.decodeIfPresent(PersonCalibration.self, forKey: .calibration)
         if var old = try c.decodeIfPresent(SavedBaseline.self, forKey: .saved) {
             if voice == nil { voice = old.voice }
             old.voice = nil
@@ -95,6 +110,7 @@ struct Person: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(speaker, forKey: .speaker)
         try c.encodeIfPresent(speakerPartial, forKey: .speakerPartial)
         try c.encodeIfPresent(markDetails, forKey: .markDetails)
+        try c.encodeIfPresent(calibration, forKey: .calibration)
     }
 }
 
@@ -242,6 +258,13 @@ final class PersonStore: ObservableObject {
     }
 
     /// 家族の印の詳しい中身の選択肢を置き換える（v1.13〜）
+    /// その人の最大を保存する・消す（v1.18〜）
+    func setCalibration(_ id: String, _ c: PersonCalibration?) {
+        guard let i = people.firstIndex(where: { $0.id == id }) else { return }
+        people[i].calibration = c
+        save()
+    }
+
     func setMarkDetails(_ id: String, _ d: MarkDetails) {
         guard let i = people.firstIndex(where: { $0.id == id }) else { return }
         people[i].markDetails = d

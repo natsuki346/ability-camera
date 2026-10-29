@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-29.6",
+  "version": "2026-10-29.7",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -76,6 +76,10 @@
     {
       "date": "2026-10-29",
       "reason": "v1.15（記録 ability-cam-20261029-192557、前面から）：この人の顔では blendshape の一部がほとんど動かなかった（browDown はほとんどの区間で 0.01 前後・最大 0.26、cheekSquint と noseSneer は記録全体で 0.00、mouthSmile は最大 0.24。eyeSquint 0.7・jawOpen 0.9 は動いていた）。顔の点（478点）から距離の指標を足した：brow_eye_gap（眉の中央と上まぶたの縦の距離、左右の平均）・brow_inner_gap（左右の眉頭の距離）・eye_open（上下のまぶたの距離、左右の平均。まばたきを外す）・mouth_corner（口の中央に対する口角の高さ）。どれも左右の目尻（33・263）の距離で割り、縦は額（10）からあご（152）への向きに沿って測る。|yaw| > 25°（geometry.max_yaw_deg）のコマは普段にも比べるのにも使わない（アプリが記録に書かない）。普段・保存した普段・z・データのタブ・co_change の対象に入れ、「いつもとの違い」の区間にはしない（segments: false）。co_change では、眉を寄せる・目を細めると小さくなる距離は向きを逆にして見る（groups の \"-brow_eye_gap\" など）。std_floor 0.01・flat_range 0.01 は仮の値。blendshape の眉と点の眉のどちらを判定に使うかはまだ決めず、face_check.py で区間ごとに比べる。保存した普段に無い指標は、うしろで集めた今日の普段がたまったら、その指標だけ比べ始める（baseline 行の from_today）。アプリ（Baseline.swift の FaceGeometry・Metric、DiffEngine.swift）と同じ値。"
+    },
+    {
+      "date": "2026-10-29",
+      "reason": "v1.16（記録 ability-cam-20261029-213623、前面から）：何もしない 108〜140秒に eye_open の z +2〜3・eye_squint の「いつもより強い」が何度も出た。普段を取ったときは yaw 13〜21°、後半は 5° くらいで、目の値が顔の向きでずれていた。目の指標（eye_squint・orbit・eye_open）は、yaw（直近1秒）が表情の普段の yaw の中央値（baseline 行の pose.yaw_deg.median、無い古い普段は平均）から eye_yaw_tolerance_deg（10°、仮の値）以上ずれたコマでは比べない（z を出さない）。co_change：brow_eye_gap を外した（眉を寄せた 65〜67・81〜91秒に変わらず、普段の標準偏差 0.021 の方が大きかった。記録は続ける）。目のまとまり（eyes：orbit・eye_open・eye_squint）は secondary_groups で、ほかのまとまり（眉・口角・口・鼻と上唇・声）が入っているときだけ数える。続いている重なりで、入っている表情のまとまり（split_groups：眉・鼻と上唇・口の緊張・口角）が前と1つも重ならなくなったら別のできごとに分ける（84.7秒からの 17.7秒が、眉 → 口角までつながっていたため）。アプリ（DiffEngine.swift の DiffCriteria）と同じ値。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -221,6 +225,8 @@
     "min_face_ratio": 0.5,
     "max_abs_yaw_deg": 35.0
   },
+  "eye_yaw_tolerance_deg": 10.0,
+  "_eye_yaw_note": "目の指標（eye_squint・orbit・eye_open）は、yaw（直近 stale_s 秒）が表情の普段の yaw の中央値（pose.yaw_deg.median、無ければ mean）からこれ以上ずれたコマでは比べない（v1.16〜、仮の値）",
   "eyes_closed": {
     "_note": "目を閉じている（v1.4〜）。普段とは比べない。threshold 以上が start_min_s 秒以上続いたら区間、threshold 未満が end_open_s 秒続いたら終わり。普段がある間の face_valid のコマだけ。通知候補には入れない",
     "threshold": 0.5,
@@ -265,7 +271,7 @@
     "mark_window_s": 10.0
   },
   "co_change": {
-    "_note": "重なりのできごと（v1.12〜、記録の event kind: \"co_change\"）。まとまり（groups）のうち、z が同じ向きに z_min 以上（下なら −z_min 以下）のメンバーがあるものが min_groups 以上（表情のまとまりを1つ以上含む）のコマが、min_overlap_s 秒以上続いたら1つのできごとを始める。そういうコマが window_s 秒来なかったら終わり（終わりは最後にそうだったコマ）。続いている間の指標・まとまりは全部書く。状態の名前は付けない。すべて仮の値で、記録で決め直す（docs/validation-log.md）。アプリ（DiffEngine.swift の DiffCriteria.co*）と同じ値。v1.15〜：groups の名前の前の \"-\" は、その指標の z を逆の向きで見る（眉を寄せる・目を細めると小さくなる顔の点の距離）",
+    "_note": "重なりのできごと（v1.12〜、記録の event kind: \"co_change\"）。まとまり（groups）のうち、z が同じ向きに z_min 以上（下なら −z_min 以下）のメンバーがあるものが min_groups 以上（表情のまとまりを1つ以上含む）のコマが、min_overlap_s 秒以上続いたら1つのできごとを始める。そういうコマが window_s 秒来なかったら終わり（終わりは最後にそうだったコマ）。続いている間の指標・まとまりは全部書く。状態の名前は付けない。すべて仮の値で、記録で決め直す（docs/validation-log.md）。アプリ（DiffEngine.swift の DiffCriteria.co*）と同じ値。v1.15〜：groups の名前の前の \"-\" は、その指標の z を逆の向きで見る（眉を寄せる・目を細めると小さくなる顔の点の距離）。v1.16〜：secondary_groups（目）は、ほかのまとまりが入っているときだけ数える。続いている重なりで、入っている split_groups が前と1つも重ならなくなったら別のできごとに分ける",
     "provisional": true,
     "z_min": 2.0,
     "min_groups": 2,
@@ -274,12 +280,12 @@
     "groups": {
       "brow": [
         "brow_down",
-        "-brow_eye_gap",
         "-brow_inner_gap"
       ],
-      "orbit": [
+      "eyes": [
         "orbit",
-        "-eye_open"
+        "-eye_open",
+        "eye_squint"
       ],
       "nose_lip": [
         "nose_lip"
@@ -296,7 +302,16 @@
         "f0_hz"
       ]
     },
-    "mark_window_s": 10.0
+    "mark_window_s": 10.0,
+    "secondary_groups": [
+      "eyes"
+    ],
+    "split_groups": [
+      "brow",
+      "nose_lip",
+      "mouth_tense",
+      "smile"
+    ]
   },
   "eyes_closed_ratio": {
     "_note": "目を閉じている割合（v1.12〜、記録の event kind: \"eyes_closed_ratio\"）。直近 window_s 秒の顔のあるコマのうち、eyeBlink 左右平均 ≥ eyes_closed.threshold が eyes_closed.start_min_s 秒以上続いたまとまり（顔の無いコマで切る）に入るコマの割合。アプリは step_s 秒ごとに書く。判定・通知には使わない",

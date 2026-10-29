@@ -254,6 +254,7 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, minHeight: 52)
                             .foregroundStyle(on ? Color.white : Self.navy)
                             .background(on ? Self.navy : Self.paleSlate, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))   // ボタン全体で押せる
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(on ? .isSelected : [])
@@ -262,6 +263,7 @@ struct ContentView: View {
         }
         .disabled(!model.running)
         .opacity(model.running ? 1 : 0.5)
+        .sensoryFeedback(.selection, trigger: model.scene)   // 押したことが分かるように（v1.16〜）
     }
 }
 

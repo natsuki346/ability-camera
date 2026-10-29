@@ -72,10 +72,17 @@ enum DiffCriteria {
     static let coMinOverlapS = 0.5
     static let coWindowS = 5.0
     /// sign：その指標の z をこの向きで見る（v1.15〜の顔の点の距離は、眉を寄せる・目を細めると小さくなるので −1。criteria.json では "-brow_eye_gap"）
+    /// v1.16〜：brow_eye_gap は外した（記録は続ける）。目のまとまり（eyes：orbit・eye_open・eye_squint）は coSecondary：
+    /// ほかのまとまり（眉・口角・口・鼻と上唇・声）が入っているときだけ数える
     static let coGroups: [(name: String, metrics: [(m: Metric, sign: Double)])] = [
-        ("brow", [(.browDown, 1), (.browEyeGap, -1), (.browInnerGap, -1)]), ("orbit", [(.orbit, 1), (.eyeOpen, -1)]),
+        ("brow", [(.browDown, 1), (.browInnerGap, -1)]), ("eyes", [(.orbit, 1), (.eyeOpen, -1), (.eyeSquint, 1)]),
         ("nose_lip", [(.noseLip, 1)]), ("mouth_tense", [(.mouthTense, 1)]),
         ("smile", [(.mouthSmile, 1), (.mouthCorner, 1)]), ("voice", [(.rmsDb, 1), (.f0Hz, 1)])]
+    static let coSecondary: Set<String> = ["eyes"]
+    /// 続いている重なりで、入っている表情のまとまり（目と声を除く）が前と1つも重ならなくなったら別のできごとに分ける（v1.16〜。例：眉 → 口角）
+    static let coSplitGroups: Set<String> = ["brow", "nose_lip", "mouth_tense", "smile"]
+    /// 目の指標（eye_squint・orbit・eye_open）は、顔の向き（yaw）が普段の中央値からこれ以上ずれたコマでは比べない（v1.16〜、仮の値。criteria.json の eye_yaw_tolerance_deg）
+    static let eyeYawToleranceDeg = 10.0
     // 目を閉じている割合（v1.12〜、criteria.json の eyes_closed_ratio。判定には使わない）：直近 windowS 秒の顔のあるコマのうち、
     // eyeBlink 左右平均 ≥ eyesClosedThreshold が eyesClosedMinS 秒以上続いたまとまりに入るコマの割合。stepS 秒ごとに記録に書く
     static let eyesRatioWindowS = 30.0
@@ -91,6 +98,8 @@ struct CoChange: Equatable {
     var endT: Double
     var metrics: Set<Metric>
     var groups: Set<String>
+    /// 始まったときの表情のまとまり（coSplitGroups のもの。v1.16〜：これと1つも重ならなくなったら別のできごと）
+    var core: Set<String> = []
 
     var seconds: Double { endT - startT }
     /// 記録に書く並び（Metric.allCases の順）
@@ -114,23 +123,33 @@ struct CoChangeDetector {
         for above in [true, false] {
             var d = dirs[above]!
             let sign = above ? 1.0 : -1.0
-            var lit: Set<String> = [], litMetrics: Set<Metric> = []
-            var face = false
+            var lit: [String: [Metric]] = [:]
             for g in DiffCriteria.coGroups {
                 let ms = g.metrics.filter { (z[$0.m] ?? 0) * $0.sign * sign >= DiffCriteria.coZ - 1e-9 }.map(\.m)
-                if !ms.isEmpty {
-                    lit.insert(g.name); litMetrics.formUnion(ms)
-                    if ms.contains(where: \.isFace) { face = true }
-                }
+                if !ms.isEmpty { lit[g.name] = ms }
             }
-            if lit.count >= DiffCriteria.coMinGroups && face {
-                if d.run0 == nil { d.run0 = t; d.runMetrics = []; d.runGroups = [] }
-                d.runMetrics.formUnion(litMetrics); d.runGroups.formUnion(lit)
+            // 目のまとまりは、ほかのまとまりが入っているときだけ数える（v1.16〜）
+            if lit.keys.allSatisfy(DiffCriteria.coSecondary.contains) { lit = [:] }
+            let litGroups = Set(lit.keys), litMetrics = Set(lit.values.flatMap { $0 })
+            let face = litMetrics.contains(where: \.isFace)
+            if litGroups.count >= DiffCriteria.coMinGroups && face {
+                let prim = litGroups.intersection(DiffCriteria.coSplitGroups)
                 if var e = d.event {
-                    e.endT = t; e.metrics.formUnion(litMetrics); e.groups.formUnion(lit)
-                    d.event = e
-                } else if let r = d.run0, t - r >= DiffCriteria.coMinOverlapS - 1e-9 {
-                    d.event = CoChange(above: above, startT: r, endT: t, metrics: d.runMetrics, groups: d.runGroups)
+                    if !prim.isEmpty, !e.core.isEmpty, prim.isDisjoint(with: e.core) {
+                        // 表情のまとまりが入れ替わった（例：眉 → 口角）：前のできごとはここまでにして、新しく数え始める（v1.16〜）
+                        finished.append(e); d.event = nil
+                        d.run0 = t; d.runMetrics = litMetrics; d.runGroups = litGroups
+                    } else {
+                        e.endT = t; e.metrics.formUnion(litMetrics); e.groups.formUnion(litGroups)
+                        d.event = e
+                    }
+                } else {
+                    if d.run0 == nil { d.run0 = t; d.runMetrics = []; d.runGroups = [] }
+                    d.runMetrics.formUnion(litMetrics); d.runGroups.formUnion(litGroups)
+                    if let r = d.run0, t - r >= DiffCriteria.coMinOverlapS - 1e-9 {
+                        d.event = CoChange(above: above, startT: r, endT: t, metrics: d.runMetrics, groups: d.runGroups,
+                                           core: d.runGroups.intersection(DiffCriteria.coSplitGroups))
+                    }
                 }
             } else {
                 d.run0 = nil
@@ -475,8 +494,8 @@ struct DiffEngine {
     }
 
     private enum Item {
-        case frame(DiffInput, faceValid: Bool)
-        case baseline([Metric: Stat]?, BaselinePart)
+        case frame(DiffInput, faceValid: Bool, yaw: Double?)
+        case baseline([Metric: Stat]?, BaselinePart, yaw: Double?)
     }
 
     private var queue: [Item] = []
@@ -492,6 +511,9 @@ struct DiffEngine {
     private var voiceOnDet = VoiceOnDetector()
     /// 重なりのできごと（v1.12〜）。終わったものは coDet.finished
     var coDet = CoChangeDetector()
+    private var faceYaw: Double?                 // 表情の普段の yaw（v1.16〜）
+    /// 最後に判定したコマで、顔の向きが普段と違うので目の指標を比べなかったか（データのタブ、v1.16〜）
+    private(set) var eyesYawExcluded = false
 
     /// 今の z（判定できたコマのもの。判定できないときは入れない）
     private(set) var z: [Metric: Double] = [:]
@@ -508,8 +530,9 @@ struct DiffEngine {
 
     /// 普段を決めた・取り直した（nil で両方を消す）。この時刻より後のコマから使う。
     /// part が face / voice なら、その部分だけ変える（v1.6〜）
-    mutating func setBaseline(_ b: [Metric: Stat]?, part: BaselinePart = .all) {
-        queue.append(.baseline(b, part))
+    /// yaw：その表情の普段の yaw の中央値（v1.16〜。目の指標を、顔の向きが普段から yawTolerance 以上ずれたコマでは比べない。無い古い普段は平均）
+    mutating func setBaseline(_ b: [Metric: Stat]?, part: BaselinePart = .all, yaw: Double? = nil) {
+        queue.append(.baseline(b, part, yaw: yaw))
     }
 
     /// 1コマ足す。0.2秒より前のコマを判定する
@@ -524,7 +547,7 @@ struct DiffEngine {
 
         if (x.blink ?? 0) >= DiffCriteria.blinkThreshold { blinkTimes.append(x.t) }
         latestT = max(latestT, x.t)
-        queue.append(.frame(x, faceValid: valid))
+        queue.append(.frame(x, faceValid: valid, yaw: yawNow))
         drain(until: latestT - DiffCriteria.blinkPadS)
     }
 
@@ -543,14 +566,15 @@ struct DiffEngine {
     private mutating func drain(until limit: Double) {
         while let first = queue.first {
             switch first {
-            case .baseline(let b, let part):
+            case .baseline(let b, let part, let yaw):
+                if part != .voice { faceYaw = b == nil ? nil : yaw }
                 if part != .voice { faceBaseline = b.map { $0.filter { $0.key.isFace } } }
                 if part != .face { voiceBaseline = b.map { $0.filter { !$0.key.isFace } } }
                 queue.removeFirst()
-            case .frame(let x, let valid):
+            case .frame(let x, let valid, let yaw):
                 guard x.t <= limit else { return }
                 queue.removeFirst()
-                process(x, faceValid: valid)
+                process(x, faceValid: valid, yaw: yaw)
             }
         }
     }
@@ -559,7 +583,10 @@ struct DiffEngine {
         blinkTimes.contains { abs($0 - t) <= DiffCriteria.blinkPadS + 1e-9 }
     }
 
-    private mutating func process(_ x: DiffInput, faceValid: Bool) {
+    private mutating func process(_ x: DiffInput, faceValid: Bool, yaw: Double?) {
+        // 目の指標（v1.16〜）：顔の向きが普段から yawTolerance 以上ずれたコマでは比べない（目の値は向きでずれるため。review.py と同じ：直近 1秒の yaw）
+        let eyesOffYaw = faceYaw.map { fy in yaw.map { abs($0 - fy) >= DiffCriteria.eyeYawToleranceDeg - 1e-9 } ?? false } ?? false
+        eyesYawExcluded = eyesOffYaw
         processedT = x.t
         blinkTimes.removeAll { $0 < x.t - DiffCriteria.blinkPadS - 1 }
         let blink = blinked(at: x.t)
@@ -585,6 +612,7 @@ struct DiffEngine {
             if m.isFace && !faceValid { zz = nil }
             if !m.isFace && x.voiceSelf == false { zz = nil }   // 本人以外の声（と言えない声）のコマでは判定しない
             if m.blinkMasked && blink { zz = nil }
+            if m.isEyeMetric && eyesOffYaw { zz = nil }
             z[m] = zz
             guard m.isMain else { continue }   // 表情のまとまり（v1.12〜）は z だけ。「いつもとの違い」の区間にはしない
 

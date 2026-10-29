@@ -244,7 +244,12 @@ struct DataTab: View {
                     Text(headText).font(.callout.weight(.medium)).foregroundStyle(Palette.head)
                 }
                 section("本人の声の似ている度合い（声紋）") { speaker }
-                section("指標ごとのずれ（帯＝いつもの範囲、点＝今）") { meters }
+                section("指標ごとのずれ（帯＝いつもの範囲、点＝今）") {
+                    if model.eyesOffYaw {   // v1.16〜
+                        NoteLine(text: "顔の向きが普段と違うので、目は比べていません", icon: "info.circle", color: Palette.progress, font: .caption)
+                    }
+                    meters
+                }
                 section("直近60秒") {
                     GraphPage(graph: graph).frame(height: 230)
                 }

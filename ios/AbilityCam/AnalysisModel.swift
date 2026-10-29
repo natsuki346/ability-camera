@@ -111,6 +111,9 @@ final class AnalysisModel: ObservableObject {
     private var squintPending: [(t: Double, m: Metric, x: Double)] = []  // 普段に数える前の目を細める・目のまわり（v1.12〜）の値（後ろ 0.2秒にまばたきが無いか待つ）
     private var asymStats: [String: Welford] = [:]
     private var rangeStats: [Metric: (lo: Double, hi: Double)] = [:]   // 普段の間の値の幅（v1.15〜）
+    private var poseYaw: [Double] = []                        // 普段の間の yaw（v1.16〜、中央値を求める）
+    /// 顔の向きが普段と違うので、目の指標を比べていない（v1.16〜、データのタブ）
+    @Published var eyesOffYaw = false
     /// 比べている保存した普段に無い指標（v1.15〜。今日の普段がたまったら、その指標だけ今日の普段で比べ始める）
     @Published var missingInSaved: [Metric] = []
     @Published var missingFilled = false
@@ -849,6 +852,10 @@ final class AnalysisModel: ObservableObject {
         scene = scene == s ? nil : s
         let t = Self.nowMs(), v = scene?.rawValue ?? "なし"
         logger.write(EventRecord(tMs: t, kind: "scene", value: .text(v)))
+        // 記録したことを見て分かるように（v1.16〜。家族の印と同じ）
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        showMessage("場面を記録しました：\(v)（\(f.string(from: Date(timeIntervalSince1970: Double(t) / 1000)))）")
         graph.addEvent(t: Double(t) / 1000, label: "場面：\(v)", isMark: false)
         link.send(LiveEvent(tMs: t, kind: "scene", value: v))
     }
@@ -972,7 +979,7 @@ final class AnalysisModel: ObservableObject {
         comparing = nil; savedFromMs = nil; askResave = false
         missingInSaved = []; flatMetrics = []
         boxStats = (Welford(), Welford(), Welford())
-        poseStats = [:]; asymStats = [:]; rangeStats = [:]; missingFilled = false
+        poseStats = [:]; asymStats = [:]; rangeStats = [:]; missingFilled = false; poseYaw = []
         baselineClosed = DiffEngine.ClosedDetector(); baselineClosedS = 0; baselineEyesClosedLong = false
         usedFace = nil
         guard !keepVoice else { return }
@@ -1097,7 +1104,7 @@ final class AnalysisModel: ObservableObject {
         row.source = BaselineSource.saved.rawValue; row.compared = true; row.part = BaselinePart.face.rawValue
         row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose; row.asym = sv.asym
         logger.write(row)
-        engine.setBaseline(Self.engineBaseline(faceMetrics), part: .face)
+        engine.setBaseline(Self.engineBaseline(faceMetrics), part: .face, yaw: Self.baselineYaw(sv.pose))
         comparing = .saved
         savedFromMs = sv.savedMs
         usedFace = (sv.savedMs, faceMetrics)
@@ -1171,9 +1178,11 @@ final class AnalysisModel: ObservableObject {
         }
         let faceBox = boxStats.cx.n > 0 ? FaceBoxStats(cx: box(boxStats.cx), cy: box(boxStats.cy), w: box(boxStats.w)) : nil
         // 顔の向きの普段（v1.8〜）：比べるのには使わない。記録と振り返りレポートだけ
-        let pose: [String: BaselineRecord.Stat]? = poseStats.isEmpty ? nil : poseStats.mapValues { w in
+        var pose: [String: BaselineRecord.Stat]? = poseStats.isEmpty ? nil : poseStats.mapValues { w in
             BaselineRecord.Stat(n: w.n, mean: (w.mean * 100).rounded() / 100, std: (w.std * 100).rounded() / 100, insufficient: w.n < Self.minSamples)
         }
+        // yaw の中央値（v1.16〜。目の指標を、顔の向きが普段からずれたコマでは比べない）
+        if !poseYaw.isEmpty { pose?["yaw_deg"]?.median = (DiffCriteria.quantile(poseYaw.sorted(), 0.5) * 10).rounded() / 10 }
         let useToday = comparing == nil   // 保存した普段で比べているときは、比べる相手を自動では切り替えない
         var row = BaselineRecord(tMs: Self.nowMs(), startedMs: baselineStartMs,
                                  wallS: ((now - baselineStartHost) * 10).rounded() / 10,
@@ -1190,7 +1199,7 @@ final class AnalysisModel: ObservableObject {
         }
         logger.write(row)
         if useToday {
-            engine.setBaseline(Self.engineBaseline(out), part: .face)
+            engine.setBaseline(Self.engineBaseline(out), part: .face, yaw: Self.baselineYaw(pose))
             comparing = .today
             usedFace = (baselineStartMs, out)
             publishBaseline(tMs: Self.nowMs())   // 見る側へ1回
@@ -1221,7 +1230,7 @@ final class AnalysisModel: ObservableObject {
         row.savedMs = sv.savedMs; row.camera = sv.camera; row.faceBox = sv.faceBox; row.pose = sv.pose; row.asym = sv.asym
         row.fromToday = add.map(\.rawValue)
         logger.write(row)
-        engine.setBaseline(Self.engineBaseline(merged), part: .face)
+        engine.setBaseline(Self.engineBaseline(merged), part: .face, yaw: Self.baselineYaw(sv.pose))
         usedFace = (used.startedMs, merged)
         missingFilled = true
         publishBaseline(tMs: now)
@@ -1311,6 +1320,12 @@ final class AnalysisModel: ObservableObject {
         e.median = median; e.iqr = median == nil ? nil : st?.iqr
         logger.write(e)
         voiceSpreadWide = v?.spreadWide ?? false
+    }
+
+    /// 表情の普段の yaw（v1.16〜）：中央値。無い古い普段は平均（review.py の baseline_yaw と同じ）
+    static func baselineYaw(_ pose: [String: BaselineRecord.Stat]?) -> Double? {
+        guard let st = pose?["yaw_deg"], !st.insufficient else { return nil }
+        return st.median ?? st.mean
     }
 
     /// 記録の baseline 行（と同じもの）から、判定に使う平均と標準偏差（下限をかけたもの）。データ不足の指標は入れない
@@ -1473,6 +1488,7 @@ final class AnalysisModel: ObservableObject {
             if let p = r.pose {
                 for (k, v) in [("yaw_deg", p.yaw), ("pitch_deg", p.pitch), ("roll_deg", p.roll)] {
                     poseStats[k, default: Welford()].add((v * 10).rounded() / 10)
+                    if k == "yaw_deg" { poseYaw.append((v * 10).rounded() / 10) }
                 }
             }
         }
@@ -1642,6 +1658,7 @@ final class AnalysisModel: ObservableObject {
         let items = shown.map { DiffItem(target: $0.target, above: $0.above, seconds: Int(max(0, latestT - $0.startT))) }
         if diffItems != items { diffItems = items }
         if meterZ != engine.z { meterZ = engine.z }
+        if eyesOffYaw != engine.eyesYawExcluded { eyesOffYaw = engine.eyesYawExcluded }
         let dm = Dictionary(uniqueKeysWithValues: shown.compactMap { s in s.metric.map { ($0, s.above) } })
         if diffMetrics != dm { diffMetrics = dm }
         // 見る側へは今までの6つだけ（v1.12 の表情のまとまりは送らない）

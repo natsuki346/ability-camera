@@ -18,6 +18,8 @@ enum Metric: String, CaseIterable {
     /// 顔の点から求める距離（v1.15〜。記録とレポート・データのタブだけ）
     static let geometry: [Metric] = [.browEyeGap, .browInnerGap, .eyeOpen, .mouthCorner]
     var isGeometry: Bool { Self.geometry.contains(self) }
+    /// 目の指標（v1.16〜：顔の向きが普段とずれたコマでは比べない）
+    var isEyeMetric: Bool { self == .eyeSquint || self == .orbit || self == .eyeOpen }
     var isMain: Bool { Self.main.contains(self) }
 
     var isFace: Bool { self != .rmsDb && self != .f0Hz }

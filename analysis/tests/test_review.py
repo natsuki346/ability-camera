@@ -1786,7 +1786,7 @@ class CoChangeTest(unittest.TestCase):
     """表情のまとまりと重なりのできごと（v1.12〜）：アプリ（DiffEngine）とレポートで同じ。1つの動きだけ・短い重なりでは出さない"""
 
     @staticmethod
-    def write(path: Path):
+    def write(path: Path, spans=None, length=52.0):
         import json
         t0 = 1_800_000_000_000
         base_bs = {k: 0.1 for k in ("browDownLeft", "browDownRight", "eyeSquintLeft", "eyeSquintRight", "cheekSquintLeft", "cheekSquintRight",
@@ -1794,39 +1794,45 @@ class CoChangeTest(unittest.TestCase):
                                     "mouthStretchLeft", "mouthStretchRight", "mouthSmileLeft", "mouthSmileRight")}
         base_bs.update(jawOpen=0.1, eyeBlinkLeft=0.0, eyeBlinkRight=0.0)
         up = {"brow": ("browDownLeft", "browDownRight"), "orbit": ("eyeSquintLeft", "eyeSquintRight"),
-              "nose": ("mouthUpperUpLeft", "mouthUpperUpRight"), "press": ("mouthPressLeft", "mouthPressRight")}
-        # (始まり, 終わり, 上げるもの, 声を上げるか)
-        spans = [(3.0, 5.0, ("brow", "orbit"), False),    # 重なり 2秒 → できごと
+              "nose": ("mouthUpperUpLeft", "mouthUpperUpRight"), "press": ("mouthPressLeft", "mouthPressRight"),
+              "smile": ("mouthSmileLeft", "mouthSmileRight")}
+        # (始まり, 終わり, 上げるもの, 声を上げるか[, yaw])
+        spans = spans or [(3.0, 5.0, ("brow", "orbit"), False),    # 重なり 2秒 → できごと
                  (7.0, 7.3, ("brow", "nose"), False),     # 5秒以内なので、前のできごとにまとめる
                  (14.0, 16.0, ("brow",), False),          # 1つだけ → 出さない
                  (20.0, 22.0, ("press",), True),          # 口の緊張＋声 → できごと
                  (30.0, 30.1, ("brow", "orbit"), False),  # 短い重なり（ならしても 0.5秒に届かない） → 出さない
-                 (36.0, 38.0, ("geo",), False),           # 顔の点の距離だけ（眉と目の間・目の開きが小さく） → できごと（v1.15〜）
+                 (36.0, 38.0, ("geo",), False),           # 顔の点の距離だけ（眉頭の間・目の開きが小さく） → できごと（v1.15〜）
                  (46.0, 53.0, ("brow", "orbit"), False)]  # 記録の終わりまで → 打ち切り
         mets = {m: {"n": 300, "mean": 0.1, "std": 0.02, "insufficient": False}
                 for m in ("mouth_smile", "brow_down", "eye_squint", "jaw_open", "orbit", "nose_lip", "mouth_tense", "cheek_raise")}
         geo_base = {"brow_eye_gap": 0.2, "brow_inner_gap": 0.2, "eye_open": 0.1, "mouth_corner": 0.02}
         for m, v in geo_base.items():
             mets[m] = {"n": 300, "mean": v, "std": 0.005, "insufficient": False}
+        pose = {"yaw_deg": {"n": 300, "mean": 0.0, "std": 1.0, "median": 0.0, "insufficient": False}}
         lines = [json.dumps({"schema": "ability-cam.ios.v0.2", "started_at_ms": t0, "direction_version": 2}),
-                 json.dumps({"type": "baseline", "t_ms": t0, "part": "face", "blink_masked": True, "metrics": mets}),
+                 json.dumps({"type": "baseline", "t_ms": t0, "part": "face", "blink_masked": True, "metrics": mets, "pose": pose}),
                  json.dumps({"type": "baseline", "t_ms": t0, "part": "voice", "metrics": {"rms_db": {"n": 300, "mean": -50.0, "std": 2.0, "insufficient": False},
                                                                                          "f0_hz": {"n": 300, "mean": 150.0, "std": 10.0, "insufficient": False}}})]
-        for k in range(int(52 / 0.033)):
+        for k in range(int(length / 0.033)):
             ts = k * 0.033
             bs = dict(base_bs)
             geo = dict(geo_base)
             loud = False
-            for a, b, which, voice in spans:
+            yaw = 0.0
+            for sp in spans:
+                a, b, which, voice = sp[:4]
                 if a <= ts < b:
                     for w in which:
                         if w == "geo":
-                            geo["brow_eye_gap"] = 0.15; geo["eye_open"] = 0.06
+                            geo["brow_eye_gap"] = 0.15; geo["brow_inner_gap"] = 0.15; geo["eye_open"] = 0.06
                             continue
                         for key in up[w]:
                             bs[key] = 0.4
                     loud = loud or voice
-            lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(ts * 1000), "face": True, "bs": bs, "yaw_deg": 0.0, "geo": geo,
+                    if len(sp) > 4:
+                        yaw = sp[4]
+            lines.append(json.dumps({"type": "frame", "t_ms": t0 + round(ts * 1000), "face": True, "bs": bs, "yaw_deg": yaw, "geo": geo,
                                      "rms_db": -30.0 if loud else -50.0, "f0_hz": 150.0, "voice_self": True}))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1840,10 +1846,10 @@ class CoChangeTest(unittest.TestCase):
             a = review.analyze(review.load(path), c)
             t0 = a.rec.t[0]
             got = [(round(float(a.rec.t[e["i0"]] - t0)), e["metrics"], e["at_end"]) for e in a.co_changes]
-            self.assertEqual(got, [(3, ["brow_down", "orbit", "nose_lip"], False),
+            self.assertEqual(got, [(3, ["brow_down", "eye_squint", "orbit", "nose_lip"], False),
                                    (20, ["rms_db", "mouth_tense"], False),
-                                   (36, ["brow_eye_gap", "eye_open"], False),   # 点の距離が小さくなる向き＝眉を寄せる・目を細める向き（v1.15〜）
-                                   (46, ["brow_down", "orbit"], True)])
+                                   (36, ["brow_inner_gap", "eye_open"], False),   # 点の距離が小さくなる向き＝眉を寄せる・目を細める向き（v1.15〜。brow_eye_gap は v1.16 で外した）
+                                   (46, ["brow_down", "eye_squint", "orbit"], True)])
             self.assertTrue(all(e["above"] for e in a.co_changes))
             self.assertGreater(float(a.rec.t[a.co_changes[0]["i1"]] - t0), 7.0)   # 5秒以内の重なりはまとめる
             # 区間（いつもとの違い）は今までの6つだけ（表情のまとまりは区間にしない）
@@ -1858,6 +1864,29 @@ class CoChangeTest(unittest.TestCase):
             diffs, n = check_app.compare_co(path, check_app.build(), c)
             self.assertEqual(n, 4)
             self.assertEqual(diffs, [])
+
+    def test_rules_v116(self):
+        """v1.16〜：目だけでは数えない・目と声なら数える・眉 → 口角で分ける・顔の向きが普段から 10° 以上ずれたら目を比べない。アプリと一致"""
+        import shutil
+        import check_app
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        spans = [(3.0, 5.0, ("orbit",), False),               # 目だけ → 出さない
+                 (11.0, 13.0, ("orbit",), True),              # 目と声 → できごと
+                 (20.0, 22.0, ("brow",), True),               # 眉と声 → できごと
+                 (22.0, 24.0, ("smile",), True),              #   続けて口角と声 → 別のできごとに分ける
+                 (32.0, 34.0, ("brow", "orbit"), False, 15.0)]   # 顔の向きが普段から 15° → 目を比べないので眉だけ → 出さない
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "rules.jsonl"
+            self.write(path, spans, length=40.0)
+            a = review.analyze(review.load(path), c)
+            t0 = a.rec.t[0]
+            got = [(round(float(a.rec.t[e["i0"]] - t0)), e["groups"]) for e in a.co_changes]
+            # 眉 → 口角の入れ替わりの間（ならしで両方が上がっている短い間）は前のできごとに入り、眉が消えたところで分かれる
+            self.assertEqual(got, [(11, ["eyes", "voice"]), (20, ["brow", "smile", "voice"]), (22, ["smile", "voice"])])
+            self.assertFalse(a.judge["eye_squint"][(a.rec.t - t0 > 32.5) & (a.rec.t - t0 < 33.5)].any())   # 向きがずれた間、目は比べない
+            if shutil.which("swiftc"):
+                diffs, n = check_app.compare_co(path, check_app.build(), c)
+                self.assertEqual((diffs, n), ([], 3))
 
     def test_face_check_and_geo(self):
         """顔の点の距離（v1.15〜）：アプリの FaceGeometry（DiffCheck --geo-selftest）と、face_check.py の区間ごとの表"""
@@ -1877,6 +1906,22 @@ class CoChangeTest(unittest.TestCase):
         self.assertGreaterEqual(int(re.search(r"z≥2 (\d+)%", rows["眉と目の間（点）"][3]).group(1)), 80)   # 眉を寄せた時間（ならしの分、始めは少し遅れる）
         self.assertIn("z≥2 0%", rows["眉と目の間（点）"][2])       # 落ち着いている時間
         self.assertIn("z≥2 0%", rows["眉を寄せる"][3])            # blendshape の眉は動いていない
+        # --auto（v1.16〜）：眉頭の間が小さくなった 36〜38秒を「眉を寄せる」と推定する
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "co.jsonl"
+            self.write(path)
+            rec = review.load(path)
+            est = face_check.auto_spans(rec, review.analyze(rec, c))
+            t0 = rec.t[0]
+            self.assertEqual([(round(a_ - t0), round(b_ - t0)) for a_, b_ in est["frown"]], [(36, 38)])
+            self.assertTrue(est["calm"])
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(face_check.main([str(path), "--auto"]), 0)
+            self.assertIn("推定した区間", buf.getvalue())
+            self.assertIn("眉を寄せる：36.", buf.getvalue())
         if shutil.which("swiftc"):
             import check_app
             p = subprocess.run([str(check_app.build()), "--geo-selftest"], capture_output=True, text=True)
@@ -1898,10 +1943,13 @@ class CoChangeTest(unittest.TestCase):
         block = src[src.index("static let coGroups"):src.index("static let coGroups") + 700]
         rv = {"browDown": "brow_down", "orbit": "orbit", "noseLip": "nose_lip", "mouthTense": "mouth_tense", "mouthSmile": "mouth_smile",
               "rmsDb": "rms_db", "f0Hz": "f0_hz", "browEyeGap": "brow_eye_gap", "browInnerGap": "brow_inner_gap", "eyeOpen": "eye_open",
-              "mouthCorner": "mouth_corner"}
+              "mouthCorner": "mouth_corner", "eyeSquint": "eye_squint"}
         app_groups = {g: [("-" if sg == "-1" else "") + rv[m] for m, sg in re.findall(r"\(\.(\w+), (-?1)\)", ms)]
                       for g, ms in re.findall(r'\("(\w+)", \[((?:\(\.\w+, -?1\)(?:, )?)+)\]\)', block)}
         self.assertEqual(app_groups, cc["groups"])
+        self.assertEqual(re.search(r'coSecondary: Set<String> = \["(\w+)"\]', src).group(1), cc["secondary_groups"][0])
+        self.assertEqual(sorted(re.findall(r'"(\w+)"', re.search(r"coSplitGroups: Set<String> = \[([^\]]*)\]", src).group(1))), sorted(cc["split_groups"]))
+        self.assertEqual(float(re.search(r"static let eyeYawToleranceDeg = ([\d.]+)", src).group(1)), c["eye_yaw_tolerance_deg"])
         # 顔の点の距離（v1.15〜）：点の番号・|yaw| の上限・下限・幅
         base = (review.HERE.parent / "ios" / "AbilityCam" / "Baseline.swift").read_text(encoding="utf-8")
         g = c["geometry"]

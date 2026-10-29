@@ -321,6 +321,47 @@ def smooth(t: np.ndarray, x: np.ndarray, tau: float, stale: float) -> np.ndarray
     return out
 
 
+EYE_METRICS = ("eye_squint", "orbit", "eye_open")   # 顔の向きが普段からずれたコマでは比べない（v1.16〜）
+
+
+def yaw_recent(rec: Recording, c: dict) -> np.ndarray:
+    """各コマの直近 stale_s 秒の yaw（顔が無いコマは前のコマの値。face_valid・アプリの DiffEngine と同じ）"""
+    t = rec.t
+    out = np.full(len(t), np.nan)
+    last_v, last_t = np.nan, -math.inf
+    for i in range(len(t)):
+        if rec.yaw[i] == rec.yaw[i]:
+            last_v, last_t = rec.yaw[i], t[i]
+        if t[i] - last_t <= c["stale_s"]:
+            out[i] = last_v
+    return out
+
+
+def baseline_yaw(b: dict) -> float | None:
+    """表情の普段の yaw（v1.16〜）：pose.yaw_deg の中央値、無い古い普段は平均（アプリの AnalysisModel.baselineYaw と同じ）"""
+    st = (b.get("pose") or {}).get("yaw_deg")
+    if not st or st.get("insufficient"):
+        return None
+    v = st.get("median", st.get("mean"))
+    return None if v is None else float(v)
+
+
+def eyes_yaw_ok(rec: Recording, c: dict, bidx: np.ndarray) -> np.ndarray:
+    """目の指標を比べてよいコマ：普段の yaw が無いか、直近の yaw が普段から eye_yaw_tolerance_deg 未満のコマ"""
+    tol = c.get("eye_yaw_tolerance_deg")
+    out = np.ones(len(rec.t), bool)
+    if tol is None:
+        return out
+    yr = yaw_recent(rec, c)
+    for bi, b in enumerate(rec.baselines):
+        by = baseline_yaw(b)
+        if by is None:
+            continue
+        sel = (bidx == bi) & np.isfinite(yr)
+        out[sel] = np.abs(yr[sel] - by) < tol - 1e-9
+    return out
+
+
 def face_valid(rec: Recording, c: dict) -> np.ndarray:
     """直近 window_s 秒で顔が映っているコマが半分以上、かつ |yaw| < 上限（向きの記録があるとき）"""
     fv = c["face_valid"]
@@ -737,6 +778,7 @@ class Analysis:
     closed: np.ndarray | None = None                             # 目を閉じていたコマ（eyes_closed の区間）
     voice_self: np.ndarray | None = None                         # 本人の声か（1 / 0 / NaN＝声が出ていない）。v1.6〜
     co_changes: list = field(default_factory=list)               # 重なりのできごと（v1.12〜、detect_co_change）
+    eyes_yaw_ok: np.ndarray | None = None                        # 目の指標を比べたコマ（顔の向きが普段に近い、v1.16〜）
     vbidx: np.ndarray | None = None                              # 声の指標で使う普段（baseline 行の番号）
 
 
@@ -965,6 +1007,8 @@ def analyze(rec: Recording, c: dict) -> Analysis:
     # 声：本人の声のコマの値だけを使い、本人の声と言えない声のコマでは判定しない（v1.6〜）
     a.voice_self = voice_self_values(rec, c, a.fvalid)
     a.vbidx = baseline_index(rec, "voice")
+    eyes_ok = eyes_yaw_ok(rec, c, a.bidx)   # 目の指標：顔の向きが普段からずれたコマは比べない（v1.16〜）
+    a.eyes_yaw_ok = eyes_ok
     for m in METRICS:
         mc = c["metrics"][m]
         voice = m not in FACE_METRICS
@@ -987,6 +1031,8 @@ def analyze(rec: Recording, c: dict) -> Analysis:
             ok &= a.fvalid
         if m == "eye_squint":
             ok &= ~blinked
+        if m in EYE_METRICS:
+            ok &= eyes_ok
         if voice:
             ok &= ~(a.voice_self == 0)
         a.judge[m] = ok
@@ -1030,7 +1076,7 @@ def analyze(rec: Recording, c: dict) -> Analysis:
             sd[sel] = max(st.get("std") or 0, c["std_floor"][m])
         a.usable[m] = bool(np.isfinite(mean).any())
         a.z[m] = (a.sm[m] - mean) / sd
-        a.judge[m] = np.isfinite(mean) & a.fvalid & (~blinked if m in BLINK_MASKED else True)
+        a.judge[m] = np.isfinite(mean) & a.fvalid & (~blinked if m in BLINK_MASKED else True) & (eyes_ok if m in EYE_METRICS else True)
     a.co_changes = detect_co_change(a, c)
     return a
 
@@ -1049,24 +1095,39 @@ def detect_co_change(a: "Analysis", c: dict) -> list[dict]:
     eps = 1e-9
     state = {above: {"run0": None, "rm": set(), "rg": set(), "ev": None} for above in (True, False)}
     out: list[dict] = []
+    secondary = set(cc.get("secondary_groups", []))
+    split = set(cc.get("split_groups", []))
     for i in range(len(t)):
         ti = float(t[i])
         for above in (True, False):
             d, sign = state[above], (1 if above else -1)
-            lit, litm, face = set(), set(), False
+            lit: dict[str, list[str]] = {}
             for name, ms in groups:
                 hit = [m for m, _ in ms if m in zs and zs[m][i] == zs[m][i] and zs[m][i] * sign >= cc["z_min"] - eps]
                 if hit:
-                    lit.add(name); litm.update(hit)
-                    face = face or any(m not in VOICE_METRICS for m in hit)
-            if len(lit) >= cc["min_groups"] and face:
-                if d["run0"] is None:
-                    d["run0"], d["rm"], d["rg"] = i, set(), set()
-                d["rm"] |= litm; d["rg"] |= lit
+                    lit[name] = hit
+            if all(g in secondary for g in lit):   # 目のまとまりは、ほかのまとまりが入っているときだけ数える（v1.16〜）
+                lit = {}
+            litg = set(lit)
+            litm = {m for ms in lit.values() for m in ms}
+            face = any(m not in VOICE_METRICS for m in litm)
+            if len(litg) >= cc["min_groups"] and face:
+                prim = litg & split
                 if d["ev"] is not None:
-                    d["ev"]["i1"] = i; d["ev"]["metrics"] |= litm; d["ev"]["groups"] |= lit
-                elif ti - float(t[d["run0"]]) >= cc["min_overlap_s"] - eps:
-                    d["ev"] = {"above": above, "i0": d["run0"], "i1": i, "metrics": set(d["rm"]), "groups": set(d["rg"]), "at_end": False}
+                    # 始まったときの表情のまとまり（core）と1つも重ならなくなったら分ける
+                    if prim and d["ev"]["core"] and not (prim & d["ev"]["core"]):
+                        # 表情のまとまりが入れ替わった（例：眉 → 口角）：前のできごとはここまで、新しく数え始める（v1.16〜）
+                        out.append(d["ev"]); d["ev"] = None
+                        d["run0"], d["rm"], d["rg"] = i, set(litm), set(litg)
+                    else:
+                        d["ev"]["i1"] = i; d["ev"]["metrics"] |= litm; d["ev"]["groups"] |= litg
+                else:
+                    if d["run0"] is None:
+                        d["run0"], d["rm"], d["rg"] = i, set(), set()
+                    d["rm"] |= litm; d["rg"] |= litg
+                    if ti - float(t[d["run0"]]) >= cc["min_overlap_s"] - eps:
+                        d["ev"] = {"above": above, "i0": d["run0"], "i1": i, "metrics": set(d["rm"]), "groups": set(d["rg"]), "at_end": False,
+                                   "core": set(d["rg"]) & split}
             else:
                 d["run0"] = None
                 if d["ev"] is not None and ti - float(t[d["ev"]["i1"]]) >= cc["window_s"] - eps:

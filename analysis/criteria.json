@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-30.1",
+  "version": "2026-10-30.2",
   "changelog": [
     {
       "date": "2026-10-26",
@@ -88,6 +88,10 @@
     {
       "date": "2026-10-30",
       "reason": "v1.18（記録 ability-cam-20261029-234627・234756、前面から。眉を5回寄せたはずが、はっきり取れたのは3回。brow_inner_gap は z ±0.4 で動かなかった）：正解つきで確かめる「試すモード」（cues：指示ごとに記録の event kind \"cue\"）と、その人の動く幅（calibration：「いちばん強く眉を寄せる」「いちばん大きく笑う」の p95 をその人の最大とし、標準偏差の下限を min(今の下限, |最大 − 普段の中央値| × floor_frac)、ただし floor_min 以上にする。baseline 行の std_floor に使った下限を書く）。眉の点の距離の候補 brow_inner_eye（眉頭 55・285 → 目頭 133・362 の縦）・brow_inner_gap2（眉頭 55・285 の間）を足した（co_change には入れない）。どれも仮の値。アプリ（Cues.swift の Calibration・CueReport、Baseline.swift の FaceGeometry）と同じ値。"
+    },
+    {
+      "date": "2026-10-30",
+      "reason": "v1.20（記録 ability-cam-20261030-011513、前面から）：撮る側の change では眉を寄せる・笑うの指示5回すべてで「いつもより強い」が出ていたのに、試すモードの結果は眉 4/5・笑う 1/5 だった。今の下限の数は、撮る側の change の行から指標ごとに始まった回数で数える。何もしない・戻す間も指標ごとに始まった回数と内訳で数え、co_change は指示ごとに区切る（114.6秒からの 21.7秒が笑う4回分につながっていたため）。"
     }
   ],
   "_note": "変更したら version を更新し、changelog に日付と理由を1件足すこと。std_floor・metrics・face_valid・blink_mask・eyes_closed・voice_self・voice_baseline・voice_on・pitch はアプリ（ios/AbilityCam/DiffEngine.swift、v1.0〜）と同じ値。変えるときは両方変える。 face_below_counts=false なら、表情の「いつもより弱い」区間は違いに数えず、参考として別に出す。",
@@ -516,7 +520,7 @@
     ]
   },
   "cues": {
-    "_note": "試すモード（v1.18〜、仮の値）。frown・smile：指示の始まり〜終わり + grace_s 秒に始まった target の「いつもより強い」を「出た」と数え、指示の始まりからの秒数を出す。指標ごと：指示の始まり〜終わり + grace_s に動く向きの z ≥ hit_z のコマがあった回数と、指示の間の z の中央値。calm・turn・rest：その間に始まった「いつもとの違い」（声が出たは入れない）と co_change の数",
+    "_note": "試すモード（v1.18〜、仮の値）。frown・smile：指示の始まり〜終わり + grace_s 秒に始まった target の「いつもより強い」を「出た」と数え、指示の始まりからの秒数を出す。指標ごと：指示の始まり〜終わり + grace_s に動く向きの z ≥ hit_z のコマがあった回数と、指示の間の z の中央値。calm・turn・rest：その間に始まった「いつもとの違い」（声が出たは入れない）と co_change の数。v1.20〜：今の下限の「いつもとの違い」は撮る側の change の行から、指標ごとに始まった回数で数える（前の行に無かった key）。記録し直した区間（最大から決めた下限）は、z が超えてから start_offset_s 後を始まりにする（change と同じ時点）。co_change は指示ごとに区切り、重なっていた指示の数で数える",
     "provisional": true,
     "grace_s": 2.0,
     "hit_z": 2.0,
@@ -532,6 +536,7 @@
       "-brow_inner_gap2",
       "mouth_smile",
       "mouth_corner"
-    ]
+    ],
+    "start_offset_s": 0.5
   }
 }

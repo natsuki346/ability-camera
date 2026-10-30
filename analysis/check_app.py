@@ -128,10 +128,8 @@ def diff_json(x, y, where: str = "", tol: float = 1e-6) -> list[str]:
     if isinstance(x, dict) and isinstance(y, dict):
         out = []
         for k in sorted(set(x) | set(y)):
-            if k not in x or k not in y:
-                out.append(f"{where}.{k}：片方にしか無い（アプリ {x.get(k)} / レポート {y.get(k)}）")
-            else:
-                out += diff_json(x[k], y[k], f"{where}.{k}", tol)
+            # アプリ（Swift の Codable）は nil のキーを書かないので、無いキーと null は同じとみなす
+            out += diff_json(x.get(k), y.get(k), f"{where}.{k}", tol)
         return out
     if isinstance(x, list) and isinstance(y, list):
         if len(x) != len(y):

@@ -65,6 +65,8 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
     /// keepZ のとき：判定したコマごとの z と、顔のあるコマの生の値（試すモードの結果・DiffCheck --cues 用）
     let zLog: [(t: Double, z: [Metric: Double])]
     let rawFace: [(t: Double, v: [Metric: Double])]
+    /// 撮る側の change の行（v1.20〜、試すモードの「いつもとの違い」を撮る側と同じに数えるため）
+    let changeRows: [(t: Double, keys: [String])]
 
     /// 標準偏差の下限の決め方（v1.18〜）。recorded：記録の baseline 行の std_floor（無ければ指標の下限）。defaults：いつも指標の下限。
     /// calibrated：その人の最大から、行ごとに決め直した下限（Calibration.floors。試すモードの「下限を変えた後」）
@@ -292,6 +294,10 @@ final class ReplayData: Identifiable, @unchecked Sendable {   // 作ったあと
         coChanges = engine.coDet.finished
         zLog = engine.zLog ?? []
         rawFace = raws
+        changeRows = evs.compactMap { e in
+            guard e["kind"] as? String == "change", let t = ms(e) else { return nil }
+            return (t, e["value"] as? [String] ?? [])
+        }
         // 試すモード（v1.18〜）
         cues = evs.compactMap { e in
             guard e["kind"] as? String == "cue", let k = CueKind(rawValue: e["value"] as? String ?? ""),

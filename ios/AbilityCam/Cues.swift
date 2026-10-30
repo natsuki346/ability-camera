@@ -89,26 +89,34 @@ enum Calibration {
     }
 }
 
-/// 試すモードの結果（v1.18〜）。アプリの画面と DiffCheck --cues（JSON）に出す。face_check.py --cues と同じ決まり
+/// 「いつもとの違い」が始まった時刻（指標ごと。key は記録の change と同じ "brow_down:above" など）
+struct CueStart: Equatable { let t: Double; let key: String }
+
+/// 試すモードの結果（v1.18〜。v1.20〜は数え方を撮る側の change に合わせた）。アプリの画面と DiffCheck --cues（JSON）に出す。face_check.py --cues と同じ決まり
 struct CueReport: Codable, Equatable {
-    static let graceS = 2.0     // 指示が終わってから、この秒数までに出たものも数える（ならしの遅れ）
+    static let graceS = 2.0     // 指示が終わってから、この秒数までに始まったものも数える（ならしの遅れ）
     static let hitZ = 2.0       // 指標ごとの「z が出た」：動く向きの z がこれ以上のコマがあった
+    /// 記録し直した区間の始まりを、撮る側の change と同じ時点にそろえる：z が 2 を超えてから startMinS 続いたとき（v1.20〜）
+    static let startOffsetS = DiffCriteria.startMinS
     /// frown → 眉を寄せる（brow_down の「いつもより強い」）、smile → 口角を上げる（mouth_smile）
-    static let target: [CueKind: Metric] = [.frown: .browDown, .smile: .mouthSmile]
+    static let target: [CueKind: String] = [.frown: "brow_down:above", .smile: "mouth_smile:above"]
     /// 指標ごとの表に並べる指標と向き
     static let metrics: [(m: Metric, sign: Double)] = Calibration.frown + Calibration.smile
 
     struct Hit: Codable, Equatable {
         let kind: String
         let n: Int               // 指示の回数
-        let hit: Int             // 「いつもとの違い」が出た回数（指示の始まり〜終わり + graceS に始まった、target の「いつもより強い」）
-        let latencyS: [Double]   // 出た回の、指示の始まりから違いの始まりまでの秒数
+        let hit: Int             // target の「いつもより強い」が、指示の始まり〜終わり + graceS に始まった指示の数
+        let latencyS: [Double]   // 出た指示の、始まりから最初に始まるまでの秒数
+        let co: Int              // 重なりのできごとが重なっていた指示の数（v1.20〜：指示ごとに区切る）
     }
     struct Quiet: Codable, Equatable {
         let kind: String
         let seconds: Double
-        let diffs: Int           // その間に始まった「いつもとの違い」（声が出たは入れない）
-        let co: Int              // その間に始まった重なりのできごと
+        let windows: Int         // 指示の数
+        let diffs: Int           // その間に始まった「いつもとの違い」（指標ごとに始まった回数。声が出たは入れない）
+        let byKey: [String: Int] // その内訳（"eyes_closed:closed" など）
+        let co: Int              // 重なりのできごとが重なっていた指示の数
     }
     struct Row: Codable, Equatable {
         let metric: String
@@ -121,25 +129,28 @@ struct CueReport: Codable, Equatable {
     var quiet: [Quiet] = []
     var rows: [Row] = []
 
-    static func compute(cues: [Cue], segments: [DiffSegment], coChanges: [CoChange], zLog: [(t: Double, z: [Metric: Double])]) -> CueReport {
+    /// starts：指標ごとに「いつもとの違い」が始まった時刻（撮る側の change から、または記録し直した区間から）。co：重なりのできごとの始まり・終わり
+    static func compute(cues: [Cue], starts: [CueStart], co: [(start: Double, end: Double)], zLog: [(t: Double, z: [Metric: Double])]) -> CueReport {
         var r = CueReport()
-        let shown = segments.filter { $0.target != .voiceOn }
+        let st = starts.filter { !$0.key.hasPrefix(DiffTarget.voiceOnKey + ":") }
+        func coOn(_ c: Cue) -> Bool { co.contains { $0.start < c.end - 1e-9 && $0.end >= c.start - 1e-9 } }
         for kind in [CueKind.frown, .smile] {
             let cs = cues.filter { $0.kind == kind }
-            guard let m = target[kind] else { continue }
+            guard let key = target[kind] else { continue }
             var lat: [Double] = []
             for c in cs {
-                let s = shown.filter { $0.target == .metric(m) && $0.above && $0.startT >= c.start - 1e-9 && $0.startT <= c.end + graceS + 1e-9 }
-                    .min { $0.startT < $1.startT }
-                if let s { lat.append(((s.startT - c.start) * 1000).rounded() / 1000) }
+                let first = st.filter { $0.key == key && $0.t >= c.start - 1e-9 && $0.t <= c.end + graceS + 1e-9 }.map(\.t).min()
+                if let f = first { lat.append(((f - c.start) * 1000).rounded() / 1000) }
             }
-            r.hits.append(Hit(kind: kind.rawValue, n: cs.count, hit: lat.count, latencyS: lat))
+            r.hits.append(Hit(kind: kind.rawValue, n: cs.count, hit: lat.count, latencyS: lat, co: cs.filter(coOn).count))
         }
         for kind in [CueKind.calm, .turn, .rest] {
             let cs = cues.filter { $0.kind == kind }
-            func inside(_ t: Double) -> Bool { cs.contains { t >= $0.start - 1e-9 && t < $0.end - 1e-9 } }
+            let inside = st.filter { s in cs.contains { s.t >= $0.start - 1e-9 && s.t < $0.end - 1e-9 } }
+            var by: [String: Int] = [:]
+            for s in inside { by[s.key, default: 0] += 1 }
             r.quiet.append(Quiet(kind: kind.rawValue, seconds: ((cs.reduce(0) { $0 + $1.end - $1.start }) * 1000).rounded() / 1000,
-                                 diffs: shown.filter { inside($0.startT) }.count, co: coChanges.filter { inside($0.startT) }.count))
+                                 windows: cs.count, diffs: inside.count, byKey: by, co: cs.filter(coOn).count))
         }
         for kind in [CueKind.frown, .smile] {
             let cs = cues.filter { $0.kind == kind }
@@ -162,6 +173,21 @@ struct CueReport: Codable, Equatable {
         return r
     }
 
+    /// 撮る側の change の行から：前の行に無かった key が出たら、その時刻に始まった（同じ key が続いているだけなら数えない）
+    static func starts(changes: [(t: Double, keys: [String])]) -> [CueStart] {
+        var prev: Set<String> = [], out: [CueStart] = []
+        for c in changes.sorted(by: { $0.t < $1.t }) {
+            for k in c.keys where !prev.contains(k) { out.append(CueStart(t: c.t, key: k)) }
+            prev = Set(c.keys)
+        }
+        return out
+    }
+
+    /// 記録し直した区間から（画面に出す区間だけ。始まりは z が超えてから startOffsetS 後＝change と同じ時点）
+    static func starts(segments: [DiffSegment]) -> [CueStart] {
+        segments.filter(\.shown).map { CueStart(t: $0.startT + startOffsetS, key: $0.key) }
+    }
+
     func hit(_ k: CueKind) -> Hit? { hits.first { $0.kind == k.rawValue } }
     func quiet(_ k: CueKind) -> Quiet? { quiet.first { $0.kind == k.rawValue } }
     func row(_ m: Metric, _ k: CueKind) -> Row? { rows.first { $0.metric == m.rawValue && $0.kind == k.rawValue } }
@@ -170,29 +196,55 @@ struct CueReport: Codable, Equatable {
     static func perMin(_ count: Int, _ seconds: Double) -> Double? { seconds > 0 ? Double(count) / seconds * 60 : nil }
 }
 
-/// 試すモードの結果を、記録のファイルから出す（v1.18〜。アプリが終わったときと DiffCheck --cues で同じ）。
-/// before：今の下限（試すモードの間に使っていた下限＝記録の baseline 行の std_floor、無ければ指標ごとの下限。v1.19〜）、after：この記録の「いちばん強く・大きく」から求めたその人の最大で決めた下限。
-/// 記録の中の最後の試すモードの指示だけを使う（同じ記録で2回試したときは後の方）
-struct CueTrial: Codable, Equatable {
-    var max: [String: Double]        // この記録から求めたその人の最大（Calibration.maxima）
-    var before: CueReport
-    var after: CueReport?            // 最大が1つも求まらなければ nil
+/// 記録し直した判定（区間・重なり・コマごとの z）
+struct CueReplay {
+    let segments: [DiffSegment]
+    let coChanges: [CoChange]
+    let zLog: [(t: Double, z: [Metric: Double])]
+    var co: [(start: Double, end: Double)] { coChanges.map { ($0.startT, $0.endT) } }
+}
 
+/// 試すモードの結果（v1.18〜）。
+/// before（今の下限）：「いつもとの違い」は撮る側の change の行から数える（v1.20〜。撮る側の画面と同じ）。change の行が無い記録は記録し直した区間から。
+///   重なり・指標ごとの z は、試すモードの間に使っていた下限（記録の std_floor）で記録し直したもの。
+/// after（最大から決めた下限）：その人の最大で決めた下限で記録し直したもの（撮る側では使っていないので、change は無い）
+struct CueTrial: Codable, Equatable {
+    var max: [String: Double]
+    var before: CueReport
+    var after: CueReport?
+    var fromChanges: Bool            // before の「いつもとの違い」を撮る側の change から数えた
+    var beforeReplayHits: [CueReport.Hit]?   // 確かめる用：before を記録し直した区間で数えたときの回数（change と違えば、記録し直しが撮る側と合っていない）
+
+    static func compute(cues: [Cue], changes: [(t: Double, keys: [String])], before: CueReplay, after: CueReplay?,
+                        maxima: [Metric: Double]) -> CueTrial {
+        let fromChanges = !changes.isEmpty
+        let replayStarts = CueReport.starts(segments: before.segments)
+        let b = CueReport.compute(cues: cues, starts: fromChanges ? CueReport.starts(changes: changes) : replayStarts, co: before.co, zLog: before.zLog)
+        let a = after.map { CueReport.compute(cues: cues, starts: CueReport.starts(segments: $0.segments), co: $0.co, zLog: $0.zLog) }
+        let check = fromChanges ? CueReport.compute(cues: cues, starts: replayStarts, co: before.co, zLog: []).hits : nil
+        return CueTrial(max: Dictionary(uniqueKeysWithValues: maxima.map { ($0.key.rawValue, $0.value) }), before: b, after: a,
+                        fromChanges: fromChanges, beforeReplayHits: check)
+    }
+
+    /// 記録のファイルから（DiffCheck --cues。アプリは記録を読み直さず、試すモードの間の入力から同じ compute を使う）
     static func run(data: Data, name: String) throws -> CueTrial? {
         let d = try ReplayData(data: data, name: name, floorMode: .recorded, keepZ: true)
         let cues = lastRun(d.cues)
-        guard !cues.isEmpty else { return nil }
+        guard let first = cues.first, let last = cues.last else { return nil }
         let mx = Calibration.maxima(frames: d.rawFace, cues: cues)
-        let before = CueReport.compute(cues: cues, segments: d.segments, coChanges: d.coChanges, zLog: d.zLog)
-        var after: CueReport?
+        var after: CueReplay?
         if !mx.isEmpty {
             let a = try ReplayData(data: data, name: name, floorMode: .calibrated(mx), keepZ: true)
-            after = CueReport.compute(cues: cues, segments: a.segments, coChanges: a.coChanges, zLog: a.zLog)
+            after = CueReplay(segments: a.segments, coChanges: a.coChanges, zLog: a.zLog)
         }
-        return CueTrial(max: Dictionary(uniqueKeysWithValues: mx.map { ($0.key.rawValue, $0.value) }), before: before, after: after)
+        // change の行：試すモードの間と、その直前の状態（続いている違いを「始まった」と数えないため）
+        let rows = d.changeRows.filter { $0.t <= last.end + CueReport.graceS + 1 }
+        let before = rows.filter { $0.t < first.start }.last.map { [$0] } ?? []
+        return compute(cues: cues, changes: before + rows.filter { $0.t >= first.start }, before: CueReplay(segments: d.segments, coChanges: d.coChanges, zLog: d.zLog),
+                       after: after, maxima: mx)
     }
 
-    /// 最後の試すモード：最初の指示（何もしない）から始まるまとまりのうち、最後のもの（指示の間が 10秒より空いたら別のまとまり）
+    /// 最後の試すモード：指示の間が 10秒より空いたら別のまとまり
     static func lastRun(_ cues: [Cue]) -> [Cue] {
         let s = cues.sorted { $0.start < $1.start }
         var out: [Cue] = []

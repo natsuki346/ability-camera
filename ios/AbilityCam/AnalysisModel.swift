@@ -124,6 +124,13 @@ final class AnalysisModel: ObservableObject {
     @Published var cueResult: CueTrial?        // 終わったときの結果（画面に出す）
     @Published var cueError: String?
     fileprivate var cueTask: Task<Void, Never>?
+    // 試すモードの間の入力・撮る側の change・指示・比べた普段（v1.20〜。結果は記録を読み直さずにこれから出す）
+    fileprivate var cueInputs: [DiffInput] = []
+    fileprivate var cueChanges: [(t: Double, keys: [String])] = []
+    fileprivate var cueCues: [Cue] = []
+    fileprivate var cueBase: (face: [String: BaselineRecord.Stat], voice: [String: BaselineRecord.Stat]?, yaw: Double?, floors: [Metric: Double])?
+    // 重い処理をしている間（v1.20〜、frame_gap の理由に work:名前）
+    fileprivate var activeWork: [String: Int64] = [:]
     // コマが来なかった間（v1.19〜、記録の frame_gap）
     fileprivate var gapLast: (tMs: Int64, cam: (delivered: Int, dropped: Int, dropReason: String?), face: (submitted: Int, notSubmitted: Int, returned: Int))?
     fileprivate var gapNotes: [(tMs: Int64, reason: String)] = []
@@ -291,16 +298,18 @@ final class AnalysisModel: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-previewCueResult") {
             func rep(_ frown: Int, _ calm: Int, _ z: Double) -> CueReport {
                 var r = CueReport()
-                r.hits = [.init(kind: "frown", n: 5, hit: frown, latencyS: Array(repeating: 0.6, count: frown)),
-                          .init(kind: "smile", n: 5, hit: 5, latencyS: [0.3, 0.3, 0.4, 0.3, 0.5])]
-                r.quiet = [.init(kind: "calm", seconds: 60, diffs: calm, co: 0), .init(kind: "turn", seconds: 20, diffs: 0, co: 0),
-                           .init(kind: "rest", seconds: 60, diffs: 1, co: 0)]
+                r.hits = [.init(kind: "frown", n: 5, hit: frown, latencyS: Array(repeating: 0.6, count: frown), co: 0),
+                          .init(kind: "smile", n: 5, hit: 5, latencyS: [0.3, 0.3, 0.4, 0.3, 0.5], co: 4)]
+                r.quiet = [.init(kind: "calm", seconds: 60, windows: 2, diffs: calm, byKey: calm > 0 ? ["eyes_closed:closed": calm] : [:], co: 0),
+                           .init(kind: "turn", seconds: 20, windows: 1, diffs: 0, byKey: [:], co: 0),
+                           .init(kind: "rest", seconds: 60, windows: 10, diffs: 2, byKey: ["eyes_closed:closed": 1, "brow_down:above": 1], co: 4)]
                 r.rows = CueReport.metrics.flatMap { item in [CueKind.frown, .smile].map { k in
                     CueReport.Row(metric: item.m.rawValue, kind: k.rawValue, n: 5, hit: k == .frown && item.m == .browDown ? frown : 0,
                                   zMedian: k == .frown && item.m == .browDown ? z : 0.2) } }
                 return r
             }
-            cueResult = CueTrial(max: ["brow_down": 0.15, "brow_inner_eye": 0.18, "mouth_smile": 0.9], before: rep(3, 0, 1.8), after: rep(5, 1, 3.4))
+            cueResult = CueTrial(max: ["brow_down": 0.15, "brow_inner_eye": 0.18, "mouth_smile": 0.9], before: rep(5, 0, 1.8), after: rep(5, 1, 3.4),
+                                 fromChanges: true, beforeReplayHits: nil)
         }
         if ProcessInfo.processInfo.arguments.contains("-previewMarkDetail") {   // 「詳しく（任意）」の見た目（v1.13〜）
             markDetailPrompt = (0, .unpleasant, MarkDetails.initial.unpleasant)
@@ -462,8 +471,11 @@ final class AnalysisModel: ObservableObject {
         pastMarks = PastMarks(); markCombos = [:]
         if let pid = PersonStore.shared.selectedID {
             let current = logger.fileName, dir = SessionStore.dir
+            beginWork("past_marks")
             Task { [weak self] in
-                let loaded = await Task.detached(priority: .utility) { PastMarks.load(personID: pid, dir: dir, except: current) }.value
+                // いちばん低い優先度で（v1.20〜。これまでの記録をすべて読むので、カメラ・解析の邪魔をしないように）
+                let loaded = await Task.detached(priority: .background) { PastMarks.load(personID: pid, dir: dir, except: current) }.value
+                self?.endWork("past_marks")
                 guard let self, self.running, self.logger.fileName == current else { return }
                 var merged = loaded
                 for (_, v) in self.markCombos.sorted(by: { $0.key < $1.key }) { merged.add(combo: v.combo, value: v.value, detail: v.detail) }
@@ -536,8 +548,10 @@ final class AnalysisModel: ObservableObject {
     private func recoverMissing() {
         sessions = SessionStore.load()
         let current = logger.fileName
+        beginWork("recover_missing")
         Task { [weak self] in
-            let list = await Task.detached(priority: .utility) {
+            defer { self?.endWork("recover_missing") }
+            let list = await Task.detached(priority: .background) {   // v1.20〜：いちばん低い優先度で
                 SessionStore.recoverMissing(except: current) > 0 ? SessionStore.load() : nil
             }.value
             if let list { self?.sessions = list }
@@ -1495,8 +1509,10 @@ final class AnalysisModel: ObservableObject {
             if let db = a.rmsDb { engineVoice[.rmsDb] = Double(db) }
             if let f0 = a.f0Hz { engineVoice[.f0Hz] = Double(f0) }
         }
-        engine.add(DiffInput(t: epochT, face: r.face, yaw: r.pose?.yaw, faceValues: Self.faceValues(r), blink: blink,
-                             voice: engineVoice, voiceSelf: voiceSelf))
+        let input = DiffInput(t: epochT, face: r.face, yaw: r.pose?.yaw, faceValues: Self.faceValues(r), blink: blink,
+                              voice: engineVoice, voiceSelf: voiceSelf)
+        engine.add(input)
+        cueInput(input)   // 試すモードの間（v1.20〜）
         writeCoChanges()
         // 目を閉じている割合（v1.12〜）：5秒ごとに直近30秒の割合を記録に書く（判定・画面には使わない）
         if running, let er = eyesRatio.add(t: epochT, face: r.face, blink: blink) {
@@ -1745,6 +1761,7 @@ final class AnalysisModel: ObservableObject {
             diffCount += Set(diffKeys).subtracting(lastChange?.diffs ?? []).count
             lastChange = (keys, faceReadable)
             var e = EventRecord(tMs: Self.nowMs(), kind: "change", value: .list(keys))
+            cueChange(tMs: e.tMs, keys: keys)   // 試すモードの結果は、撮る側の change と同じ数え方（v1.20〜）
             e.faceReadable = faceReadable
             e.baseline = comparing?.rawValue   // どちらの普段で比べたか
             logger.write(e)
@@ -1792,6 +1809,7 @@ extension AnalysisModel {
     func startCues() {
         guard running, cueStage == nil else { return }
         cueResult = nil; cueError = nil
+        cueInputs = []; cueChanges = []; cueCues = []; cueBase = nil
         logger.write(EventRecord(tMs: Self.nowMs(), kind: "cue_run", value: .text("start")))
         restart(.face)
         cueStage = .baseline
@@ -1801,6 +1819,12 @@ extension AnalysisModel {
             while !Task.isCancelled, self.comparing == nil {
                 try? await Task.sleep(for: .milliseconds(200))
             }
+            // 試すモードの間に比べる普段（v1.20〜：結果は記録を読み直さず、この普段と試すモードの間の入力から出す）
+            if let f = self.usedFace {
+                let face = f.metrics.filter { Metric(rawValue: $0.key)?.isFace ?? false }
+                self.cueBase = (face, self.usedVoice, Self.baselineYaw(self.todayBaseline?.pose), self.calibFloors(face))
+            }
+            self.cueChanges = [(Double(Self.nowMs()) / 1000, self.lastChange?.diffs ?? [])]   // 始めたときに続いている違いは「始まった」と数えない
             for (i, st) in CuePlan.steps.enumerated() {
                 guard !Task.isCancelled else { return }
                 let start = Self.nowMs(), end = start + Int64(st.seconds * 1000)
@@ -1815,8 +1839,12 @@ extension AnalysisModel {
                 var e = EventRecord(tMs: end, kind: "cue", value: .text(st.kind.rawValue))
                 e.startMs = start; e.endMs = end
                 self.logger.write(e)
+                self.cueCues.append(Cue(kind: st.kind, start: Double(start) / 1000, end: Double(end) / 1000))
             }
             self.logger.write(EventRecord(tMs: Self.nowMs(), kind: "cue_run", value: .text("end")))
+            // 最後の指示のあと graceS 秒の入力も使う（指示の終わりから2秒後までに始まったものも数える）
+            try? await Task.sleep(for: .seconds(CueReport.graceS + 0.5))
+            guard !Task.isCancelled else { return }
             await self.finishCues()
         }
     }
@@ -1827,38 +1855,70 @@ extension AnalysisModel {
         cueTask?.cancel(); cueTask = nil
         if running { logger.write(EventRecord(tMs: Self.nowMs(), kind: "cue_run", value: .text("stopped"))) }
         cueStage = nil
+        cueInputs = []; cueChanges = []
     }
 
     /// 記録を閉じるとき（裏に回った・記録を終えた）
     func cancelCues() {
         cueTask?.cancel(); cueTask = nil
         cueStage = nil
+        cueInputs = []; cueChanges = []
     }
 
-    /// 終わった：記録を読み直して結果を出し（DiffCheck --cues と同じ CueTrial.run）、その人の最大を保存する（次に普段を決めたときから下限に使う）
+    /// 試すモードの間の入力（記録に書いたコマと同じもの）。撮る側の判定に渡したあとで呼ぶ
+    fileprivate func cueInput(_ x: DiffInput) {
+        guard case .step = cueStage else { return }   // 最後の指示のあと graceS 秒も、まだ最後の段のまま
+        cueInputs.append(x)
+    }
+
+    /// 撮る側の change の行（記録に書いたのと同じ時刻・中身）
+    fileprivate func cueChange(tMs: Int64, keys: [String]) {
+        guard case .step = cueStage else { return }
+        cueChanges.append((Double(tMs) / 1000, keys))
+    }
+
+    /// 終わった：結果を出し（記録は読み直さない。v1.20〜：12MB の記録を読み直す間、カメラのコマが止まっていたため）、その人の最大を保存する
     private func finishCues() async {
         cueStage = .computing
-        guard let url = logger.flushedURL() else { cueStage = nil; cueError = "記録のファイルが見つかりませんでした"; return }
-        let name = url.lastPathComponent
-        let result: Result<CueTrial?, Error> = await Task.detached(priority: .userInitiated) {
-            Result { try CueTrial.run(data: Data(contentsOf: url), name: name) }
+        guard let base = cueBase else { cueStage = nil; cueError = "普段がそろわないまま終わりました"; return }
+        let inputs = cueInputs, cues = cueCues, changes = cueChanges
+        cueInputs = []; cueChanges = []
+        let frames = inputs.filter(\.face).map { (t: $0.t, v: $0.faceValues) }
+        let mx = Calibration.maxima(frames: frames, cues: cues)
+        let faceNow = Self.engineBaseline(base.face, floors: base.floors)
+        let faceAfter = mx.isEmpty ? nil : Self.engineBaseline(base.face, floors: Calibration.floors(ref: { m in
+            guard let st = base.face[m.rawValue], !st.insufficient else { return nil }
+            return st.median ?? st.mean
+        }, max: mx))
+        let voice = base.voice.map { Self.engineBaseline($0) }
+        let yaw = base.yaw
+        beginWork("cue_result")
+        // 低い優先度で（カメラ・解析の邪魔をしないように）。数千コマを判定し直すだけで、ファイルは読まない
+        let trial = await Task.detached(priority: .utility) { () -> CueTrial in
+            func run(_ face: [Metric: DiffEngine.Stat]) -> CueReplay {
+                var e = DiffEngine()
+                e.zLog = []
+                e.setBaseline(face, part: .face, yaw: yaw)
+                if let voice { e.setBaseline(voice, part: .voice) }
+                var segs: [DiffSegment] = []
+                for x in inputs { e.add(x); segs += e.finished; e.finished = [] }
+                e.flush(); segs += e.finished
+                return CueReplay(segments: segs, coChanges: e.coDet.finished, zLog: e.zLog ?? [])
+            }
+            return CueTrial.compute(cues: cues, changes: changes, before: run(faceNow), after: faceAfter.map(run), maxima: mx)
         }.value
+        endWork("cue_result")
         guard cueStage == .computing else { return }   // 計算している間に記録を閉じた
         cueStage = nil
-        switch result {
-        case .failure(let e): cueError = "結果を出せませんでした：\(e.localizedDescription)"
-        case .success(nil): cueError = "記録に試すモードの指示がありませんでした"
-        case .success(let r?):
-            cueResult = r
-            guard !r.max.isEmpty else { return }
-            var e = EventRecord(tMs: Self.nowMs(), kind: "calibration", value: nil)
-            e.max = r.max
-            e.camera = (lensInUse ?? camera.lens).rawValue
-            logger.write(e)
-            if let p = PersonStore.shared.selected {
-                PersonStore.shared.setCalibration(p.id, PersonCalibration(savedMs: Self.nowMs(), camera: e.camera ?? "", max: r.max))
-                showMessage("\(p.displayName)の動く幅を保存しました（次に普段を決めたときから使います）")
-            }
+        cueResult = trial
+        guard !trial.max.isEmpty else { return }
+        var e = EventRecord(tMs: Self.nowMs(), kind: "calibration", value: nil)
+        e.max = trial.max
+        e.camera = (lensInUse ?? camera.lens).rawValue
+        logger.write(e)
+        if let p = PersonStore.shared.selected {
+            PersonStore.shared.setCalibration(p.id, PersonCalibration(savedMs: Self.nowMs(), camera: e.camera ?? "", max: trial.max))
+            showMessage("\(p.displayName)の動く幅を保存しました（次に普段を決めたときから使います）")
         }
     }
 
@@ -1900,6 +1960,18 @@ extension AnalysisModel {
                                  value: reason.map { .text($0) }))
     }
 
+    /// 重い処理を始めた・終えた（v1.20〜）：記録に event work（value：名前、start_ms・end_ms）を書き、その間の frame_gap の reason に work:名前 を入れる
+    func beginWork(_ name: String) {
+        activeWork[name] = Self.nowMs()
+    }
+
+    func endWork(_ name: String) {
+        guard let s = activeWork.removeValue(forKey: name), running else { return }
+        var e = EventRecord(tMs: Self.nowMs(), kind: "work", value: .text(name))
+        e.startMs = s; e.endMs = Self.nowMs()
+        logger.write(e)
+    }
+
     /// コマが届いた：前のコマから frameGapMinMs 以上空いていたら event frame_gap を書く（t_ms＝前のコマ、end_ms＝このコマ）
     fileprivate func watchGap(tMs: Int64) {
         guard running else { gapLast = nil; return }
@@ -1913,7 +1985,9 @@ extension AnalysisModel {
         let returned = fc.returned - last.face.returned
         e.cameraFrames = delivered; e.droppedFrames = dropped; e.submittedFrames = submitted
         e.notSubmittedFrames = notSub; e.returnedFrames = returned
-        e.reason = FrameGap.reason(notes: gapNotes.filter { $0.tMs >= last.tMs - 500 && $0.tMs <= tMs }.map(\.reason),
+        let notes = gapNotes.filter { $0.tMs >= last.tMs - 500 && $0.tMs <= tMs }.map(\.reason)
+            + activeWork.keys.sorted().map { "work:\($0)" }   // その間に続いていた重い処理（v1.20〜）
+        e.reason = FrameGap.reason(notes: notes,
                                   delivered: delivered, dropped: dropped, dropReason: cam.dropReason, submitted: submitted, returned: returned)
         logger.write(e)
     }

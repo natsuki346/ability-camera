@@ -2266,7 +2266,10 @@ class CueTest(unittest.TestCase):
         self.assertEqual(lst("frown"), cal["frown"])
         self.assertEqual(lst("smile"), cal["smile"])
         self.assertEqual(lst("frown") + lst("smile"), cc["metrics"])
-        self.assertIn("[.frown: .browDown, .smile: .mouthSmile]", src)
+        self.assertIn('[.frown: "brow_down:above", .smile: "mouth_smile:above"]', src)
+        self.assertIn("static let startOffsetS = DiffCriteria.startMinS", src)
+        eng = (review.HERE.parent / "ios" / "AbilityCam" / "DiffEngine.swift").read_text(encoding="utf-8")
+        self.assertEqual(float(re.search(r"static let startMinS = ([\d.]+)", eng).group(1)), cc["start_offset_s"])
         if not shutil.which("swiftc"):
             self.skipTest("swiftc が無い")
         import check_app
@@ -2325,3 +2328,78 @@ class FrameGapTest(unittest.TestCase):
                 import check_app
                 diffs, has = check_app.compare_cues(p, check_app.build(), c)
                 self.assertEqual((diffs, has), ([], True))
+
+
+class CueChangeTest(unittest.TestCase):
+    """v1.20〜：試すモードの「今の下限」は撮る側の change の行から数える（記録 ability-cam-20261030-011513 で、change では 5/5 なのに結果が 4/5・1/5 だった）。
+    何もしない・戻す間は指標ごとに始まった回数と内訳、co_change は指示ごとに区切る。アプリ（DiffCheck --cues）と一致"""
+
+    def make(self, d: Path) -> Path:
+        import json
+        objs = [json.loads(x) for x in (review.HERE / "tests" / "fixture_cues.jsonl").read_text(encoding="utf-8").splitlines()]
+        t0 = objs[0]["started_at_ms"]
+        cues = [(o["value"], o["start_ms"], o["end_ms"]) for o in objs if o.get("kind") == "cue"]
+        for o in objs:   # 笑う間は鼻・上唇も上げる：重なりのできごとが、戻す（3秒）では終わらず1つにつながる
+            if o.get("type") == "frame" and any(k == "smile" and s0 <= o["t_ms"] < s1 for k, s0, s1 in cues):
+                o["bs"]["mouthUpperUpLeft"] = o["bs"]["mouthUpperUpRight"] = 0.4
+        ch = [(t0 + 9_000, [])]
+        for k, s0, s1 in cues:   # 撮る側の画面：眉・笑うの指示ごとに「いつもより強い」が出て、戻す間に消えた
+            if k in ("frown", "smile"):
+                key = "brow_down:above" if k == "frown" else "mouth_smile:above"
+                ch += [(s0 + 900, [key]), (s1 + 600, [])]
+        rest_after_smile = [c for c in cues if c[0] == "rest"][9]
+        ch += [(rest_after_smile[1] + 1000, ["eyes_closed:closed"]), (rest_after_smile[1] + 1500, ["eyes_closed:closed", "brow_down:above"]),
+               (rest_after_smile[1] + 1800, ["eyes_closed:closed", "brow_down:above"]), (rest_after_smile[1] + 2500, [])]
+        objs += [{"type": "event", "t_ms": t, "kind": "change", "value": v, "face_readable": True} for t, v in ch]
+        hdr, rest = objs[0], sorted(objs[1:], key=lambda o: o["t_ms"])
+        p = d / "cue_changes.jsonl"
+        p.write_text("\n".join(json.dumps(o, ensure_ascii=False) for o in [hdr] + rest) + "\n", encoding="utf-8")
+        return p
+
+    def test_counts(self):
+        import shutil
+        import face_check
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        with tempfile.TemporaryDirectory() as d:
+            p = self.make(Path(d))
+            tr = face_check.cue_trial(review.load(p), c)
+            hit = {h["kind"]: h for h in tr["before"]["hits"]}
+            self.assertTrue(tr["fromChanges"])
+            self.assertEqual((hit["frown"]["hit"], hit["smile"]["hit"]), (5, 5))
+            self.assertEqual(hit["frown"]["latencyS"], [0.9] * 5)
+            # 記録し直すと眉は今の下限では出ない（作り物の記録）。違うことを結果に出す
+            self.assertEqual({h["kind"]: h["hit"] for h in tr["beforeReplayHits"]}, {"frown": 0, "smile": 5})
+            self.assertIn("撮る側の change と違う", "\n".join(face_check.cue_text(tr)))
+            # 戻す間：目を閉じた → 眉が加わった は 2つ、同じ組み合わせが続いているだけなら数えない
+            rest = next(q for q in tr["before"]["quiet"] if q["kind"] == "rest")
+            self.assertEqual(rest["byKey"], {"eyes_closed:closed": 1, "brow_down:above": 1})
+            self.assertEqual(rest["diffs"], 2)
+            # 重なりのできごとは笑う5回分が1つにつながるが、指示ごとに区切って数える
+            a = review.analyze(review.load(p), c)
+            self.assertEqual(len(a.co_changes), 1)
+            self.assertEqual(hit["smile"]["co"], 5)
+            self.assertGreaterEqual(rest["co"], 4)
+            if shutil.which("swiftc"):
+                import check_app
+                diffs, has = check_app.compare_cues(p, check_app.build(), c)
+                self.assertEqual((diffs, has), ([], True))
+
+
+class CueRecord011513Test(unittest.TestCase):
+    """記録 ability-cam-20261030-011513（v1.19、前面、試すモード）：撮る側の change と同じく 眉 5/5・笑う 5/5。
+    記録は tests/records/ に置いたときだけ（人の記録なので、リポジトリには入れない）"""
+    PATH = Path(__file__).with_name("records") / "ability-cam-20261030-011513.jsonl"
+
+    def test_record(self):
+        import shutil
+        import face_check
+        if not self.PATH.exists():
+            self.skipTest(f"{self.PATH} が無い")
+        c = review.load_criteria(review.HERE / "criteria.json", [])
+        tr = face_check.cue_trial(review.load(self.PATH), c)
+        hit = {h["kind"]: h["hit"] for h in tr["before"]["hits"]}
+        self.assertEqual(hit, {"frown": 5, "smile": 5})
+        if shutil.which("swiftc"):
+            import check_app
+            diffs, has = check_app.compare_cues(self.PATH, check_app.build(), c)
+            self.assertEqual((diffs, has), ([], True))

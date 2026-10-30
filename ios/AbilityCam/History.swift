@@ -118,7 +118,7 @@ struct OpenedRecordsView: View {
     private func load(_ url: URL) {
         loading += 1
         Task {
-            let r = await Task.detached(priority: .userInitiated) { () -> Result<ReplayData, Error> in
+            let r = await Task.detached(priority: .utility)   /* v1.20〜：記録中のカメラの邪魔をしないように */ { () -> Result<ReplayData, Error> in
                 // 選んだファイルをその場で読むだけ（写さない）
                 let ok = url.startAccessingSecurityScopedResource()
                 defer { if ok { url.stopAccessingSecurityScopedResource() } }
@@ -164,7 +164,7 @@ struct ReplayLoaderView: View {
         }
         .task(id: "\(url.path)#\(version)") {
             let url = url
-            let r = await Task.detached(priority: .userInitiated) { () -> Result<ReplayData, Error> in
+            let r = await Task.detached(priority: .utility)   /* v1.20〜：記録中のカメラの邪魔をしないように */ { () -> Result<ReplayData, Error> in
                 do {
                     let d = try Data(contentsOf: url)
                     let r = try ReplayData(data: d, name: url.lastPathComponent)

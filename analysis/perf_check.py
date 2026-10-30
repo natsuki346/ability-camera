@@ -63,6 +63,9 @@ def summary(path: Path) -> dict:
     for e in fg:
         for r in (e.get("reason") or "unknown").split(","):
             reasons[r] = reasons.get(r, 0) + 1
+    # 重い処理をしていた間（v1.20〜、event kind: "work"）
+    wk = [e for e in rec.events if e.get("kind") == "work" and e.get("start_ms") and e.get("end_ms")]
+    work = "、".join(f"{e.get('value')} {e['start_ms'] / 1000 - t[0]:.1f}〜{e['end_ms'] / 1000 - t[0]:.1f}s" for e in wk) if wk else None
     gap_reasons = "、".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])) if fg else None
     f0r = np.array([r["f0_ratio"] for r in rec.speaker if r.get("f0_ratio") is not None], float)   # v1.10.2〜
     part = {k: np.array([r[k] for r in rec.speaker if r.get(k) is not None], float) for k in ("fbank_ms", "predict_ms", "wait_ms")}   # v1.10.3〜
@@ -84,7 +87,7 @@ def summary(path: Path) -> dict:
             "fps_win_min": min(win_fps) if win_fps else None,
             "fps_first": fps_of(t < half, dur / 2), "fps_second": fps_of(t >= half, dur / 2),
             "thermal": thermal, "faces_limit": faces_limit,
-            "gap_n": len(gaps), "gap_s": float(sum(d for _, d in gaps)), "gaps": gap_text, "gap_reasons": gap_reasons}
+            "gap_n": len(gaps), "gap_s": float(sum(d for _, d in gaps)), "gaps": gap_text, "gap_reasons": gap_reasons, "work": work}
 
 
 COLS = [("file", "記録", "{}"), ("speaker_on", "話者の区別", "{}"), ("duration_s", "長さ 秒", "{:.0f}"), ("fps", "解析コマ/秒", "{:.1f}"),
@@ -97,7 +100,7 @@ COLS = [("file", "記録", "{}"), ("speaker_on", "話者の区別", "{}"), ("dur
         ("lat_geo_p50", "撮影→結果 ms 中央値（点の距離あり）", "{:.0f}"), ("lat_nogeo_p50", "撮影→結果 ms 中央値（顔はあるが点の距離なし）", "{:.0f}"),
         ("fps_win_min", "10秒ごとの解析コマ/秒 最小", "{:.1f}"), ("fps_first", "解析コマ/秒 前半", "{:.1f}"), ("fps_second", "解析コマ/秒 後半", "{:.1f}"),
         ("gap_n", "コマの来ない間 0.3秒以上 回", "{}"), ("gap_s", "その合計 秒", "{:.1f}"), ("gaps", "コマの来ない間（始まりからの秒 長さ）", "{}"),
-        ("gap_reasons", "frame_gap の理由（v1.19〜）", "{}"),
+        ("gap_reasons", "frame_gap の理由（v1.19〜）", "{}"), ("work", "重い処理をしていた間（v1.20〜）", "{}"),
         ("thermal", "端末の熱（v1.18〜）", "{}"), ("faces_limit", "探す顔の数の変更", "{}"),
         ("load_ms", "読み込み ms", "{:.0f}"), ("cached", "前に読み込んだもの", "{}"),
         ("fbank_p50", "fbank ms 中央値", "{:.1f}"), ("predict_p50", "predict ms 中央値", "{:.1f}"), ("predict_p95", "predict ms 95%", "{:.1f}"),

@@ -193,7 +193,7 @@ final class PersonStore: ObservableObject {
         save()
     }
 
-    private static var url: URL {
+    nonisolated private static var url: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("persons.json")
@@ -208,14 +208,19 @@ final class PersonStore: ObservableObject {
         Self.excludeFromBackup()
     }
 
+    /// v1.20〜：書き出しは裏の低い優先度のキューで（声の特徴の数値が入ると大きくなる。main を止めないように）。順に書くので、最後に頼んだものが残る
+    private static let saveQueue = DispatchQueue(label: "persons.save", qos: .utility)
+
     private func save() {
         guard !previewOnly, let d = try? JSONEncoder().encode(people) else { return }
-        try? d.write(to: Self.url, options: [.atomic, .completeFileProtection])
-        Self.excludeFromBackup()   // 書き直すと付け直しが要ることがあるので、毎回
+        Self.saveQueue.async {
+            try? d.write(to: Self.url, options: [.atomic, .completeFileProtection])
+            Self.excludeFromBackup()   // 書き直すと付け直しが要ることがあるので、毎回
+        }
     }
 
     /// persons.json を iCloud・端末のバックアップに入れない（v1.10〜。声の特徴の数値を入れる前に）
-    private static func excludeFromBackup() {
+    nonisolated private static func excludeFromBackup() {
         var u = url
         guard FileManager.default.fileExists(atPath: u.path) else { return }
         var v = URLResourceValues()

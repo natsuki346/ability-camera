@@ -64,14 +64,14 @@ struct CueResultView: View {
                         compare(Self.names[k] ?? "", hitText(result.before.hit(k)), result.after.map { hitText($0.hit(k)) })
                     }
                 } header: { Text("指示どおりに動かしたとき") } footer: {
-                    Text("「いつもとの違い」（眉を寄せる・口角を上げるの「いつもより強い」）が、指示の始まりから終わりの\(Int(CueReport.graceS))秒後までに出た回数と、出るまでの秒数（中央値）")
+                    Text("「いつもとの違い」（眉を寄せる・口角を上げるの「いつもより強い」）が、指示の始まりから終わりの\(Int(CueReport.graceS))秒後までに始まった回数と、始まるまでの秒数（中央値）、重なりのできごとが重なっていた指示の数。今の下限の数は、撮る側の画面（記録の change）と同じ数え方")
                 }
                 Section {
                     ForEach([CueKind.calm, .turn, .rest], id: \.self) { k in
                         compare("\(Self.names[k] ?? "")の間", quietText(result.before.quiet(k)), result.after.map { quietText($0.quiet(k)) })
                     }
                 } header: { Text("動かしていないとき") } footer: {
-                    Text("その間に始まった「いつもとの違い」（声が出たは入れない）と重なりのできごとの数（1分あたり）")
+                    Text("その間に始まった「いつもとの違い」（指標ごとに始まった回数。同じ指標が続いているだけなら数えない。声が出たは入れない）と内訳、重なりのできごとが重なっていた指示の数")
                 }
                 ForEach([CueKind.frown, .smile], id: \.self) { k in
                     Section {
@@ -112,13 +112,22 @@ struct CueResultView: View {
     private func hitText(_ h: CueReport.Hit?) -> String {
         guard let h else { return "–" }
         let lat = h.latencyS.isEmpty ? "" : String(format: "・出るまで %.1f秒", DiffCriteria.quantile(h.latencyS.sorted(), 0.5))
-        return "出た \(h.hit)／\(h.n)回\(lat)"
+        return "出た \(h.hit)／\(h.n)回\(lat)・重なり \(h.co)／\(h.n)回"
     }
 
     private func quietText(_ q: CueReport.Quiet?) -> String {
         guard let q else { return "–" }
         let pm = { (n: Int) in CueReport.perMin(n, q.seconds).map { String(format: "%.1f", $0) } ?? "–" }
-        return "違い \(q.diffs)件（\(pm(q.diffs))/分）・重なり \(q.co)件（\(pm(q.co))/分）・\(Int(q.seconds.rounded()))秒"
+        let by = q.byKey.sorted { $0.key < $1.key }.map { k, v in "\(Self.keyLabel(k)) \(v)" }.joined(separator: "・")
+        return "違い \(q.diffs)件（\(pm(q.diffs))/分）\(by.isEmpty ? "" : "：" + by)・重なり \(q.co)／\(q.windows)回・\(Int(q.seconds.rounded()))秒"
+    }
+
+    /// "brow_down:above" → 「眉を寄せる・強い」
+    static func keyLabel(_ k: String) -> String {
+        let parts = k.split(separator: ":").map(String.init)
+        guard let t = DiffTarget(key: parts.first ?? "") else { return k }
+        guard case .metric(let m) = t else { return t.label }
+        return m.label + (parts.last == "above" ? (m.isFace ? "・強い" : "・上") : (m.isFace ? "・弱い" : "・下"))
     }
 
     private func rowText(_ r: CueReport.Row?) -> String {

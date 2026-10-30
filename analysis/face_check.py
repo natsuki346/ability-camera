@@ -138,33 +138,63 @@ def maxima(rec: review.Recording, cues, c: dict) -> dict[str, float]:
     return out
 
 
-def cue_report(a: review.Analysis, cues, c: dict) -> dict:
+def seg_key(m: str, up: bool) -> str:
+    """記録の change と同じ key（アプリの DiffSegment.key）"""
+    if m == review.EYES:
+        return f"{m}:closed"
+    if m == review.VOICE_ON:
+        return f"{m}:on"
+    return f"{m}:{'above' if up else 'below'}"
+
+
+def starts_from_changes(rows: list[tuple[float, list[str]]]) -> list[tuple[float, str]]:
+    """撮る側の change の行から、指標ごとに始まった時刻（前の行に無かった key。アプリの CueReport.starts(changes:)）"""
+    prev, out = set(), []
+    for t, keys in sorted(rows, key=lambda r: r[0]):
+        out += [(t, k) for k in keys if k not in prev]
+        prev = set(keys)
+    return out
+
+
+def starts_from_segments(a: review.Analysis, c: dict) -> list[tuple[float, str]]:
+    """記録し直した区間から（始まりは z が超えてから start_offset_s 後＝change と同じ時点。アプリの CueReport.starts(segments:)）"""
+    t = a.rec.t
+    off = c["cues"]["start_offset_s"]
+    return [(float(t[s.i0]) + off, seg_key(s.metric, s.sign > 0)) for s in a.segments]
+
+
+def cue_report(a: review.Analysis, cues, c: dict, starts: list[tuple[float, str]], with_z: bool = True) -> dict:
+    """アプリの CueReport.compute と同じ決まり"""
     cc = c["cues"]
     t = a.rec.t
     eps = 1e-9
-    segs = [(s.metric, s.sign > 0, float(t[s.i0])) for s in a.segments if s.metric != review.VOICE_ON]
-    cos = [float(t[e["i0"]]) for e in a.co_changes]
+    st = [(ts, k) for ts, k in starts if not k.startswith(review.VOICE_ON + ":")]
+    cos = [(float(t[e["i0"]]), float(t[e["i1"]])) for e in a.co_changes]
+
+    def co_on(s0, s1):
+        return any(c0 < s1 - eps and c1 >= s0 - eps for c0, c1 in cos)
     r = {"hits": [], "quiet": [], "rows": []}
     for kind in ("frown", "smile"):
         cs = [x for x in cues if x[0] == kind]
-        m = cc["target"][kind]
+        key = cc["target"][kind] + ":above"
         lat = []
         for _, s0, s1 in cs:
-            st = [ts for mm, up, ts in segs if mm == m and up and s0 - eps <= ts <= s1 + cc["grace_s"] + eps]
-            if st:
-                lat.append(review.swift_round(min(st) - s0, 3))
-        r["hits"].append({"kind": kind, "n": len(cs), "hit": len(lat), "latencyS": lat})
+            ts = [x for x, k in st if k == key and s0 - eps <= x <= s1 + cc["grace_s"] + eps]
+            if ts:
+                lat.append(review.swift_round(min(ts) - s0, 3))
+        r["hits"].append({"kind": kind, "n": len(cs), "hit": len(lat), "latencyS": lat, "co": sum(1 for _, s0, s1 in cs if co_on(s0, s1))})
     for kind in ("calm", "turn", "rest"):
         cs = [x for x in cues if x[0] == kind]
-
-        def inside(ts, cs=cs):
-            return any(s0 - eps <= ts < s1 - eps for _, s0, s1 in cs)
-        r["quiet"].append({"kind": kind, "seconds": review.swift_round(sum(s1 - s0 for _, s0, s1 in cs), 3),
-                           "diffs": sum(1 for _, _, ts in segs if inside(ts)), "co": sum(1 for ts in cos if inside(ts))})
+        inside = [k for x, k in st if any(s0 - eps <= x < s1 - eps for _, s0, s1 in cs)]
+        by: dict[str, int] = {}
+        for k in inside:
+            by[k] = by.get(k, 0) + 1
+        r["quiet"].append({"kind": kind, "seconds": review.swift_round(sum(s1 - s0 for _, s0, s1 in cs), 3), "windows": len(cs),
+                           "diffs": len(inside), "byKey": by, "co": sum(1 for _, s0, s1 in cs if co_on(s0, s1))})
     for kind in ("frown", "smile"):
         cs = [x for x in cues if x[0] == kind]
         for m, sign in sign_list(cc["metrics"]):
-            z = np.where(a.judge[m], a.z[m], np.nan) if m in a.z else np.full(len(t), np.nan)
+            z = np.where(a.judge[m], a.z[m], np.nan) if (with_z and m in a.z) else np.full(len(t), np.nan)
             zs, hit = [], 0
             for _, s0, s1 in cs:
                 w = (t >= s0 - eps) & (t <= s1 + cc["grace_s"] + eps) & np.isfinite(z)
@@ -177,14 +207,31 @@ def cue_report(a: review.Analysis, cues, c: dict) -> dict:
     return r
 
 
+def change_rows(rec: review.Recording, cues) -> list[tuple[float, list[str]]]:
+    """試すモードの間と、その直前の change の行（アプリの CueTrial.run と同じ）"""
+    rows = sorted(((e["t_ms"] / 1000, list(e.get("value") or [])) for e in rec.events if e.get("kind") == "change"), key=lambda r: r[0])
+    first, last = cues[0][1], cues[-1][2]
+    rows = [r for r in rows if r[0] <= last + review.load_criteria(review.HERE / "criteria.json", [])["cues"]["grace_s"] + 1]
+    before = [r for r in rows if r[0] < first][-1:]
+    return before + [r for r in rows if r[0] >= first]
+
+
 def cue_trial(rec: review.Recording, c: dict) -> dict | None:
     cues = last_run(cue_list(rec))
     if not cues:
         return None
     mx = maxima(rec, cues, c)
-    before = cue_report(review.analyze(review.with_floors(rec, c, "recorded"), c), cues, c)   # 試すモードの間に使っていた下限（v1.19〜）
-    after = cue_report(review.analyze(review.with_floors(rec, c, "calibrated", mx), c), cues, c) if mx else None
-    return {"max": mx, "before": before, "after": after}
+    a0 = review.analyze(review.with_floors(rec, c, "recorded"), c)   # 試すモードの間に使っていた下限
+    rows = change_rows(rec, cues)
+    from_changes = bool(rows)
+    replay_starts = starts_from_segments(a0, c)
+    before = cue_report(a0, cues, c, starts_from_changes(rows) if from_changes else replay_starts)
+    after = None
+    if mx:
+        a1 = review.analyze(review.with_floors(rec, c, "calibrated", mx), c)
+        after = cue_report(a1, cues, c, starts_from_segments(a1, c))
+    check = cue_report(a0, cues, c, replay_starts, with_z=False)["hits"] if from_changes else None
+    return {"max": mx, "before": before, "after": after, "fromChanges": from_changes, "beforeReplayHits": check}
 
 
 CUE_NAMES = {"frown": "眉を寄せる", "smile": "笑う", "calm": "何もしない", "turn": "顔を横に向ける", "rest": "戻す"}
@@ -201,11 +248,13 @@ def cue_text(tr: dict) -> list[str]:
         out.append(f"■ {label}")
         for h in rep["hits"]:
             lat = f"・出るまで 中央値 {np.median(h['latencyS']):.1f}秒" if h["latencyS"] else ""
-            out.append(f"  {CUE_NAMES[h['kind']]}：いつもとの違いが出た {h['hit']}／{h['n']}回{lat}")
+            out.append(f"  {CUE_NAMES[h['kind']]}：いつもとの違いが出た {h['hit']}／{h['n']}回{lat}・重なり {h['co']}／{h['n']}回")
         for q in rep["quiet"]:
             def pm(k, q=q):
                 return f"{q[k] / q['seconds'] * 60:.1f}" if q["seconds"] > 0 else "–"
-            out.append(f"  {CUE_NAMES[q['kind']]}の間（{q['seconds']:.0f}秒）：いつもとの違い {q['diffs']}件（{pm('diffs')}/分）・重なり {q['co']}件（{pm('co')}/分）")
+            by = "・".join(f"{k} {v}" for k, v in sorted(q["byKey"].items()))
+            out.append(f"  {CUE_NAMES[q['kind']]}の間（{q['seconds']:.0f}秒）：いつもとの違い {q['diffs']}件（{pm('diffs')}/分）"
+                       + (f"：{by}" if by else "") + f"・重なり {q['co']}／{q['windows']}回")
         out.append("  指標\t眉を寄せる：z 中央値・z≥2 の回数\t笑う：z 中央値・z≥2 の回数")
         for m in dict.fromkeys(r["metric"] for r in rep["rows"]):
             cells = []
@@ -213,6 +262,10 @@ def cue_text(tr: dict) -> list[str]:
                 r = next(x for x in rep["rows"] if x["metric"] == m and x["kind"] == kind)
                 cells.append(("–" if r["zMedian"] is None else f"{r['zMedian']:+.1f}") + f"・{r['hit']}／{r['n']}")
             out.append(f"  {review.LABEL.get(m, m)}\t" + "\t".join(cells))
+    if tr.get("fromChanges") and tr.get("beforeReplayHits") and tr["beforeReplayHits"] != [
+            {k: h[k] for k in ("kind", "n", "hit", "latencyS", "co")} for h in tr["before"]["hits"]]:
+        out.append("（確かめる用）記録し直した区間で数えると：" + "、".join(f"{CUE_NAMES[h['kind']]} {h['hit']}／{h['n']}回" for h in tr["beforeReplayHits"])
+                   + "（撮る側の change と違う）")
     if tr["max"]:
         out.append("その人の最大：" + "、".join(f"{review.LABEL.get(k, k)} {v:.3f}" for k, v in tr["max"].items()))
     return out

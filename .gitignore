@@ -34,3 +34,4 @@ web/*.pem
 __pycache__/
 analysis/.venv/
 .DS_Store
+analysis/tests/records/
